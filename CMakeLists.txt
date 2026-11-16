@@ -101,6 +101,9 @@ if(JMT_BUILD_TESTS)
   add_executable(golden_test tests/golden_test.cpp)
   target_include_directories(golden_test PRIVATE src)
   target_link_libraries(golden_test PRIVATE jmt)
+  add_executable(batch_test tests/batch_test.cpp)
+  target_include_directories(batch_test PRIVATE src)
+  target_link_libraries(batch_test PRIVATE jmt)
   # Golden files and the weights file are generated locally:
   #   python tools/export_weights.py && python tools/dump_golden.py A B
   file(GLOB golden_files "${CMAKE_CURRENT_SOURCE_DIR}/build/golden/*.jmtt")
@@ -110,6 +113,8 @@ if(JMT_BUILD_TESTS)
       string(REPLACE ":" "_" backend_name "${backend}")
       add_test(NAME golden_${backend_name}_${name}
                COMMAND golden_test "${CMAKE_CURRENT_SOURCE_DIR}/weights/flexglue.jmtw" "${golden}" ${backend})
+      add_test(NAME batch_${backend_name}_${name}
+               COMMAND batch_test "${CMAKE_CURRENT_SOURCE_DIR}/weights/flexglue.jmtw" "${golden}" ${backend})
     endforeach()
   endforeach()
 endif()

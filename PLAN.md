@@ -4,10 +4,10 @@ Minimal-dependency image matching for bundle-adjustment pipelines: FlexGlue, wri
 `../just-keypoints` (C++ core, hand-written CPU / CUDA / Metal / WebGPU kernels, no PyTorch or ONNX Runtime
 at run time), plus a covisibility function that decides which image pairs are worth matching.
 
-Status: M1-M3 done: the C++ library runs on the CPU and on the Mac GPU (Metal) and matches the original.
-Metal after a first tuning pass (M5, in progress): 794 ms per pair in FP32 and 557 ms in FP16 at full
-settings, 2x and 3.5x the time PyTorch takes on the same GPU. Numbers marked "estimate" are computed
-from the layer sizes, not measured.
+Status: M1-M4 done: the C++ library runs on the CPU, on the Mac GPU (Metal) and on NVIDIA (CUDA) and matches
+the original. M5 is done on Metal: 314 ms per pair in FP32 and 105 ms in FP16 at full settings on an M5 Pro,
+against 376 and 157 ms for PyTorch on the same GPU. On CUDA the M5 items beyond the kernel tuning of M4 are
+open. Numbers marked "estimate" are computed from the layer sizes, not measured.
 
 ## What FlexGlue is (reviewed at release v0.1, 2026-10-26)
 
@@ -79,6 +79,7 @@ jmt_features* jmt_describe(jmt_ctx*, const jmt_image*);       /* once per image;
 int  jmt_match(jmt_ctx*, const jmt_features* a, const float* xy_a, int na,
                const jmt_features* b, const float* xy_b, int nb,
                const jmt_match_options*, jmt_matches*);
+int  jmt_match_batch(jmt_ctx*, const jmt_pair* pairs, int n_pairs, const jmt_match_options*, jmt_matches*);
 int  jmt_covisibility(jmt_ctx*, const jmt_features* a, const jmt_features* b, int level, float* score);
 int  jmt_shortlist(jmt_ctx*, const jmt_features* const* images, int n, int k, jmt_pairs*);
 void jmt_features_free(jmt_features*);
@@ -90,8 +91,8 @@ void jmt_destroy(jmt_ctx*);
 - `jmt_match_options`: `n_layers`, `filter_threshold` (0.1), `max_distance_px` (3), `min_covisibility`,
   `early_stop_decay`.
 - `jmt_features` can be saved and loaded, so a capture is described once (not written yet).
-- Implemented so far: `jmt_create`, `jmt_describe`, `jmt_match`; see `include/jmt/jmt.h`. `jmt_covisibility` and
-  `jmt_shortlist` belong to the covisibility track.
+- Implemented so far: `jmt_create`, `jmt_describe`, `jmt_match`, `jmt_match_batch`; see `include/jmt/jmt.h`.
+  `jmt_covisibility` and `jmt_shortlist` belong to the covisibility track.
 
 ## Covisibility
 
@@ -156,19 +157,28 @@ reference for recall, before any C++ is written for them.
 - [ ] **M5 — Fast**
   GEMM and attention kernels tuned per backend, pairs batched, zero allocations per pair. Benchmark table
   against PyTorch and the upstream ONNX models.
-  In progress (Metal). Per pair, 2048 keypoints per image, best of 5 runs, M5 Pro; FP32 results unchanged
-  (identical matches to the original on the 6 pairs, points within 2.6e-4 px):
+  Done on Metal (M5 Pro, macOS 26). Per pair, 2048 keypoints per image, Berlin pair, best of 8 runs;
+  PyTorch measured the same way on the same day (`tools/bench_torch.py`):
 
-  | Size, layers | Metal FP32 | Metal FP16 | PyTorch MPS FP32 / FP16 |
-  |---|---|---|---|
-  | 512, 9 | 794 ms (M3: 1090) | 557 ms (M3: 918) | 395 / 158 ms |
-  | 512, 5 | 452 ms (M3: 625) | 321 ms (M3: 519) | 223 ms / - |
-  | 384, 9 | 337 ms (M3: 452) | 247 ms (M3: 377) | 172 ms / - |
+  | Size, layers | Metal FP32 | PyTorch MPS FP32 | Metal FP16 | PyTorch MPS FP16 | Metal FP32 / FP16 after M3 |
+  |---|---|---|---|---|---|
+  | 512, 9 | 314 ms | 376 ms | 105 ms | 157 ms | 1090 / 918 ms |
+  | 512, 5 | 180 ms | 215 ms | 62 ms | 92 ms | 625 / 519 ms |
+  | 384, 9 | 140 ms | 167 ms | 48 ms | 82 ms | 452 / 377 ms |
 
-  Describe: 70 ms per image in FP32, 55 ms in FP16 (M3: 87 and 67; PyTorch MPS: 44).
-  FP16 now also stores the attention weights as half, which is where most of its gain comes from and
-  costs some agreement: over the 6 pairs, 97.1 % to 100 % of the matches are the same as the original's
-  (M3: 99.85 % to 100 %), confident points still move by 0.003-0.02 px (median).
+  Describe, per image: 31 ms in FP32 and 13 ms in FP16 at 512 px, 19 and 8 ms at 384 px (PyTorch: 39 and
+  23 ms in both precisions; after M3: 87 and 67 ms at 512 px).
+  In a batch of 8 (`jmt_match_batch`): 311 / 176 / 137 ms per pair in FP32 and 103 / 59 / 45 ms in FP16.
+  Agreement with the original on the 6 pairs x 2 settings (`tools/compare_all.sh`): FP32 identical matches
+  on all 12 runs, points within 1.9e-4 px, confidences within 5.6e-6, features within 3.1e-5. FP16: identical
+  matches on 11 of the 12 runs and 38 of 39 on the other; confident points move by 0.005-0.034 px (median),
+  covisibility by at most 3.2e-3.
+  The second batch of the same pairs creates no device buffers (`tests/batch_test.cpp`).
+  See "Notes from M5, second pass". The fast kernels need macOS 26; older systems use the kernels of the
+  first pass (786 ms in FP32, 549 ms in FP16).
+  Open: on CUDA, the read-out on the device, the fused operations and attention without the logits buffer
+  (the hooks in `core/ops.h` are there, CUDA uses their defaults; not compiled or run on the NVIDIA machine
+  since these changes). PyTorch and ONNX Runtime on the NVIDIA machine are not measured.
 - [ ] **M6 — Runs in the browser** (WebGPU via Dawn, then Emscripten; FP16 when `shader-f16` is available)
 - [ ] **M7 — Demo and docs**: pick images, see the shortlist, matches and timings; just-keypoints supplies the keypoints.
 - [ ] **M8 — v1.0**: CMake package, npm package, weights fetch script.
@@ -183,12 +193,14 @@ reference for recall, before any C++ is written for them.
 
 ## Risks
 
-- **Speed.** A pair at 512 px and 9 layers takes 158 ms in PyTorch on the M5 Pro GPU in FP16 (395 ms in
-  FP32), plus 41 ms per image for the features; the authors report 29 ms on an RTX 4090. Input size is not
-  the lever hoped for: 256 px loses the accuracy (see Notes from M1). What is left: 5 layers instead of 9
-  (223 ms instead of 395 in FP32), 384 px (172 ms), FP16, and the shortlist.
-- **Matching upstream's speed.** PyTorch uses vendor GEMM and fused attention. Hand-written kernels beat it
-  on ALIKED's small convolutions; matching it on large matrix products is harder.
+- **Speed.** A pair at 512 px and 9 layers takes 105 ms on the M5 Pro GPU in FP16 (314 ms in FP32), plus
+  13 ms per image for the features; the authors report 29 ms on an RTX 4090. Input size is not the lever
+  hoped for: 256 px loses the accuracy (see Notes from M1). What is left: 5 layers instead of 9 (62 ms in
+  FP16), 384 px (48 ms), and the shortlist.
+- **Matching upstream's speed.** Settled on Metal (1.2x faster than PyTorch in FP32, 1.5x in FP16) once the
+  kernels used the same matrix hardware as the vendor library. Open on CUDA: 70 % of cuBLAS in FP32.
+- **The fast Metal path depends on Metal 4** (macOS 26) and, for its FP16 speed, on the matrix hardware of
+  the M5 GPU. On older chips it has not been measured.
 - **Browser.** A 275 MB download, about 1 GB of GPU memory, and WebGPU buffer limits for the 4096x4096
   attention products (tile them).
 - **1.5-entmax** needs a sort or a bisection per query over 4096 values; pick the form that is exact on GPU.
@@ -333,15 +345,16 @@ ONNX Runtime 1.32 on the same M5 Pro, upstream's release v0.1 models (512 px, 9 
 | ONNX Runtime, CoreML provider, FP32 matcher | 201 ms | 5130 ms |
 | ONNX Runtime, CoreML provider, FP16 matcher | 201 ms | 3090 ms |
 | jmt CPU | 590 ms | 7500 ms |
-| jmt Metal FP32 | 70 ms | 794 ms |
-| jmt Metal FP16 | 55 ms | 557 ms |
-| PyTorch MPS FP32 / FP16 | 44 ms | 395 / 158 ms |
+| jmt Metal FP32 | 31 ms | 314 ms |
+| jmt Metal FP16 | 13 ms | 105 ms |
+| PyTorch MPS FP32 / FP16 | 39 ms | 376 / 157 ms |
 
 - ONNX Runtime has no useful GPU path on the Mac: CoreML takes 194 of the matcher's 2107 nodes (23
   partitions) and the rest runs on the CPU, which is slower than the CPU provider alone. Its CUDA provider
   can only be measured on the NVIDIA machine (M4).
-- jmt on Metal is 3.1x faster than the best ONNX Runtime result (4.4x in FP16); jmt on the CPU is 3x
-  slower than ONNX Runtime on the CPU, as expected from a reference backend.
+- jmt on Metal is 7.8x faster than the best ONNX Runtime result (23x in FP16); jmt on the CPU is 3x
+  slower than ONNX Runtime on the CPU, as expected from a reference backend. (The ONNX Runtime rows were
+  measured before the second pass of M5 and not repeated; the jmt and PyTorch rows are current.)
 - The ONNX matcher returns 90 matches on this pair where the PyTorch model (and jmt) returns 70, with the
   same covisibility score. Not investigated; its documentation describes `max_distance_px` as scaled by
   the long image side, where the PyTorch code scales each axis by the squashed size, which would accept
@@ -453,7 +466,9 @@ FP16:
   bank-conflict review has not been done for the Metal kernels, where threadgroup memory is not used for
   the products.
 
-## Notes from M5 (Metal, in progress)
+## Notes from M5, first pass (Metal, plain kernels)
+
+These are the kernels a system older than macOS 26 still runs.
 
 What the measurements showed, in the order tried. All times are GPU time per pair at 512 px / 9 layers.
 
@@ -485,3 +500,64 @@ What the measurements showed, in the order tried. All times are GPU time per pai
   selection on the GPU, preprocessing on the GPU, batching pairs.
 - Peak memory: 3.1 GB in FP16 (M3: 3.8 GB in FP32).
 - `tools/bench.sh [backend] [options]` prints the wall time and the GPU time per kernel for the Berlin pair.
+
+## Notes from M5, second pass (Metal)
+
+- **Where the limit was.** A kernel that only multiplies and adds in registers reaches 2.9 T (10^12)
+  multiply-adds per second in float and 6.2 T in half on this GPU. `k_linear` ran at 2.3 T (2.9 T with
+  half accumulators), and the shapes that should have helped (more accumulators, 8 values per load, weights and
+  inputs kept in cache) did not: a thread slows down sharply past about 64 float registers (128 half), and
+  a load costs as much as 4 to 6 scalar multiply-adds. That put the best plain kernel near 3.6 T.
+- **PyTorch was above that limit**: 13.5 T for a half matrix product, 3.6 T in float. So it was not using
+  plain shader arithmetic.
+- **Metal Performance Primitives** (Metal 4, macOS 26; headers in the system, no library to link) is what
+  reaches that hardware from a kernel of our own: `matmul2d` computes one tile of a product cooperatively
+  on the threads of a SIMD group. It plays the part the tensor-core instructions play on CUDA. The shader
+  source is still compiled at run time; when it does not compile with `JMT_MPP` (older system) the backend
+  falls back to the kernels of the first pass (`JMT_METAL_MPP=0` forces that).
+  Measured, 4096 x 1024 x 1024: 8 to 16 T in half (dispatches this short time unevenly), 3.8 T in float.
+  `simdgroup_matrix` (8 x 8 products, available since macOS 13) gives 3.5 T in both float and half: a gain
+  in float only, not used.
+- **Products** (`k_mm`): a tile of 64 x 64 outputs per threadgroup of 4 SIMD groups, weights as stored
+  (no rearranged copy). The tile is a float "cooperative tensor" held in registers, so bias, GELU or ReLU
+  and the residual are applied before it is written: the separate passes for them are gone. Tensors are
+  clipped at their edges by the primitive, so any size works.
+- **Attention** (`k_attn`) no longer has a weights buffer (512 MB in float at 512 px). One SIMD group
+  takes 32 queries of one head and walks the source tokens 32 at a time: logits, row maxima, weights,
+  row sums and the product with the values all stay in registers; when a row's maximum grows, what it has
+  accumulated is rescaled. 9.4 ms per attention before (FP16), 1.4 ms now; 14 ms to 5 ms in FP32.
+  Computing the logits twice (first for the maxima) instead of rescaling cost 20 ms more per pair in FP16
+  and 87 ms in FP32.
+- **Half overflows in attention.** Before the division by the row sum, an output is a sum over 4096
+  tokens. With flat weights and values near 16 it exceeds 65504: NaN at 512 px, nothing wrong at 384. Row
+  sums and outputs are accumulated in float in both modes; that also cut the error of an attention output
+  from 2.5e-3 to 1.7e-4 on a test with values up to 0.4.
+- **FP16 accuracy is bound by half storage**, not by where the products round: float tiles in `k_mm`
+  instead of half ones changed neither the agreement nor the time.
+- **Layer norm** (`k_layer_norm_sg`): one SIMD group per token, each thread holding 1/32 of the channels
+  in registers, mean and variance reduced across the group, activation applied in the same pass.
+- **Read-out on the device** (`k_readout`): one SIMD group per query. The 1.5-entmax threshold is the
+  root of a convex decreasing function; Newton's method from the left end climbs to it without passing
+  it, which needs no sort. The reference's cut at the 512 largest logits is reproduced: when more than
+  512 cells can have weight, the 512th largest is found by bisection. Against the golden dumps it is as
+  close as the host version: coarse positions within 2e-7 (median), masses within 2e-5.
+- **One round trip per pair.** Nothing is read back before the last operation (unless early stop is on):
+  `FlexGlue::match_queue` issues a pair, `match_read` reads it. Per pair: 2 ms to encode and 4 ms on the
+  host (offsets and mutual nearest neighbours); the rest is GPU work.
+- **Batches are a pipeline, not a stack.** One pair already fills the GPU, so `jmt_match_batch` keeps 4
+  pairs queued and finishes pair i on the host while the device works on the next ones. Gain: 1 to 7 %.
+  Stacking pairs into larger tensors would gain nothing here.
+- **Preprocessing on the device** from the 8-bit image (`k_preprocess`). The source rows and columns of
+  the resize are computed on the host: computed in the shader, some differed in the last bit and the
+  features moved by 4e-4 at 384 px.
+- **Allocations.** Device buffers are pooled and a pair of a size seen before creates none (tested). On
+  the host the results reuse their arrays and the rotary tables are computed once per grid size; tensor
+  handles and parameter names are still allocated per operation.
+- **The profile is no longer a measure.** With `JMT_METAL_PROFILE=1` every dispatch is its own command
+  buffer; now that most take under a millisecond the GPU's clock drops between them and the totals vary
+  2x from run to run. Wall time over several runs is what the tables use.
+- Where the time is now (FP16, profile, one of the faster runs, both images and the pair): products 57 ms,
+  attention 49, layer norm 11, depthwise convolution 7, channel copies 4, read-out 3.
+- Peak memory: 2.8 GB in FP16, 3.2 GB in FP32 (first pass: 3.1 GB in FP16).
+- Not done: slices and concatenations as views (4 ms), the depthwise convolution, float logits in FP16
+  attention (a float tile as the left operand of the second product gave wrong results; not investigated).

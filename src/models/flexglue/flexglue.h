@@ -5,6 +5,9 @@
 #pragma once
 
 #include <functional>
+#include <map>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -40,6 +43,21 @@ class FlexGlue {
   // rgb: height x width x 3 floats in [0, 1] -> features (size / 8, size / 8, 256).
   TensorPtr describe(Ops& ops, const float* rgb, int height, int width, int size, const Trace& trace = nullptr) const;
 
+  // The same from 8-bit pixels (`channels` bytes each: 1 grey, 3 or 4 with R, G, B first; rows of `stride`
+  // bytes), so a backend can do the conversion and the resize on the device.
+  TensorPtr describe_u8(Ops& ops, const unsigned char* data, int height, int width, int stride, int channels,
+                        int size) const;
+
+  // A pair whose work is queued on the backend and not read back yet.
+  struct Pair;
+  // match in two steps, so the work of several pairs can be queued before any result is waited for:
+  // match_queue issues every operation of a pair, match_read reads the results and does the host part
+  // (offsets, mutual nearest neighbours). With early stop on, match_queue itself reads a score per layer.
+  std::shared_ptr<Pair> match_queue(Ops& ops, const TensorPtr& f0, const float* xy0, int n0, float w0, float h0,
+                                    const TensorPtr& f1, const float* xy1, int n1, float w1, float h1,
+                                    const MatchOptions& options, const Trace& trace = nullptr) const;
+  void match_read(Pair& pair, MatchResult* out) const;
+
   // xy0: n0 keypoints of image 0 (x, y), (w0, h0) its size in pixels; likewise for image 1.
   void match(Ops& ops, const TensorPtr& f0, const float* xy0, int n0, float w0, float h0, const TensorPtr& f1,
              const float* xy1, int n1, float w1, float h1, const MatchOptions& options, MatchResult* out,
@@ -51,24 +69,38 @@ class FlexGlue {
   struct Tokens {
     TensorPtr x0, x1;
     int layer;
-    float covisibility;
+    float covisibility;       // < 0: not read yet, see covis_logits
+    TensorPtr covis_logits[2];
   };
-  TensorPtr lin(Ops& ops, const std::string& name, const TensorPtr& x) const;
-  TensorPtr norm(Ops& ops, const std::string& name, const TensorPtr& x, float eps = 1e-5f) const;
+  struct HeadWork {
+    int n = 0, h = 0, w = 0, layer = 0;
+    TensorPtr coarse_t, mass_t, logits, matchability;
+    std::vector<float> coarse, mass;
+  };
+  TensorPtr backbone(Ops& ops, TensorPtr x, const Trace& trace) const;
+  TensorPtr lin(Ops& ops, const std::string& name, const TensorPtr& x, Act act = Act::None,
+                const TensorPtr& residual = nullptr) const;
+  TensorPtr norm(Ops& ops, const std::string& name, const TensorPtr& x, float eps = 1e-5f, Act act = Act::None) const;
   TensorPtr mlp3(Ops& ops, const std::string& name, const TensorPtr& x) const;
   TensorPtr ffn(Ops& ops, const std::string& block, const TensorPtr& x, const TensorPtr& message) const;
   TensorPtr self_block(Ops& ops, const std::string& p, const TensorPtr& x, const std::vector<float>& cos,
                        const std::vector<float>& sin) const;
-  void rotary_encoding(int h, int w, std::vector<float>* cos, std::vector<float>* sin) const;
-  float covisibility(Ops& ops, int layer, const TensorPtr& x0, const TensorPtr& x1) const;
+  struct Rotary {
+    std::vector<float> cos, sin;
+  };
+  const Rotary& rotary_encoding(int h, int w) const;
+  void covisibility_queue(Ops& ops, int layer, const TensorPtr& x0, const TensorPtr& x1, TensorPtr logits[2]) const;
+  float covisibility_read(const TensorPtr logits[2]) const;
   Tokens decode_pair(Ops& ops, const TensorPtr& f0, const TensorPtr& f1, const MatchOptions& options,
                      const Trace& trace) const;
-  void head(Ops& ops, int layer, const std::vector<float>& pts, const TensorPtr& cf_i, const TensorPtr& cf_j,
-            std::vector<float>* refined, std::vector<float>* confidence, const Trace& trace,
-            const std::string& tag) const;
+  HeadWork head_queue(Ops& ops, int layer, const std::vector<float>& pts, const TensorPtr& cf_i, const TensorPtr& cf_j,
+                      const Trace& trace, const std::string& tag) const;
+  void head_read(HeadWork& work, std::vector<float>* refined, std::vector<float>* confidence) const;
 
   const Weights& w_;
   int n_layers_, heads_;
+  mutable std::mutex rotary_mutex_;
+  mutable std::map<std::pair<int, int>, std::unique_ptr<Rotary>> rotary_;
 };
 
 }  // namespace jmt

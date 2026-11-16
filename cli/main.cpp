@@ -40,15 +40,9 @@ void usage() {
                "  --min-covisibility S   reject pairs scoring below S (default 0 = off)\n"
                "  --early-stop D         stop early on non-covisible pairs, decay D in [0,1) (default off)\n"
                "  --threads N            CPU threads (default all)\n"
-               "  --dump-features        also write the dense features to OUT\n");
-}
-
-// Waits for the features to be computed (GPU backends return before the work is done).
-void jmt_sync_features(jmt_features* f) {
-  float first[1];
-  std::vector<float> all(f->tensor->size());
-  f->tensor->read(all.data());
-  (void)first;
+               "  --dump-features        also write the dense features to OUT\n"
+               "  --runs N               repeat N times and report the fastest run (default 1)\n"
+               "  --batch N              also time N copies of the pair through jmt_match_batch\n");
 }
 
 double now_ms() {
@@ -83,7 +77,7 @@ int main(int argc, char** argv) {
     jmt_match_options options;
     jmt_match_options_default(&options);
     bool dump_features = false;
-    int runs = 1;
+    int runs = 1, batch = 0;
     for (int i = 2; i < argc; ++i) {
       std::string a = argv[i];
       auto value = [&]() -> std::string {
@@ -104,6 +98,7 @@ int main(int argc, char** argv) {
         else throw std::runtime_error("unknown backend " + b);
       }
       else if (a == "--runs") runs = std::stoi(value());
+      else if (a == "--batch") batch = std::stoi(value());
       else if (a == "--size") config.input_size = std::stoi(value());
       else if (a == "--layers") options.n_layers = std::stoi(value());
       else if (a == "--filter") options.filter_threshold = std::stof(value());
@@ -142,7 +137,11 @@ int main(int argc, char** argv) {
       fa = jmt_describe(ctx, &va);
       fb = fa ? jmt_describe(ctx, &vb) : nullptr;
       if (!fa || !fb) throw std::runtime_error(jmt_last_error());
-      jmt_sync_features(fb);
+      // GPU backends return before the work is done: wait, so the time is charged to describe. Reading
+      // the features back also waits on a backend that does not implement finish.
+      jmt::ops_of(ctx).finish();
+      std::vector<float> wait(fb->tensor->size());
+      fa->tensor->read(wait.data()), fb->tensor->read(wait.data());
       t_describe = std::min(t_describe, (now_ms() - t0) / 2);
       t0 = now_ms();
       if (jmt_match(ctx, fa, ka.data, na, fb, kb.data, nb, &options, &m) != 0) throw std::runtime_error(jmt_last_error());
@@ -152,6 +151,20 @@ int main(int argc, char** argv) {
     std::printf("%d matches from %d and %d keypoints, covisibility %.4f, %d layers\n", m.n, na, nb, m.covisibility,
                 m.stop_layer);
     std::printf("load %.0f ms, describe %.0f ms per image, match %.0f ms\n", t_load, t_describe, t_match);
+    if (batch > 0) {
+      std::vector<jmt_pair> pairs(batch, jmt_pair{fa, ka.data, na, fb, kb.data, nb});
+      std::vector<jmt_matches> all(batch);
+      double t_batch = 1e30;
+      for (int run = 0; run < std::max(1, runs); ++run) {
+        t0 = now_ms();
+        if (jmt_match_batch(ctx, pairs.data(), batch, &options, all.data()) != 0) throw std::runtime_error(jmt_last_error());
+        t_batch = std::min(t_batch, (now_ms() - t0) / batch);
+      }
+      for (const jmt_matches& b : all)
+        if (b.n != all[0].n) throw std::runtime_error("batch: results differ between copies of the pair");
+      std::printf("batch of %d: %.1f ms per pair, %d matches each\n", batch, t_batch, all[0].n);
+      m = all[0];
+    }
 
     if (!out_path.empty()) {
       std::vector<float> idx(m.idx, m.idx + 2 * static_cast<size_t>(m.n));
