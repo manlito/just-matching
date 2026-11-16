@@ -58,7 +58,7 @@ typedef struct {
 
 /* Keypoint coordinates, in and out, follow just-keypoints: pixels of the original image, x right / y down,
    (0,0) = centre of the top-left pixel. Arrays are owned by the context and stay valid until the next
-   jmt_match or jmt_destroy on it. */
+   jmt_match, jmt_match_batch or jmt_destroy on it. */
 typedef struct {
   int n;                  /* number of matches */
   const int32_t* idx;     /* [n][2]: keypoint index in a, keypoint index in b */
@@ -90,6 +90,23 @@ void jmt_features_free(jmt_features* features);
    Returns 0 on success. A context must not be used from several threads at once. */
 int jmt_match(jmt_ctx* ctx, const jmt_features* a, const float* xy_a, int n_a, const jmt_features* b,
               const float* xy_b, int n_b, const jmt_match_options* options, jmt_matches* matches);
+
+/* One pair of a batch: the arguments of jmt_match. */
+typedef struct {
+  const jmt_features* a;
+  const float* xy_a;
+  int n_a;
+  const jmt_features* b;
+  const float* xy_b;
+  int n_b;
+} jmt_pair;
+
+/* Matches n_pairs pairs; matches[i] receives the result of pairs[i], the same as jmt_match would give.
+   On a GPU backend the pairs are pipelined: the device works on the next pairs while the host finishes
+   the previous one (offsets, mutual nearest neighbours), and no pair waits for a round trip in between.
+   Returns 0 on success; on failure no result is valid. */
+int jmt_match_batch(jmt_ctx* ctx, const jmt_pair* pairs, int n_pairs, const jmt_match_options* options,
+                    jmt_matches* matches);
 
 void jmt_destroy(jmt_ctx* ctx);
 

@@ -5,8 +5,18 @@
 // Scalar arguments are passed one per buffer index with setBytes.
 //
 // Precision: `real` is the storage type of tensors and weights: float, or half when compiled with JMT_FP16.
-// Values are converted to float when read, and all arithmetic and accumulation is float32 in both modes.
+// In the kernels written with plain arithmetic, values are converted to float when read and all arithmetic
+// and accumulation is float32 in both modes.
+//
+// With JMT_MPP (Metal 4, macOS 26) the matrix products and attention are built on Metal Performance
+// Primitives instead: matmul2d runs a product cooperatively on the threads of a SIMD group, on whatever
+// matrix hardware the GPU has. It is to Metal what the tensor-core instructions are to CUDA: a primitive
+// used from our own kernels, not a library call. See the section at the end of this file.
 #include <metal_stdlib>
+#ifdef JMT_MPP
+#include <metal_tensor>
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+#endif
 using namespace metal;
 
 #ifdef JMT_FP16
@@ -423,3 +433,285 @@ kernel void k_attn_apply(device const wreal* weights [[buffer(0)]], device const
       device real4*, constant int&, uint);
 JMT_APPLY("k_attn_apply_r4_t8", 4, 8)
 JMT_APPLY("k_attn_apply_r2_t16", 2, 16)
+
+#ifdef JMT_MPP
+// ---------------------------------------------------------------------------------------------
+// Kernels on Metal Performance Primitives.
+//
+// A tensor here is a view of a buffer with extents (columns, rows). matmul2d computes one tile of the
+// output per threadgroup from slices of its operands; slices are clipped to the tensors, so tiles on the
+// edge need no code of their own. A cooperative tensor is a tile held in the registers of the group's
+// threads: the result can be changed there (bias, activation, residual, softmax) before it is stored.
+//
+// Measured on an M5 Pro, 4096 x 1024 x 1024: 10 to 15 T multiply-adds per second in half and 3.8 T in
+// float, against 2.9 T and 2.3 T for k_linear.
+// ---------------------------------------------------------------------------------------------
+using namespace mpp::tensor_ops;
+typedef dextents<int32_t, 2> ext2;
+
+constant int kNone = 2;  // activation: kGelu, kRelu or none
+
+inline float activate(float v, int act) {
+  if (act == kGelu) return 0.5f * v * (1.0f + erf_approx(v * 0.70710678118654752440f));
+  if (act == kRelu) return max(v, 0.0f);
+  return v;
+}
+
+// Product: out (n, cout) = act(scale * x (n, cin) W^T + bias) + residual. w is stored (cout, cin), as in
+// the weights file. flags: 1 = bias, 2 = residual (n, cout).
+// Threadgroups: (ceil(cout / 64), ceil(n / 64)), each of 4 SIMD groups.
+constant int kMmRows = 64;
+constant int kMmCols = 64;
+constant int kMmGroups = 4;
+
+kernel void k_mm(device real* x [[buffer(0)]], device real* w [[buffer(1)]], device const real* bias [[buffer(2)]],
+                 device const real* residual [[buffer(3)]], constant int& n [[buffer(4)]], constant int& cin [[buffer(5)]],
+                 constant int& cout [[buffer(6)]], constant int& flags [[buffer(7)]], constant int& act [[buffer(8)]],
+                 constant float& scale [[buffer(9)]], device real* out [[buffer(10)]],
+                 uint2 tg [[threadgroup_position_in_grid]]) {
+  constexpr auto desc = matmul2d_descriptor(kMmRows, kMmCols, static_cast<int>(dynamic_extent), false, true);
+  matmul2d<desc, execution_simdgroups<kMmGroups>> op;
+  auto X = tensor<device real, ext2, tensor_inline>(x, ext2(cin, n));
+  auto W = tensor<device real, ext2, tensor_inline>(w, ext2(cin, cout));
+  auto C = tensor<device real, ext2, tensor_inline>(out, ext2(cout, n));
+  const int r0 = int(tg.y) * kMmRows, c0 = int(tg.x) * kMmCols;
+  auto tX = X.slice(0, r0);
+  auto tW = W.slice(0, c0);
+  auto tC = C.slice(c0, r0);
+#ifndef JMT_FP16
+  if (flags == 0 && act == kNone && scale == 1.0f) {
+    op.run(tX, tW, tC);
+    return;
+  }
+#endif
+  // The tile is float in both modes, so the bias, the activation and the residual are applied to the
+  // unrounded product and the result is rounded to the storage type once.
+  auto tile = op.template get_destination_cooperative_tensor<decltype(tX), decltype(tW), float>();
+  op.run(tX, tW, tile);
+  for (auto it = tile.begin(); it != tile.end(); it++) {
+    if (!tile.is_valid_element(it)) continue;
+    const auto at = tile.get_multidimensional_index(it);
+    const int col = c0 + at[0], row = r0 + at[1];
+    if (col >= cout || row >= n) continue;
+    float v = *it * scale;
+    if (flags & 1) v += float(bias[col]);
+    v = activate(v, act);
+    const size_t o = size_t(row) * size_t(cout) + size_t(col);
+    if (flags & 2) v += float(residual[o]);
+    out[o] = real(v);
+  }
+}
+
+// Attention with 64 channels per head, without the weights buffer: out = softmax(q k^T / 8) v per head.
+// One SIMD group takes 32 queries of one head and walks the source tokens 32 at a time, once. Per tile:
+// the logits (a 32 x 32 x 64 product), the largest of each row so far, the weights exp(logit - largest)
+// in registers, their row sums, and the product of the tile with the values, accumulated into 32 x 64
+// outputs. When a row's largest logit grows, what the row has accumulated is scaled down to the new
+// reference first, so the result is the same as with the true row maximum known in advance. The outputs
+// are divided by the row sums at the end. Source tokens past S in the last tile are masked.
+// Threadgroups: heads * ceil(P / 32), each of one SIMD group (32 threads).
+constant int kAtRows = 32;
+constant int kAtCols = 32;
+
+kernel void k_attn(device real* q [[buffer(0)]], device real* k [[buffer(1)]], device real* v [[buffer(2)]],
+                   constant int& P [[buffer(3)]], constant int& S [[buffer(4)]], constant int& heads [[buffer(5)]],
+                   device real* out [[buffer(6)]], uint tg [[threadgroup_position_in_grid]]) {
+  const int C = heads * 64, pblocks = (P + kAtRows - 1) / kAtRows;
+  const int pb = int(tg) % pblocks, hd = int(tg) / pblocks;
+  constexpr auto logits_desc = matmul2d_descriptor(kAtRows, kAtCols, 64, false, true);
+  constexpr auto apply_desc =
+      matmul2d_descriptor(kAtRows, 64, kAtCols, false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<logits_desc, execution_simdgroup> logits_op;
+  matmul2d<apply_desc, execution_simdgroup> apply_op;
+  auto Q = tensor<device real, ext2, tensor_inline>(q, ext2(C, P));
+  auto K = tensor<device real, ext2, tensor_inline>(k, ext2(C, S));
+  auto V = tensor<device real, ext2, tensor_inline>(v, ext2(C, S));
+  auto tQ = Q.slice(hd * 64, pb * kAtRows);
+  typedef decltype(tQ) slice_t;
+
+  // Logits and weights are tiles of `real`. Row sums and outputs are float in both modes: before the
+  // division an output is a sum over all source tokens, which overflows half (4096 weights near 1 times a
+  // value of 16), and half sums of many small terms lose most of their digits.
+  auto tile = logits_op.template get_destination_cooperative_tensor<slice_t, slice_t, real>();
+  auto top = logits_op.template get_row_reduction_destination_cooperative_tensor<slice_t, slice_t, real>();
+  auto part = logits_op.template get_row_reduction_destination_cooperative_tensor<slice_t, slice_t, real>();
+  auto sum = logits_op.template get_row_reduction_destination_cooperative_tensor<slice_t, slice_t, float>();
+  auto shrink = logits_op.template get_row_reduction_destination_cooperative_tensor<slice_t, slice_t, float>();
+  auto acc = apply_op.template get_destination_cooperative_tensor<decltype(tile), slice_t, float>();
+  const real lowest = real(-1e30f);  // -inf in half
+  #pragma unroll
+  for (ushort i = 0; i < top.get_capacity(); ++i)
+    if (top.is_valid_element(i)) top[i] = lowest, sum[i] = 0.0f;
+  #pragma unroll
+  for (ushort i = 0; i < acc.get_capacity(); ++i)
+    if (acc.is_valid_element(i)) acc[i] = 0.0f;
+
+  for (int s = 0; s < S; s += kAtCols) {
+    auto tK = K.slice(hd * 64, s);
+    auto tV = V.slice(hd * 64, s);
+    logits_op.run(tQ, tK, tile);
+    const bool last = s + kAtCols > S;
+    if (last)
+      for (auto it = tile.begin(); it != tile.end(); it++)
+        if (tile.is_valid_element(it) && s + tile.get_multidimensional_index(it)[0] >= S) *it = lowest;
+    // New row maxima; rows whose maximum grew are scaled to it (shrink is 1 for the others, 0 at the start).
+    reduce_rows(tile, part, reduction_operation::max, lowest);
+    bool grew = false;
+    #pragma unroll
+    for (ushort i = 0; i < top.get_capacity(); ++i)
+      if (top.is_valid_element(i)) {
+        const real t = max(top[i], part[i]);
+        shrink[i] = t > top[i] ? exp((float(top[i]) - float(t)) * 0.125f) : 1.0f;
+        grew = grew || t > top[i];
+        sum[i] *= shrink[i];
+        top[i] = t;
+      }
+    if (simd_any(grew))
+      for (auto it = acc.begin(); it != acc.end(); it++) *it *= *shrink.map_iterator(it);
+    for (auto it = tile.begin(); it != tile.end(); it++) *it = exp((*it - *top.map_iterator(it)) * real(0.125f));  // 1 / sqrt(64)
+    if (last)
+      for (auto it = tile.begin(); it != tile.end(); it++)
+        if (tile.is_valid_element(it) && s + tile.get_multidimensional_index(it)[0] >= S) *it = real(0);
+    reduce_rows(tile, part, reduction_operation::sum, real(0));
+    #pragma unroll
+    for (ushort i = 0; i < sum.get_capacity(); ++i)
+      if (sum.is_valid_element(i)) sum[i] += float(part[i]);
+    auto weights = apply_op.template get_left_input_cooperative_tensor<real, real, float>(tile);
+    apply_op.run(weights, tV, acc);
+  }
+  for (auto it = acc.begin(); it != acc.end(); it++) {
+    if (!acc.is_valid_element(it)) continue;
+    const auto at = acc.get_multidimensional_index(it);
+    const int row = pb * kAtRows + at[1];
+    if (row < P) out[size_t(row) * size_t(C) + size_t(hd * 64 + at[0])] = real(*it / *sum.map_iterator(it));
+  }
+}
+
+// LayerNorm over groups of g channels (g a multiple of 32, at most 1024), then an activation. One SIMD
+// group (32 threads) per token and group: each thread holds g / 32 values in registers, and the mean and
+// the variance are reduced across the group. Threadgroups: n * (c / g), 32 threads each.
+kernel void k_layer_norm_sg(device const real* x [[buffer(0)]], device const real* gain [[buffer(1)]],
+                            device const real* bias [[buffer(2)]], constant int& n [[buffer(3)]],
+                            constant int& c [[buffer(4)]], constant int& g [[buffer(5)]], constant float& eps [[buffer(6)]],
+                            constant int& act [[buffer(7)]], device real* out [[buffer(8)]],
+                            uint tg [[threadgroup_position_in_grid]], ushort lane [[thread_index_in_simdgroup]]) {
+  const int per = g / 32;
+  const uint j0 = uint(lane) * uint(per);
+  const size_t base = size_t(tg) * size_t(g) + size_t(j0);
+  float vals[32];
+  float s = 0;
+  for (int j = 0; j < per; ++j) {
+    vals[j] = float(x[base + j]);
+    s += vals[j];
+  }
+  const float mean = simd_sum(s) / float(g);
+  float sq = 0;
+  for (int j = 0; j < per; ++j) {
+    vals[j] -= mean;
+    sq = fma(vals[j], vals[j], sq);
+  }
+  const float inv = 1.0f / precise::sqrt(simd_sum(sq) / float(g) + eps);
+  for (int j = 0; j < per; ++j)
+    out[base + j] = real(activate(vals[j] * inv * float(gain[j0 + j]) + float(bias[j0 + j]), act));
+}
+
+// Match read-out of one query from its logits over the h x w cells (see Ops::readout and core/readout.h,
+// which this follows). One SIMD group (32 threads) per query; every thread scans a 32nd of the cells and
+// the group reduces. Threadgroups: N, 32 threads each.
+//
+// The 1.5-entmax threshold tau solves sum over T of max(y - tau, 0)^2 = 1 with y = (logit - top) / 2 and
+// T the 512 largest logits (the reference sorts them and uses a closed form per prefix; the root is the
+// same). The sum is convex and decreasing in tau and is at least 1 at tau = -1, so Newton's method from
+// -1 climbs to the root without passing it. Cells with y <= -1 never count; when more than 512 cells lie
+// above -1, the 512th largest y is found by bisection and the cells below it are left out.
+kernel void k_readout(device const float* logits [[buffer(0)]], constant int& h [[buffer(1)]], constant int& w [[buffer(2)]],
+                      device float* coarse [[buffer(3)]], device float* mass [[buffer(4)]],
+                      uint tg [[threadgroup_position_in_grid]], ushort lane [[thread_index_in_simdgroup]]) {
+  const int P = h * w, per = (P + 31) / 32;
+  const int s0 = min(P, int(lane) * per), s1 = min(P, s0 + per);
+  device const float* row = logits + size_t(tg) * size_t(P);
+  // Largest logit and the first cell that has it.
+  float best = -INFINITY;
+  int at = P;
+  for (int s = s0; s < s1; ++s) {
+    const float v = row[s];
+    if (v > best) best = v, at = s;
+  }
+  const float top = simd_max(best);
+  const int arg = simd_min(best == top ? at : P);
+  // Cells that can have weight: y > cut. `extra` copies of the value `cut` stand for the cells that tie
+  // at the 512th place.
+  float cut = -1.0f;
+  int count = 0;
+  for (int s = s0; s < s1; ++s) count += int((row[s] - top) * 0.5f > cut);
+  count = simd_sum(count);
+  int extra = 0;
+  if (count > 512) {
+    float lo = -1.0f, hi = 0.0f;  // count(y > lo) >= 512 > count(y > hi)
+    for (int it = 0; it < 30; ++it) {
+      const float mid = 0.5f * (lo + hi);
+      int c = 0;
+      for (int s = s0; s < s1; ++s) c += int((row[s] - top) * 0.5f > mid);
+      if (simd_sum(c) >= 512) lo = mid; else hi = mid;
+    }
+    int c = 0;
+    for (int s = s0; s < s1; ++s) c += int((row[s] - top) * 0.5f > hi);
+    cut = hi, extra = 512 - simd_sum(c);
+  }
+  float tau = -1.0f;
+  for (int it = 0; it < 40; ++it) {
+    float a = 0, b = 0;
+    for (int s = s0; s < s1; ++s) {
+      const float y = (row[s] - top) * 0.5f;
+      const float d = y > cut ? max(y - tau, 0.0f) : 0.0f;
+      a += d, b = fma(d, d, b);
+    }
+    const float de = max(cut - tau, 0.0f) * float(extra);
+    a = simd_sum(a) + de, b = simd_sum(b) + de * max(cut - tau, 0.0f);
+    const float next = tau + (b - 1.0f) / (2.0f * a);
+    if (!(next > tau)) break;
+    tau = next;
+  }
+  if (lane != 0) return;
+  // Expected cell-centre position in the 3 x 3 window around the best cell, and the window's mass.
+  const int by = arg / w, bx = arg % w;
+  float px = 0, py = 0, total = 0, inside = 0;
+  for (int dy = -1; dy <= 1; ++dy)
+    for (int dx = -1; dx <= 1; ++dx) {
+      int ny = by + dy, nx = bx + dx;
+      const bool in = ny >= 0 && ny < h && nx >= 0 && nx < w;
+      ny = clamp(ny, 0, h - 1), nx = clamp(nx, 0, w - 1);
+      float p = max((row[ny * w + nx] - top) * 0.5f - tau, 0.0f);
+      p *= p;
+      px += p * ((float(nx) + 0.5f) / float(w) * 2.0f - 1.0f), py += p * ((float(ny) + 0.5f) / float(h) * 2.0f - 1.0f);
+      total += p;
+      if (in) inside += p;
+    }
+  coarse[2 * tg] = px / total, coarse[2 * tg + 1] = py / total;
+  mass[tg] = inside;
+}
+
+// Network input from 8-bit pixels: bilinear resize to oh x ow of pixel / 255, then (v - mean) / std per
+// channel. ch bytes per pixel (1: grey; 3 or 4: R, G, B first). The source rows and columns come from the
+// host (taps: 3 floats per output row, then 3 per output column: first index, second index, weight of the
+// second), so they are the same as on the other backends to the last bit. Grid: oh * ow.
+kernel void k_preprocess(device const uchar* img [[buffer(0)]], device const float* taps [[buffer(1)]],
+                         constant int& stride [[buffer(2)]], constant int& ch [[buffer(3)]], constant int& oh [[buffer(4)]],
+                         constant int& ow [[buffer(5)]], constant float3& mean [[buffer(6)]], constant float3& stdev [[buffer(7)]],
+                         device real* out [[buffer(8)]], uint gid [[thread_position_in_grid]]) {
+  if (int(gid) >= oh * ow) return;
+  device const float* ty3 = taps + 3 * (int(gid) / ow);
+  device const float* tx3 = taps + 3 * (oh + int(gid) % ow);
+  const int y0 = int(ty3[0]), y1 = int(ty3[1]), x0 = int(tx3[0]), x1 = int(tx3[1]);
+  const float ty = ty3[2], tx = tx3[2];
+  for (int c = 0; c < 3; ++c) {
+    const int o = ch == 1 ? 0 : c;
+    const float p00 = float(img[size_t(y0) * stride + size_t(x0 * ch + o)]) / 255.0f;
+    const float p01 = float(img[size_t(y0) * stride + size_t(x1 * ch + o)]) / 255.0f;
+    const float p10 = float(img[size_t(y1) * stride + size_t(x0 * ch + o)]) / 255.0f;
+    const float p11 = float(img[size_t(y1) * stride + size_t(x1 * ch + o)]) / 255.0f;
+    const float top = p00 * (1 - tx) + p01 * tx, bottom = p10 * (1 - tx) + p11 * tx;
+    out[size_t(gid) * 3 + c] = real(((top * (1 - ty) + bottom * ty) - mean[c]) / stdev[c]);
+  }
+}
+#endif  // JMT_MPP

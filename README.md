@@ -3,16 +3,17 @@
 Image matching (FlexGlue) and covisibility with minimal dependencies, the companion of
 [just-keypoints](../just-keypoints). No PyTorch, no ONNX Runtime at run time. Plan and status: [PLAN.md](PLAN.md).
 
-Status: the CPU reference backend and the Metal and CUDA backends work and match the original FlexGlue. Metal
-is not as fast as PyTorch yet: about 0.8 s per pair at full settings on an M5 Pro (0.56 s in FP16), against
-7.5 s on the CPU and 0.4 s (0.16 s in FP16) for PyTorch on the same GPU. CUDA takes 0.73 s per pair on a
-laptop RTX 2070 Max-Q, and 0.35 s in FP16, where its kernels use the tensor cores.
-The WebGPU backend and the covisibility functions are planned.
+Status: the CPU reference backend and the Metal and CUDA backends work and match the original FlexGlue.
+On an M5 Pro, Metal takes 0.31 s per pair at full settings and 0.105 s in FP16, against 0.38 s and 0.16 s
+for PyTorch on the same GPU and 7.5 s on the CPU; describing an image takes 31 ms (13 ms in FP16).
+CUDA takes 0.73 s per pair on a laptop RTX 2070 Max-Q, and 0.35 s in FP16, where its kernels use the tensor
+cores. The WebGPU backend and the covisibility functions are planned.
 
 ## Build
 
 Needs CMake >= 3.16 and a C++17 compiler. Nothing else for the CPU backend. The Metal backend is built on
 macOS (`-DJMT_METAL=OFF` to leave it out); it uses only Metal.framework and compiles its shaders at run time.
+Its fast kernels need macOS 26 (Metal 4); on older systems it runs slower ones, with the same results in FP32.
 The CUDA backend is built when a CUDA compiler is found (`-DJMT_CUDA=OFF` to leave it out); it needs only
 the CUDA toolkit (nvcc and its runtime library), no cuBLAS or cuDNN.
 
@@ -38,7 +39,8 @@ jkp extract b.jpg --model raco --no-covariance --no-ranker --out b.jkpt
 build/release/jmt match a.jpg b.jpg --kpts-a a.jkpt --kpts-b b.jkpt --out matches.jmtt
 ```
 
-Options: `--backend cpu|metal|metal:fp16|cuda|cuda:fp16`, `--runs N` (report the fastest), `--weights FILE`, `--size N` (network input, default 512), `--layers N` (0..9, default 9),
+Options: `--backend cpu|metal|metal:fp16|cuda|cuda:fp16`, `--runs N` (report the fastest), `--batch N` (also
+time N copies of the pair as one batch), `--weights FILE`, `--size N` (network input, default 512), `--layers N` (0..9, default 9),
 `--filter T`, `--max-px D`, `--min-covisibility S`, `--early-stop D`, `--threads N`, `--dump-features`.
 
 ## C API
@@ -68,12 +70,16 @@ jmt_destroy(ctx);
 Keypoints are `[n][2]` pixel coordinates with (0,0) at the centre of the top-left pixel, as just-keypoints
 returns them.
 
+For many pairs, `jmt_match_batch` takes an array of `jmt_pair` and fills an array of `jmt_matches`: the same
+results, with the GPU kept busy while the host finishes each pair.
+
 ## Validation against the original
 
 ```sh
 python tools/compare.py a.jpg b.jpg --a upstream --b "cmd:build/release/jmt match"
 python tools/compare.py a.jpg b.jpg --a upstream --b "cmd:build/release/jmt match --backend metal"
 python tools/dump_golden.py a.jpg b.jpg      # then: cmake -S . -B build/release && ctest --test-dir build/release
+tools/compare_all.sh metal:fp16              # the 6 test pairs at two settings against the original
 ```
 
 ## Licenses

@@ -21,6 +21,8 @@ struct Tensor {
 };
 using TensorPtr = std::shared_ptr<Tensor>;
 
+enum class Act { None, Gelu, Relu };
+
 class Ops {
  public:
   virtual ~Ops() = default;
@@ -53,6 +55,8 @@ class Ops {
 
   // Rotary position encoding. x: n tokens x (heads * 2 * pairs) channels; cos, sin: n x pairs.
   // Each consecutive channel pair (a, b) of every head becomes (a cos - b sin, b cos + a sin).
+  // The caller keeps cos and sin unchanged and at the same address for as long as it uses the backend (the
+  // model computes them once per grid size): a backend may keep a device copy keyed by that address.
   virtual TensorPtr rotary(const TensorPtr& x, const std::vector<float>& cos, const std::vector<float>& sin,
                            int heads) = 0;
   // Scaled dot-product attention per head. q: (P, heads * d); k, v: (S, heads * d) -> (P, heads * d).
@@ -68,6 +72,54 @@ class Ops {
   // (coarse: N x 2 in [-1, 1]) and the probability mass of that window (mass: N).
   virtual void readout(const TensorPtr& query, const TensorPtr& search, float temperature, std::vector<float>* coarse,
                        std::vector<float>* mass) = 0;
+
+  // ---- Fused forms. A backend may override them to save passes over memory; the defaults compose the
+  // operations above, so the result is the same.
+
+  // act(x W^T + b) + residual. residual may be null.
+  virtual TensorPtr linear_fused(const TensorPtr& x, const Param& weight, const Param* bias, Act act,
+                                 const TensorPtr& residual) {
+    TensorPtr y = activate(linear(x, weight, bias), act);
+    return residual ? add(residual, y) : y;
+  }
+  // act(layer_norm(x)).
+  virtual TensorPtr layer_norm_act(const TensorPtr& x, const Param& gain, const Param& bias, float eps, Act act) {
+    return activate(layer_norm(x, gain, bias, eps), act);
+  }
+  // preprocess from 8-bit pixels: `channels` bytes per pixel (1: grey, 3 or 4: R, G, B first), rows of
+  // `stride` bytes. Same result as preprocess on the pixels divided by 255.
+  virtual TensorPtr preprocess_u8(const unsigned char* data, int height, int width, int stride, int channels,
+                                  int out_h, int out_w, const float mean[3], const float std[3]) {
+    std::vector<float> rgb(static_cast<size_t>(width) * height * 3);
+    for (int y = 0; y < height; ++y)
+      for (int x = 0; x < width; ++x) {
+        const unsigned char* p = data + static_cast<size_t>(y) * stride + static_cast<size_t>(x) * channels;
+        float* o = rgb.data() + (static_cast<size_t>(y) * width + x) * 3;
+        for (int c = 0; c < 3; ++c) o[c] = static_cast<float>(p[channels == 1 ? 0 : c]) / 255.0f;
+      }
+    return preprocess(rgb.data(), height, width, out_h, out_w, mean, std);
+  }
+
+  // ---- Read-out on the device. When has_device_readout() is true, readout_device and sample_at replace
+  // readout and sample in the head, so a pair needs no round trip to the host before its last operation.
+  virtual bool has_device_readout() const { return false; }
+  // As readout; coarse: 1 x N x 2 and mass: 1 x N x 1, both read back as float32 exactly.
+  virtual void readout_device(const TensorPtr& /*query*/, const TensorPtr& /*search*/, float /*temperature*/,
+                              TensorPtr* /*coarse*/, TensorPtr* /*mass*/) {}
+  // As sample, with the points taken from a tensor (1 x n x 2) made by readout_device.
+  virtual TensorPtr sample_at(const TensorPtr& /*x*/, const TensorPtr& /*pts*/) { return nullptr; }
+
+  // Device buffers created so far (0 when the backend does not count them). Tests use it to check that a
+  // second pair of the same size allocates nothing.
+  virtual long device_allocations() const { return 0; }
+
+  // GPU backends queue their work. flush starts what is queued without waiting for it; finish blocks until
+  // every tensor created so far is computed. Reading a tensor waits for that tensor.
+  virtual void flush() {}
+  virtual void finish() {}
+
+ private:
+  TensorPtr activate(const TensorPtr& x, Act act) { return act == Act::Gelu ? gelu(x) : act == Act::Relu ? relu(x) : x; }
 };
 
 std::unique_ptr<Ops> make_cpu_ops(int num_threads);
