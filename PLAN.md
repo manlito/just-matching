@@ -220,15 +220,16 @@ reference for recall, before any C++ is written for them.
     weights file (284 MB to download instead of 567, widened to float32 on load) passes the same FP16 runs.
   - Speed, per pair, 2048 keypoints per image, Berlin pair, best of 8 (`jmt match --runs 8`):
 
-    | Size, layers | WebGPU FP32 | WebGPU FP16 | Metal FP32 | Metal FP16 | Chrome FP32 |
-    |---|---|---|---|---|---|
-    | 512, 9 | 496 ms | 499 ms | 315 ms | 105 ms | 498-527 ms |
-    | 512, 5 | 285 ms | 281 ms | 181 ms | 62 ms | |
-    | 384, 9 | 219 ms | 215 ms | 141 ms | 49 ms | |
-    | 384, 5 | | | | | 126-132 ms |
+    | Size, layers | WebGPU FP32 | WebGPU FP16 | Metal FP32 | Metal FP16 | CPU | Chrome FP32 |
+    |---|---|---|---|---|---|---|
+    | 512, 9 | 496 ms | 499 ms | 315 ms | 105 ms | 7.2 s | 498-527 ms |
+    | 512, 5 | 285 ms | 281 ms | 181 ms | 62 ms | 4.3 s | |
+    | 384, 9 | 219 ms | 215 ms | 141 ms | 49 ms | 2.5 s | |
+    | 384, 5 | 126 ms | 124 ms | 82 ms | 29 ms | 1.4 s | 126-132 ms |
 
-    Describe, per image: 50 ms at 512 px and 30 ms at 384 px in both precisions (Metal: 32 / 13 and
-    20 / 8 ms); 50 and 31 ms in Chrome. FP16 is no faster: WGSL has no matrix hardware, the arithmetic is
+    CPU: the native CPU backend on all cores of the M5 Pro, best of 3. Describe, per image: 50 ms at 512 px
+    and 30 ms at 384 px in both precisions (Metal: 32 / 13 and 20 / 8 ms; CPU: 0.41 and 0.27 s); 50 and
+    31 ms in Chrome. FP16 is no faster: WGSL has no matrix hardware, the arithmetic is
     f32 in both modes, and these kernels are bound by arithmetic, not memory. See "Notes from M6".
   - Module: 294 KB of wasm and 100 KB of JS; weights fetched separately.
   - Not checked: Safari and Firefox (JSPI), Dawn on Vulkan or Direct3D 12, a GPU other than the M5 Pro.
