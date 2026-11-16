@@ -6,6 +6,9 @@
 Implementations (--a / --b):
     upstream[:cpu|mps|cuda][,fp16]   the original repository under PyTorch
     folded[:cpu|mps|cuda][,fp16]     reference forward pass from weights/flexglue.jmtw (tools/folded.py)
+    cmd:<command>                    external program, e.g. "cmd:build/release/jmt match"; it is run as
+                                     <command> A.png B.png --kpts-a A.jkpt --kpts-b B.jkpt --out OUT.jmtt
+                                     --size S --layers L --dump-features (tokens are not compared)
 
 Keypoints come from the just-keypoints CLI (RaCo, --keypoints N per image; $JKP overrides its path).
 Reported per pair, a against b:
@@ -46,11 +49,12 @@ def main():
             st = {}
             out.append(impl.match(f[0], xy[0], common.size_of(im[0]), f[1], xy[1], common.size_of(im[1]),
                                   n_layers=args.layers, stages=st))
-            feats.append([x.float().cpu() for x in f])
+            feats.append([impl.features(x) for x in f])
             stages.append(st)
         feat = max((feats[0][i] - feats[1][i]).abs().max().item() for i in (0, 1))
         key = f"tokens0_l{args.layers}"
-        tokens = (stages[0][key] - stages[1][key]).abs().max().item() if args.layers and key in stages[0] else 0.0
+        both = args.layers and key in stages[0] and key in stages[1]
+        tokens = (stages[0][key] - stages[1][key]).abs().max().item() if both else float("nan")
         sure = out[0]["confidence0"] > 0.1
         d = (out[0]["p2d0_i1"] - out[1]["p2d0_i1"]).norm(dim=-1)[sure]
         pos, med = (d.max().item(), d.median().item()) if len(d) else (0.0, 0.0)
@@ -62,7 +66,7 @@ def main():
               f"pos max {pos:.2e} median {med:.2e} px  conf {conf:.2e}  "
               f"covis {out[0]['covisibility']:.4f} / {out[1]['covisibility']:.4f}  "
               f"matches {na} / {nb}, same {same}")
-        worst["feat"], worst["tokens"] = max(worst["feat"], feat), max(worst["tokens"], tokens)
+        worst["feat"], worst["tokens"] = max(worst["feat"], feat), max(worst["tokens"], tokens if tokens == tokens else 0.0)
         worst["pos"], worst["conf"] = max(worst["pos"], pos), max(worst["conf"], conf)
         worst["same"] = min(worst["same"], same / max(na, nb, 1))
     print(f"worst: feat {worst['feat']:.2e}  tokens {worst['tokens']:.2e}  pos {worst['pos']:.2e} px  "

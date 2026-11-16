@@ -38,7 +38,7 @@ def main():
             im = common.load_image(path)
             st = {}
             feats.append(folded.describe(w, im, (args.size, args.size), st))
-            tensors[f"image{i}"] = (im * 255).round().byte().permute(1, 2, 0).numpy()
+            tensors[f"image{i}"] = (im * 255).round().permute(1, 2, 0).numpy()  # float32: the C++ reader loads only that
             tensors.update({f"im{i}.{k}": v.numpy() for k, v in st.items()})
             ims.append(im), xys.append(common.keypoints(path, args.keypoints))
             tensors[f"keypoints{i}"] = xys[-1].numpy()
@@ -47,7 +47,7 @@ def main():
                            n_layers=args.layers, stages=st)
     tensors.update({f"pair.{k}": v.numpy() for k, v in st.items()})
     for k, v in out.items():
-        tensors[f"out.{k}"] = v.numpy() if isinstance(v, torch.Tensor) else np.float32([v])
+        tensors[f"out.{k}"] = v.float().numpy() if isinstance(v, torch.Tensor) else np.float32([v])
     name = "-".join(os.path.splitext(os.path.basename(p))[0] for p in (args.a, args.b))
     path = args.out or os.path.join(common.ROOT, "build", "golden", f"{name}.jmtt")
     os.makedirs(os.path.dirname(path), exist_ok=True)

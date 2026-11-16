@@ -4,7 +4,7 @@ Minimal-dependency image matching for bundle-adjustment pipelines: FlexGlue, wri
 `../just-keypoints` (C++ core, hand-written CPU / CUDA / Metal / WebGPU kernels, no PyTorch or ONNX Runtime
 at run time), plus a covisibility function that decides which image pairs are worth matching.
 
-Status: M1 done (reference locked, presets measured); no C++ yet. Numbers marked "estimate" are computed
+Status: M1 and M2 done: the C++ library runs on the CPU and matches the original. No GPU backend yet. Numbers marked "estimate" are computed
 from the layer sizes, not measured.
 
 ## What FlexGlue is (reviewed at release v0.1, 2026-10-26)
@@ -73,7 +73,7 @@ convolution kernels; here it is one very good GEMM and one attention kernel per 
 
 ```c
 jmt_ctx* jmt_create(const jmt_config*);                       /* backend, weights, precision, input size */
-int  jmt_describe(jmt_ctx*, const jmt_image*, jmt_features**); /* once per image; features stay on the device */
+jmt_features* jmt_describe(jmt_ctx*, const jmt_image*);       /* once per image; features stay on the device */
 int  jmt_match(jmt_ctx*, const jmt_features* a, const float* xy_a, int na,
                const jmt_features* b, const float* xy_b, int nb,
                const jmt_match_options*, jmt_matches*);
@@ -87,7 +87,9 @@ void jmt_destroy(jmt_ctx*);
   both directions (`xy_a_in_b`, `xy_b_in_a`), `covisibility`, `stop_layer`.
 - `jmt_match_options`: `n_layers`, `filter_threshold` (0.1), `max_distance_px` (3), `min_covisibility`,
   `early_stop_decay`.
-- `jmt_features` can be saved and loaded, so a capture is described once.
+- `jmt_features` can be saved and loaded, so a capture is described once (not written yet).
+- Implemented so far: `jmt_create`, `jmt_describe`, `jmt_match`; see `include/jmt/jmt.h`. `jmt_covisibility` and
+  `jmt_shortlist` belong to the covisibility track.
 
 ## Covisibility
 
@@ -122,9 +124,14 @@ reference for recall, before any C++ is written for them.
   6.1e-6, features within 2.0e-5, tokens after layer 9 within 1.9e-4. Also checked at 256 px / 3 layers,
   384 px / 0 layers, and on MPS. Golden dump and `compare.py` exist. Presets and covisibility: see
   "Notes from M1". Not done: the MegaLoc comparison on our own captures (no capture was at hand).
-- [ ] **M2 — First matches from our own code**
-  `jmt describe`, `jmt match a.jkpt b.jkpt` on the CPU backend match upstream. Needs a blocked,
-  multi-threaded GEMM even here: a naive one takes minutes per pair.
+- [x] **M2 — First matches from our own code**
+  Done: `jmt match A B --kpts-a A.jkpt --kpts-b B.jkpt` (CPU, C++, no dependencies) matches the original on
+  6 pairs (FlexGlue and ALIKED sample images, 2048 RaCo keypoints each), at 512 px / 9 layers and at
+  384 px / 5 layers: identical matches (up to 1209 per pair), predicted points within 4.8e-4 px, confidence
+  within 1.6e-5, features within 2.5e-5, covisibility equal to 4 digits. Early stop gives the same layer
+  and score as the original. Every intermediate tensor of two golden dumps (384 px / 9 layers,
+  256 px / 3 layers) matches within 1e-5 of its largest value (tokens after 9 layers: 5.1e-4 on values up to 67). Speed is not a goal here: on the M5 Pro, 0.59 s per
+  image and 7.5 s per pair at 512 px / 9 layers (4.4 s with 5 layers, 2.5 s at 384 px); 67 s on one thread.
 - [ ] **M3 — Runs on the Mac GPU** (Metal, FP32 then FP16)
 - [ ] **M4 — Runs on NVIDIA** (CUDA; order of M3/M4 depends on the machine in use)
 - [ ] **M5 — Fast**
@@ -231,3 +238,24 @@ in the same scene. "Covisible" here means "same scene", so this tests scene sepa
   range (0.88 against 0.99), VLAD and the grid score a wide one.
 - Not tested: ranking partial overlap inside one capture, which is the real job of the shortlist. Needs a
   capture with known poses or MegaLoc as the reference.
+
+## Notes from M2
+
+- The graph (`src/models/flexglue/`) is written once against `src/core/ops.h`: 17 operations on token-major
+  tensors (h, w, c). A GPU backend implements that interface. The head's last steps (offset expectation,
+  sigmoid, mutual nearest neighbours) run on the host from values read back: a few thousand numbers per pair.
+  Expect to revise the interface when the first GPU backend shows what it needs (fused blocks, no read-backs
+  inside the layer loop for early stop).
+- Convolutions with a stride (stem 4x4, downsampling 2x2) and the neck's 3x3 are patch extraction plus one
+  matrix product; everything else heavy is `linear`, `attention` and `dwconv7`. One good matrix product per
+  backend covers most of the time.
+- The CPU matrix product is blocked (32 rows by a 256 KB slab of weights) and written as `y += a * x` loops
+  so the compiler vectorizes it without `-ffast-math`. Unlike just-keypoints the library is built with the
+  compiler's default floating-point contraction: FP16 on the GPU backends rules out bit-level agreement
+  anyway, and fused multiply-add is worth the speed here.
+- Weights are held twice on the CPU backend (as stored, and transposed on first use): about 1.1 GB.
+- The public API takes and returns keypoints in the just-keypoints convention and adds 0.5 inside.
+- `tools/compare.py` writes lossless PNGs for the program under test: JPEG decoders differ, and both sides
+  must see the same pixels for the comparison to mean anything.
+- `tests/golden_test.cpp` checks every stage against a golden dump (`ctest`, 2 dumps, 5 s) and is the main
+  debugging tool for new backends. Golden maps are stored (c, h, w); the test converts.

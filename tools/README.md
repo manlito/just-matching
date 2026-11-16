@@ -15,6 +15,7 @@ python tools/compare.py $A/berlin1.jpg $A/berlin2.jpg                       # or
 python tools/compare.py $A/berlin1.jpg $A/berlin2.jpg --layers 3 --size 256
 python tools/compare.py $A/berlin1.jpg $A/berlin2.jpg --a upstream:cpu --b upstream:mps,fp16
 python tools/dump_golden.py $A/berlin1.jpg $A/berlin2.jpg                   # -> build/golden/*.jmtt (not committed)
+python tools/compare.py $A/berlin1.jpg $A/berlin2.jpg --b "cmd:build/release/jmt match"   # original vs the C++ library
 python tools/presets.py $A/berlin*.jpg $A/lamar*.jpg --neg $A/lamar_cab_1446.jpg $A/lamar_cab_1450.jpg
 python tools/covis.py SCENE_DIR... --single IMAGE...                        # cheap covisibility scores vs FlexGlue's
 ```
@@ -26,7 +27,7 @@ python tools/covis.py SCENE_DIR... --single IMAGE...                        # ch
 | `folded.py` | forward pass from the weights file only; the executable specification for the C++ backends |
 | `upstream.py` | runs the original FlexGlue behind the same interface and exposes its tokens per layer |
 | `common.py` | image loading, keypoints from the `jkp` CLI (`$JKP` overrides its path), implementation selection |
-| `compare.py` | compares two implementations (`upstream`, `folded`; CPU, MPS or CUDA; FP32 or FP16) on image pairs |
+| `compare.py` | compares two implementations (`upstream`, `folded`, or `cmd:<program>` for the `jmt` CLI) on image pairs |
 | `dump_golden.py` | golden test vectors from the reference pass |
 | `presets.py` | accuracy and time against input size, layer count and precision, on synthetic pairs with exact ground truth |
 | `covis.py` | evaluates the covisibility levels of the plan on folders of images |
