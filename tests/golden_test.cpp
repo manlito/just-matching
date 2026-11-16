@@ -1,5 +1,5 @@
 // Compares every stage of the library against golden tensors dumped from the reference forward pass.
-//   golden_test WEIGHTS.jmtw GOLDEN.jmtt [cpu|metal|metal:fp16|cuda|cuda:fp16]
+//   golden_test WEIGHTS.jmtw GOLDEN.jmtt [cpu|metal|cuda|webgpu, each GPU one also :fp16]
 // FP16 is a sanity check with wide tolerances: it is not expected to reproduce the reference, and on a hard
 // pair up to 25 % of the queries (the unconfident ones) may land on another cell (measured at 256 px: 11 %
 // on Metal, 18 % on CUDA). tools/compare.py is the real FP16 check: it compares confident queries and matches.
@@ -74,10 +74,10 @@ void check_points(const std::string& name, const std::vector<float>& got, const 
 
 int main(int argc, char** argv) {
   const std::string backend = argc == 4 ? argv[3] : "cpu";
-  const bool fp16 = backend == "metal:fp16" || backend == "cuda:fp16";
+  const bool fp16 = backend.find(":fp16") != std::string::npos;
   const double loose = fp16 ? 300 : 1;
   if (argc < 3 || argc > 4) {
-    std::fprintf(stderr, "usage: golden_test WEIGHTS.jmtw GOLDEN.jmtt [cpu|metal|metal:fp16|cuda|cuda:fp16]\n");
+    std::fprintf(stderr, "usage: golden_test WEIGHTS.jmtw GOLDEN.jmtt [cpu|metal|cuda|webgpu, each GPU one also :fp16]\n");
     return 2;
   }
   try {
@@ -92,6 +92,9 @@ int main(int argc, char** argv) {
 #endif
 #ifdef JMT_HAVE_CUDA
     else if (backend == "cuda" || backend == "cuda:fp16") ops = jmt::make_cuda_ops(0, fp16);
+#endif
+#ifdef JMT_HAVE_WEBGPU
+    else if (backend == "webgpu" || backend == "webgpu:fp16") ops = jmt::make_webgpu_ops(fp16);
 #endif
     else throw std::runtime_error("this build has no " + backend + " backend");
 

@@ -3,13 +3,14 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <map>
 #include <string>
 #include <vector>
 
 namespace jmt {
 
-// A float32 tensor that lives inside a loaded container.
+// A float32 tensor that lives inside a loaded container (float16 tensors are widened to float32 on load).
 struct Param {
   std::vector<int> shape;
   const float* data = nullptr;
@@ -33,6 +34,7 @@ class Weights {
 
  private:
   std::vector<uint32_t> storage_;  // 4-byte aligned copy of the file
+  std::deque<std::vector<float>> widened_;  // float16 tensors as float32
   std::map<std::string, Param> tensors_;
   std::map<std::string, std::string> meta_;
 };

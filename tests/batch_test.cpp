@@ -1,6 +1,6 @@
 // Checks the C API on the image pair of a golden file: jmt_match_batch gives what jmt_match gives pair by
 // pair, and matching again allocates no device buffers.
-//   batch_test WEIGHTS.jmtw GOLDEN.jmtt [cpu|metal|metal:fp16|cuda|cuda:fp16]
+//   batch_test WEIGHTS.jmtw GOLDEN.jmtt [cpu|metal|cuda|webgpu, each GPU one also :fp16]
 #include <cmath>
 #include <cstdio>
 #include <stdexcept>
@@ -42,6 +42,7 @@ int main(int argc, char** argv) {
     config.input_size = golden.meta_int("size");
     if (backend.rfind("metal", 0) == 0) config.backend = JMT_BACKEND_METAL;
     else if (backend.rfind("cuda", 0) == 0) config.backend = JMT_BACKEND_CUDA;
+    else if (backend.rfind("webgpu", 0) == 0) config.backend = JMT_BACKEND_WEBGPU;
     if (backend.find(":fp16") != std::string::npos) config.precision = JMT_PRECISION_FP16;
     jmt_ctx* ctx = jmt_create(&config);
     if (!ctx) throw std::runtime_error(jmt_last_error());

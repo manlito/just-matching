@@ -33,8 +33,10 @@ python tools/covis.py SCENE_DIR... --single IMAGE...                        # ch
 | `covis.py` | evaluates the covisibility levels of the plan on folders of images |
 | `compare_all.sh` | `compare.py` on the 6 test pairs at 512 px / 9 layers and 384 px / 5 layers for one backend: `tools/compare_all.sh metal:fp16 [--save DIR]`; `JMT="tools/remote.sh user@host DIR build/release/jmt"` runs the CLI on another machine |
 | `bench_torch.py` | time of the original under PyTorch on the pair `bench.sh` uses, FP32 and FP16, for the benchmark table |
-| `bench.sh` | wall time and GPU time per kernel of the `jmt` CLI on the Berlin pair: `tools/bench.sh metal:fp16` |
+| `bench.sh` | wall time and GPU time per kernel of the `jmt` CLI on the Berlin pair: `tools/bench.sh metal:fp16` (WebGPU: wall time per kernel, a round trip each) |
 | `remote.sh` | runs the `jmt` CLI on another machine over SSH, so `compare.py` can check a backend this machine lacks: `--b "cmd:tools/remote.sh user@host DIR build/release/jmt match --backend cuda"` |
+| `fetch_webgpu.sh` | unpacks the pinned Dawn release (native) and emdawnwebgpu (browser) under `third_party/webgpu` |
+| `web_testdata.py` | the browser test page's data: the 6 test pairs as raw RGBA, their keypoints and the native CPU backend's results |
 | `bench_onnx.py` | times upstream's ONNX models under ONNX Runtime (`pip install onnxruntime`, or `onnxruntime-gpu` for `--providers cuda`; models from release v0.1 in `third_party/onnx/`) |
 
 Keypoints: just-keypoints returns `(0,0)` at the centre of the top-left pixel, FlexGlue expects it at that
