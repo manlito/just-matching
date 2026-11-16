@@ -127,5 +127,8 @@ std::unique_ptr<Ops> make_cpu_ops(int num_threads);
 std::unique_ptr<Ops> make_metal_ops(int device, bool fp16);
 // Only in builds with the CUDA backend. Same arguments.
 std::unique_ptr<Ops> make_cuda_ops(int device, bool fp16);
+// Only in builds with the WebGPU backend (Dawn natively, emdawnwebgpu in the browser). fp16 needs the
+// adapter's shader-f16 feature.
+std::unique_ptr<Ops> make_webgpu_ops(bool fp16);
 
 }  // namespace jmt

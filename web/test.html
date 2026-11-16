@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>just-matching browser test</title>
+<style>
+  :root { --bg: #fff; --fg: #1d1d1f; --muted: #6e6e73; --line: #e5e5ea; --ok: #1a7f37; --bad: #c62828; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #161618; --fg: #f2f2f7; --muted: #a1a1a6; --line: #333336; --ok: #4ac26b; --bad: #ff6b6b; }
+  }
+  body { background: var(--bg); color: var(--fg); font: 14px/1.45 system-ui, sans-serif; margin: 24px 16px; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  h2 { font-size: 15px; margin: 20px 0 4px; }
+  p { margin: 4px 0 12px; color: var(--muted); max-width: 76ch; }
+  #status { font-weight: 600; color: var(--fg); }
+  .wrap { overflow-x: auto; }
+  table { border-collapse: collapse; font-variant-numeric: tabular-nums; margin: 8px 0 16px; }
+  th, td { padding: 4px 10px; border-bottom: 1px solid var(--line); text-align: right; white-space: nowrap; }
+  th:first-child, td:first-child { text-align: left; }
+  th { color: var(--muted); font-weight: 500; }
+  .ok { color: var(--ok); } .bad { color: var(--bad); font-weight: 600; }
+</style>
+</head>
+<body>
+<h1>just-matching in the browser</h1>
+<p>Runs the WebAssembly module on WebGPU (FP32, and FP16 when the adapter has <code>shader-f16</code>) on the 6
+test pairs at 512 px / 9 layers and 384 px / 5 layers, and compares each result with the native CPU backend on
+the same pixels and keypoints (testdata/). FP32 must give the same matches, predicted points of confident
+queries within 0.01 px and covisibility within 1e-4; in FP16 at most 3 matches, or 3 % of them, may differ
+(present on one side only), as natively.</p>
+<p id="status">Loading…</p>
+<p id="adapter"></p>
+<div class="wrap" id="tables"></div>
+<script type="module">
+import * as jmt from './jmt.js';
+
+const status = document.getElementById('status');
+const tables = document.getElementById('tables');
+
+async function fetchBuffer(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`${url}: ${r.status}`);
+  return r.arrayBuffer();
+}
+
+async function loadImage(entry) {
+  const buf = await fetchBuffer('testdata/' + entry.rgba);
+  const v = new DataView(buf);
+  const w = v.getUint32(0, true), h = v.getUint32(4, true);
+  return { width: w, height: h, data: new Uint8Array(buf, 8, w * h * 4) };
+}
+
+// Result against the reference: matches as sets of index pairs, predicted points of the queries the
+// reference is confident about (> 0.1), confidences and covisibility.
+function compare(got, ref) {
+  const key = (m, i) => m[2 * i] * 65536 + m[2 * i + 1];
+  const refSet = new Set();
+  for (let i = 0; i < ref.matches.length / 2; i++) refSet.add(key(ref.matches, i));
+  let shared = 0;
+  for (let i = 0; i < got.n; i++) shared += refSet.has(key(got.matches, i));
+  const nRef = refSet.size;
+  let pos = 0, conf = 0;
+  for (const [pts, refPts, c, refC] of [[got.aInB, ref.a_in_b, got.confA, ref.conf_a], [got.bInA, ref.b_in_a, got.confB, ref.conf_b]]) {
+    for (let i = 0; i < refC.length; i++) {
+      conf = Math.max(conf, Math.abs(c[i] - refC[i]));
+      if (refC[i] > 0.1) pos = Math.max(pos, Math.hypot(pts[2 * i] - refPts[2 * i], pts[2 * i + 1] - refPts[2 * i + 1]));
+    }
+  }
+  const same = got.n === nRef && shared === nRef;
+  const differ = got.n + nRef - 2 * shared;  // matches on one side only
+  return { n: got.n, nRef, shared, same, differ, overlap: nRef ? shared / Math.max(nRef, got.n) : (got.n ? 0 : 1), pos, conf,
+           covis: Math.abs(got.covisibility - ref.covisibility) };
+}
+
+const fmt = (x, d = 1) => (x === undefined || Number.isNaN(x) ? '–' : x.toExponential(d));
+const ms = x => x.toFixed(0);
+
+async function run() {
+  const manifest = await (await fetch('testdata/manifest.json')).json();
+  const names = Object.keys(manifest.images);
+  const images = {};
+  for (const name of names) images[name] = await loadImage(manifest.images[name]);
+  const keypoints = {};
+  for (const name of names) keypoints[name] = new Float32Array(manifest.images[name].keypoints);
+
+  let adapterInfo = 'no WebGPU', hasF16 = false;
+  if (jmt.webgpuSupported()) {
+    const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+    if (adapter) {
+      const i = adapter.info || {};
+      adapterInfo = [i.vendor, i.architecture, i.device, i.description].filter(Boolean).join(' / ') || 'WebGPU adapter';
+      hasF16 = adapter.features.has('shader-f16');
+    }
+  }
+  document.getElementById('adapter').textContent = `Adapter: ${adapterInfo}. shader-f16: ${hasF16 ? 'yes' : 'no'}. ` +
+    `${navigator.userAgent.match(/Chrome\/[\d.]+/)?.[0] ?? navigator.userAgent}. Reference: ${manifest.reference}.`;
+  const params = new URLSearchParams(location.search);
+  const precisions = (params.get('precisions') ?? (hasF16 ? 'fp32,fp16' : 'fp32')).split(',');
+  const settings = manifest.pairs[0].refs.map(r => [r.size, r.layers]);
+
+  status.textContent = 'Loading the weights…';
+  const weights = new Uint8Array(await fetchBuffer(params.get('weights') ?? 'flexglue.jmtw'));
+  const summary = { adapter: adapterInfo, runs: [], ok: true };
+  for (const precision of precisions) {
+    for (const [si, [size, layers]] of settings.entries()) {
+      status.textContent = `WebGPU ${precision}, ${size} px: creating the matcher…`;
+      const t0 = performance.now();
+      const matcher = await jmt.create({ weights, precision, inputSize: size });
+      const tCreate = performance.now() - t0;
+      const rows = [];
+      for (const [pi, pair] of manifest.pairs.entries()) {
+        status.textContent = `WebGPU ${precision}, ${size} px / ${layers} layers: pair ${pi + 1} of ${manifest.pairs.length}…`;
+        let t = performance.now();
+        const fa = await matcher.describe(images[pair.a]), fb = await matcher.describe(images[pair.b]);
+        await matcher.finish();
+        const tDescribe = (performance.now() - t) / 2;
+        t = performance.now();
+        const got = await matcher.match(fa, keypoints[pair.a], fb, keypoints[pair.b], { layers });
+        const tMatch = performance.now() - t;
+        fa.destroy(), fb.destroy();
+        const c = compare(got, pair.refs[si]);
+        const ok = precision === 'fp32' ? c.same && c.pos <= 0.01 && c.covis <= 1e-4 : c.differ <= Math.max(3, 0.03 * c.nRef);
+        summary.ok &&= ok;
+        rows.push({ pair: `${pair.a} – ${pair.b}`, ok, tDescribe, tMatch, ...c });
+      }
+      matcher.destroy();
+      summary.runs.push({ precision, size, layers, tCreate, rows });
+      const title = document.createElement('h2');
+      title.textContent = `WebGPU ${precision}, ${size} px, ${layers} layers (matcher created in ${ms(tCreate)} ms; ` +
+        'the first pair compiles the kernels)';
+      const table = document.createElement('table');
+      table.innerHTML = '<tr><th>pair</th><th>matches</th><th>native</th><th>shared</th><th>points (px)</th>' +
+        '<th>confidence</th><th>covisibility</th><th>describe (ms per image)</th><th>match (ms)</th><th></th></tr>' +
+        rows.map(r => `<tr><td>${r.pair}</td><td>${r.n}</td><td>${r.nRef}</td><td>${(100 * r.overlap).toFixed(1)} %</td>` +
+          `<td>${fmt(r.pos)}</td><td>${fmt(r.conf)}</td><td>${fmt(r.covis)}</td><td>${ms(r.tDescribe)}</td>` +
+          `<td>${ms(r.tMatch)}</td><td class="${r.ok ? 'ok' : 'bad'}">${r.ok ? 'ok' : 'FAIL'}</td></tr>`).join('');
+      tables.append(title, table);
+    }
+  }
+  status.textContent = summary.ok ? 'All runs agree with the native results.' : 'Some runs differ from the native results.';
+  status.className = summary.ok ? 'ok' : 'bad';
+  return summary;
+}
+
+window.jmtTest = run().catch(e => {
+  status.textContent = 'Error: ' + e.message;
+  status.className = 'bad';
+  return { ok: false, error: e.message };
+});
+</script>
+</body>
+</html>

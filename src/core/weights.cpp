@@ -1,5 +1,7 @@
 #include "core/weights.h"
 
+#include "core/half.h"
+
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
@@ -67,11 +69,28 @@ Weights Weights::from_memory(const void* data, size_t size) {
     Param p;
     for (int d = 0; d < ndim; ++d) p.shape.push_back(static_cast<int>(r.uint(4)));
     uint64_t offset = r.uint(8), nbytes = r.uint(8);
-    if (dtype != 0) continue;  // only float32 tensors are used by the library
-    if (offset % 4 != 0 || offset > size || nbytes > size - offset || nbytes != p.size() * 4)
+    if (dtype != 0 && dtype != 1) continue;  // float32 and float16 tensors are used by the library
+    const size_t elem = dtype == 0 ? 4 : 2;
+    if (offset % elem != 0 || offset > size || nbytes > size - offset || nbytes != p.size() * elem)
       throw std::runtime_error("weights: bad tensor entry '" + name + "'");
-    p.data = reinterpret_cast<const float*>(w.storage_.data()) + offset / 4;
+    if (dtype == 0) {
+      p.data = reinterpret_cast<const float*>(w.storage_.data()) + offset / 4;
+    } else {  // float16 (half the download in the browser): widened to float32 here
+      std::vector<float> values(p.size());
+      const uint8_t* src = reinterpret_cast<const uint8_t*>(w.storage_.data()) + offset;
+      for (size_t j = 0; j < values.size(); ++j) {
+        uint16_t h;
+        std::memcpy(&h, src + 2 * j, 2);
+        values[j] = half_to_float(h);
+      }
+      w.widened_.push_back(std::move(values));
+      p.data = w.widened_.back().data();
+    }
     w.tensors_[name] = p;
+  }
+  if (!w.widened_.empty() && w.tensors_.size() == w.widened_.size()) {
+    w.storage_.clear();  // nothing points into the file any more
+    w.storage_.shrink_to_fit();
   }
   return w;
 }

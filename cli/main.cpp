@@ -31,7 +31,8 @@ namespace {
 void usage() {
   std::fprintf(stderr,
                "usage: jmt match A B --kpts-a A.jkpt --kpts-b B.jkpt [--out OUT.jmtt] [options]\n"
-               "  --backend B            cpu (default), metal, metal:fp16, cuda, cuda:fp16\n"
+               "  --backend B            cpu (default), metal, metal:fp16, cuda, cuda:fp16,\n"
+               "                         webgpu, webgpu:fp16\n"
                "  --weights FILE         weights file (default weights/flexglue.jmtw)\n"
                "  --size N               network input side, multiple of 32 (default 512)\n"
                "  --layers N             transformer layers, 0..9 (default 9)\n"
@@ -95,6 +96,8 @@ int main(int argc, char** argv) {
         else if (b == "metal:fp16") config.backend = JMT_BACKEND_METAL, config.precision = JMT_PRECISION_FP16;
         else if (b == "cuda") config.backend = JMT_BACKEND_CUDA;
         else if (b == "cuda:fp16") config.backend = JMT_BACKEND_CUDA, config.precision = JMT_PRECISION_FP16;
+        else if (b == "webgpu") config.backend = JMT_BACKEND_WEBGPU;
+        else if (b == "webgpu:fp16") config.backend = JMT_BACKEND_WEBGPU, config.precision = JMT_PRECISION_FP16;
         else throw std::runtime_error("unknown backend " + b);
       }
       else if (a == "--runs") runs = std::stoi(value());
