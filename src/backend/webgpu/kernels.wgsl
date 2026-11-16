@@ -12,9 +12,7 @@
 //   `fn group(g: u32, li: u32)`, called by every thread of N-thread workgroup number g (li: thread in the
 //   group; surplus groups have g >= the kernel's count).
 // - `$O` is the output type of a kernel instance: `real`, or `f32` for an instance named with `_f32`.
-//   An instance name may also carry `_r{R}c{C}` (replaces `$R` and `$C`) and flags such as `_v4`: a line
-//   that starts with `//?v4 ` is kept (without that prefix) only in instances with the flag, a line that
-//   starts with `//?s ` only in instances without any flag.
+//   An instance name may also carry `_r{R}c{C}` (replaces `$R` and `$C`).
 // - Binding 0 holds the kernel's scalar arguments (`P`, 64 words, read with pi / pu / pf by position, in
 //   the order the host passes them). Buffers bind to 1, 2, ... in the order the host passes them.
 //
@@ -65,19 +63,16 @@ fn div_rn(a: f32, b: f32) -> f32 {
 //@kernel k_mm
 // Matrix product: out (n, cout) = act(scale * x (n, cin) W^T + bias) + residual, W stored (cout, cin) as in
 // the weights file. Scalars: n, cin, cout, flags (1 = bias, 2 = residual (n, cout)), act, scale.
-// One workgroup: a (16 R) x (16 C) tile of the output; one thread: R tokens x C channels, interleaved
-// (thread (ty, tx) has tokens ty + 16 r and channels tx + 16 c), so neighbouring threads store
+// The general form, for any cin; k_mmd (cin a multiple of 4) and k_mmh (FP16, cin a multiple of 8) are the
+// fast ones. One workgroup: a (16 R) x (16 C) tile of the output; one thread: R tokens x C channels,
+// interleaved (thread (ty, tx) has tokens ty + 16 r and channels tx + 16 c), so neighbouring threads store
 // neighbouring outputs. The operands go through workgroup memory 16 inputs at a time, a row as 4 vectors
-// (plus one of padding against bank conflicts); a thread reads one vector per row and input quad and
-// accumulates dot products. Every vector in workgroup memory is written whole by one thread (threads
-// writing different components of one vector race on some compilers).
-// Instances: k_mm_r{R}c{C}, with _v4 when cin is a multiple of 4 (vector loads from memory).
+// plus one of padding. Every vector in workgroup memory is written whole by one thread (threads writing
+// different components of one vector race on some compilers). Instances: k_mm_r{R}c{C}.
 // Groups: ceil(cout / (16 C)) * ceil(n / (16 R)), channel tile fastest.
 //@group 256
-//?v4 @group(0) @binding(1) var<storage, read> x: array<vec4<real>>;
-//?v4 @group(0) @binding(2) var<storage, read> wt: array<vec4<real>>;
-//?s @group(0) @binding(1) var<storage, read> x: array<real>;
-//?s @group(0) @binding(2) var<storage, read> wt: array<real>;
+@group(0) @binding(1) var<storage, read> x: array<real>;
+@group(0) @binding(2) var<storage, read> wt: array<real>;
 @group(0) @binding(3) var<storage, read> bias: array<real>;
 @group(0) @binding(4) var<storage, read> residual: array<real>;
 @group(0) @binding(5) var<storage, read_write> out: array<$O>;
@@ -89,20 +84,16 @@ const SV = 5u;  // vectors per tile row: 16 inputs and one of padding
 var<workgroup> xs: array<vec4<f32>, BR * SV>;
 var<workgroup> ws: array<vec4<f32>, BC * SV>;
 
-// Inputs k .. k + 3 of row `row` (zeros past cin); row * cin + k is a multiple of 4 in the _v4 instance.
-fn load4x(row: u32, k: u32, cin: u32) -> vec4<f32> {
-//?v4 if (k >= cin) { return vec4<f32>(0.0); }
-//?v4 return vec4<f32>(x[(row * cin + k) / 4u]);
-//?s var r = vec4<f32>(0.0);
-//?s for (var j = 0u; j < 4u; j++) { if (k + j < cin) { r[j] = f32(x[row * cin + k + j]); } }
-//?s return r;
+// Inputs k .. k + 3 of the row starting at `base` (zeros past cin).
+fn load4x(base: u32, k: u32, cin: u32) -> vec4<f32> {
+  var r = vec4<f32>(0.0);
+  for (var j = 0u; j < 4u; j++) { if (k + j < cin) { r[j] = f32(x[base + k + j]); } }
+  return r;
 }
-fn load4w(row: u32, k: u32, cin: u32) -> vec4<f32> {
-//?v4 if (k >= cin) { return vec4<f32>(0.0); }
-//?v4 return vec4<f32>(wt[(row * cin + k) / 4u]);
-//?s var r = vec4<f32>(0.0);
-//?s for (var j = 0u; j < 4u; j++) { if (k + j < cin) { r[j] = f32(wt[row * cin + k + j]); } }
-//?s return r;
+fn load4w(base: u32, k: u32, cin: u32) -> vec4<f32> {
+  var r = vec4<f32>(0.0);
+  for (var j = 0u; j < 4u; j++) { if (k + j < cin) { r[j] = f32(wt[base + k + j]); } }
+  return r;
 }
 
 fn group(g: u32, li: u32) {
@@ -118,39 +109,18 @@ fn group(g: u32, li: u32) {
   let ty = li / 16u;
   var acc: array<f32, TR * TC>;
   for (var i = 0u; i < TR * TC; i++) { acc[i] = 0.0; }
-  // Loads: vector e of a tile is inputs 4 (e % 4) .. + 3 of its row e / 4. The next tile's are fetched
-  // into registers while the current one is multiplied.
-  var xv: array<vec4<f32>, TR / 4u>;
-  var wv: array<vec4<f32>, TC / 4u>;
-  for (var i = 0u; i < TR / 4u; i++) {
-    let e = li + 256u * i;
-    xv[i] = load4x(min(r0 + e / 4u, n - 1u), (e % 4u) * 4u, cin);
-  }
-  for (var i = 0u; i < TC / 4u; i++) {
-    let e = li + 256u * i;
-    wv[i] = load4w(min(c0 + e / 4u, cout - 1u), (e % 4u) * 4u, cin);
-  }
   for (var k0 = 0u; k0 < cin; k0 += 16u) {
+    // Vector e of a tile is inputs 4 (e % 4) .. + 3 of its row e / 4.
     workgroupBarrier();
     for (var i = 0u; i < TR / 4u; i++) {
       let e = li + 256u * i;
-      xs[(e / 4u) * SV + e % 4u] = xv[i];
+      xs[(e / 4u) * SV + e % 4u] = load4x(min(r0 + e / 4u, n - 1u) * cin, k0 + (e % 4u) * 4u, cin);
     }
     for (var i = 0u; i < TC / 4u; i++) {
       let e = li + 256u * i;
-      ws[(e / 4u) * SV + e % 4u] = wv[i];
+      ws[(e / 4u) * SV + e % 4u] = load4w(min(c0 + e / 4u, cout - 1u) * cin, k0 + (e % 4u) * 4u, cin);
     }
     workgroupBarrier();
-    if (k0 + 16u < cin) {
-      for (var i = 0u; i < TR / 4u; i++) {
-        let e = li + 256u * i;
-        xv[i] = load4x(min(r0 + e / 4u, n - 1u), k0 + 16u + (e % 4u) * 4u, cin);
-      }
-      for (var i = 0u; i < TC / 4u; i++) {
-        let e = li + 256u * i;
-        wv[i] = load4w(min(c0 + e / 4u, cout - 1u), k0 + 16u + (e % 4u) * 4u, cin);
-      }
-    }
     for (var q = 0u; q < 4u; q++) {
       var b: array<vec4<f32>, TC>;
       for (var c = 0u; c < TC; c++) { b[c] = ws[(tx + 16u * c) * SV + q]; }
@@ -158,6 +128,125 @@ fn group(g: u32, li: u32) {
         let a = xs[(ty + 16u * r) * SV + q];
         for (var c = 0u; c < TC; c++) { acc[r * TC + c] += dot(a, b[c]); }
       }
+    }
+  }
+  let scale = pf(5u);
+  let act = pi(4u);
+  for (var r = 0u; r < TR; r++) {
+    let row = r0 + ty + 16u * r;
+    if (row >= n) { break; }
+    for (var c = 0u; c < TC; c++) {
+      let col = c0 + tx + 16u * c;
+      if (col >= cout) { break; }
+      var v = acc[r * TC + c] * scale;
+      if ((flags & 1u) != 0u) { v += f32(bias[col]); }
+      v = activate(v, act);
+      let o = row * cout + col;
+      if ((flags & 2u) != 0u) { v += f32(residual[o]); }
+      out[o] = $O(v);
+    }
+  }
+}
+
+//@kernel k_mmh
+// k_mm with half arithmetic (FP16 mode, cin a multiple of 8), without workgroup memory: a thread reads its
+// R rows of x and C rows of W straight from the buffers, 8 values per 16-byte load (two vec4<f16> in a
+// vec4<u32>), and accumulates f16 dot products of 8 inputs in f32. On the M5 Pro, staging the operands in
+// workgroup memory gained nothing, and 8 halves per load instead of 4 gave 3.0 -> 3.7 T multiply-adds/s.
+//@group 256
+@group(0) @binding(1) var<storage, read> x: array<vec4<u32>>;
+@group(0) @binding(2) var<storage, read> wt: array<vec4<u32>>;
+@group(0) @binding(3) var<storage, read> bias: array<real>;
+@group(0) @binding(4) var<storage, read> residual: array<real>;
+@group(0) @binding(5) var<storage, read_write> out: array<$O>;
+const TR = $Ru;
+const TC = $Cu;
+const BR = 16u * TR;
+const BC = 16u * TC;
+
+fn group(g: u32, li: u32) {
+  let n = pu(0u);
+  let cin = pu(1u);
+  let cout = pu(2u);
+  let flags = pu(3u);
+  let ctiles = (cout + BC - 1u) / BC;
+  if (g >= ctiles * ((n + BR - 1u) / BR)) { return; }
+  let c0 = (g % ctiles) * BC;
+  let r0 = (g / ctiles) * BR;
+  let tx = li % 16u;
+  let ty = li / 16u;
+  var acc: array<f32, TR * TC>;
+  for (var i = 0u; i < TR * TC; i++) { acc[i] = 0.0; }
+  var xb: array<u32, TR>;
+  var wb: array<u32, TC>;
+  for (var r = 0u; r < TR; r++) { xb[r] = min(r0 + ty + 16u * r, n - 1u) * (cin / 8u); }
+  for (var c = 0u; c < TC; c++) { wb[c] = min(c0 + tx + 16u * c, cout - 1u) * (cin / 8u); }
+  for (var k0 = 0u; k0 < cin / 8u; k0 += 1u) {
+    var b: array<vec4<u32>, TC>;
+    for (var c = 0u; c < TC; c++) { b[c] = wt[wb[c] + k0]; }
+    for (var r = 0u; r < TR; r++) {
+      let a = x[xb[r] + k0];
+      let a0 = bitcast<vec4<f16>>(a.xy);
+      let a1 = bitcast<vec4<f16>>(a.zw);
+      for (var c = 0u; c < TC; c++) { acc[r * TC + c] += f32(dot(a0, bitcast<vec4<f16>>(b[c].xy)) + dot(a1, bitcast<vec4<f16>>(b[c].zw))); }
+    }
+  }
+  let scale = pf(5u);
+  let act = pi(4u);
+  for (var r = 0u; r < TR; r++) {
+    let row = r0 + ty + 16u * r;
+    if (row >= n) { break; }
+    for (var c = 0u; c < TC; c++) {
+      let col = c0 + tx + 16u * c;
+      if (col >= cout) { break; }
+      var v = acc[r * TC + c] * scale;
+      if ((flags & 1u) != 0u) { v += f32(bias[col]); }
+      v = activate(v, act);
+      let o = row * cout + col;
+      if ((flags & 2u) != 0u) { v += f32(residual[o]); }
+      out[o] = $O(v);
+    }
+  }
+}
+
+//@kernel k_mmd
+// k_mm without workgroup memory (cin a multiple of 4): a thread reads its R rows of x and C rows of W
+// straight from the buffers, 4 values per load. Arithmetic in f32. The products of FP32 mode, and those of
+// FP16 mode with float output (the read-out's logits) or cin not a multiple of 8.
+//@group 256
+@group(0) @binding(1) var<storage, read> x: array<vec4<real>>;
+@group(0) @binding(2) var<storage, read> wt: array<vec4<real>>;
+@group(0) @binding(3) var<storage, read> bias: array<real>;
+@group(0) @binding(4) var<storage, read> residual: array<real>;
+@group(0) @binding(5) var<storage, read_write> out: array<$O>;
+const TR = $Ru;
+const TC = $Cu;
+const BR = 16u * TR;
+const BC = 16u * TC;
+
+fn group(g: u32, li: u32) {
+  let n = pu(0u);
+  let cin = pu(1u);
+  let cout = pu(2u);
+  let flags = pu(3u);
+  let ctiles = (cout + BC - 1u) / BC;
+  if (g >= ctiles * ((n + BR - 1u) / BR)) { return; }
+  let c0 = (g % ctiles) * BC;
+  let r0 = (g / ctiles) * BR;
+  let tx = li % 16u;
+  let ty = li / 16u;
+  var acc: array<f32, TR * TC>;
+  for (var i = 0u; i < TR * TC; i++) { acc[i] = 0.0; }
+  var xb: array<u32, TR>;
+  var wb: array<u32, TC>;
+  for (var r = 0u; r < TR; r++) { xb[r] = min(r0 + ty + 16u * r, n - 1u) * (cin / 4u); }
+  for (var c = 0u; c < TC; c++) { wb[c] = min(c0 + tx + 16u * c, cout - 1u) * (cin / 4u); }
+  for (var k0 = 0u; k0 < cin / 4u; k0 += 1u) {
+    var b: array<vec4<f32>, TC>;
+    for (var c = 0u; c < TC; c++) { b[c] = vec4<f32>(wt[wb[c] + k0]); }
+    for (var r = 0u; r < TR; r++) {
+      let a = vec4<f32>(x[xb[r] + k0]);
+      for (var c = 0u; c < TC; c++) { acc[r * TC + c] += dot(a, b[c]); }
     }
   }
   let scale = pf(5u);
@@ -208,15 +297,14 @@ fn run(gid: u32) {
 //@kernel k_dwconv7
 // Depthwise 7x7, padding 3. taps: (49, c). One thread: 4 channels of 4 neighbouring outputs of a row, so
 // every input it loads serves the taps of all 4. Scalars: h, w, c. Grid: h * ceil(w / 4) * c / 4.
-@group(0) @binding(1) var<storage, read> x: array<real>;
-@group(0) @binding(2) var<storage, read> taps: array<real>;
-@group(0) @binding(3) var<storage, read> bias: array<real>;
-@group(0) @binding(4) var<storage, read_write> out: array<real>;
+@group(0) @binding(1) var<storage, read> x: array<vec4<real>>;
+@group(0) @binding(2) var<storage, read> taps: array<vec4<real>>;
+@group(0) @binding(3) var<storage, read> bias: array<vec4<real>>;
+@group(0) @binding(4) var<storage, read_write> out: array<vec4<real>>;
 
-fn ld4(a: u32) -> vec4<f32> { return vec4<f32>(f32(x[a]), f32(x[a + 1u]), f32(x[a + 2u]), f32(x[a + 3u])); }
-fn tap4(a: u32) -> vec4<f32> {
-  return vec4<f32>(f32(taps[a]), f32(taps[a + 1u]), f32(taps[a + 2u]), f32(taps[a + 3u]));
-}
+// c is a multiple of 4, so 4 channels are one vector of the buffers.
+fn ld4(a: u32) -> vec4<f32> { return vec4<f32>(x[a / 4u]); }
+fn tap4(a: u32) -> vec4<f32> { return vec4<f32>(taps[a / 4u]); }
 
 fn run(gid: u32) {
   let h = pi(0u);
@@ -229,7 +317,7 @@ fn run(gid: u32) {
   let rest = i32(gid) / c4;
   let x0 = (rest % wq) * 4;
   let y = rest / wq;
-  let b = vec4<f32>(f32(bias[q * 4]), f32(bias[q * 4 + 1]), f32(bias[q * 4 + 2]), f32(bias[q * 4 + 3]));
+  let b = vec4<f32>(bias[q]);
   var acc = array<vec4<f32>, 4>(b, b, b, b);
   for (var ky = 0; ky < 7; ky++) {
     let sy = y + ky - 3;
@@ -248,10 +336,7 @@ fn run(gid: u32) {
   for (var o = 0; o < 4; o++) {
     if (x0 + o >= w) { break; }
     let a = u32((y * w + x0 + o) * c + q * 4);
-    out[a] = real(acc[o].x);
-    out[a + 1u] = real(acc[o].y);
-    out[a + 2u] = real(acc[o].z);
-    out[a + 3u] = real(acc[o].w);
+    out[a / 4u] = vec4<real>(acc[o]);
   }
 }
 
@@ -470,86 +555,88 @@ fn run(gid: u32) {
   out[gid] = real(p00 * (1.0 - tx) * (1.0 - ty) + p01 * tx * (1.0 - ty) + p10 * (1.0 - tx) * ty + p11 * tx * ty);
 }
 
-//@kernel k_attn
-// Attention with 64 channels per head, without a weights buffer: out = softmax(q k^T / 8) v per head.
-// One workgroup: 64 queries of one head; it walks the source tokens 64 at a time. Thread (ty, tx) holds
-// queries ty + 16 r (r < 4) and, per tile, the logits of tokens 4 tx .. 4 tx + 3. Per tile:
-//   logits    q k^T, the operands through workgroup memory 16 channels at a time as vectors of 4 channels;
-//             a thread reads its keys' vectors in an order rotated by tx, which spreads the reads of the
-//             16 threads of a row over the banks
-//   softmax   the largest logit of each query so far, from the 16 threads that share its row; when it
-//             grows, the outputs and the partial sums so far are scaled to the new reference
-//   values    out += weights v, 16 tokens at a time: the weights as vectors of 4 tokens (each written
-//             whole by the thread that holds them), the values as vectors of 4 channels; a thread holds
-//             outputs 4 tx .. 4 tx + 3 of its queries
-// Each thread keeps the sum of its own weights; the 16 partial sums of a row are added at the end.
+//@kernel k_tokens_t
+// Values of attention, transposed and packed for k_attnh: out[(channel * S8 + s / 8)] holds channel
+// `channel` of tokens s .. s + 7 as 8 f16 (zeros past S). Scalars: S, C (channels), S8 = ceil(S / 8).
+@group(0) @binding(1) var<storage, read> x: array<real>;
+@group(0) @binding(2) var<storage, read_write> out: array<vec4<u32>>;
+
+fn run(gid: u32) {
+  let S = pu(0u);
+  let C = pu(1u);
+  let S8 = pu(2u);
+  if (gid >= C * S8) { return; }
+  let ch = gid / S8;
+  let s = (gid % S8) * 8u;
+  var h: array<real, 8>;
+  for (var j = 0u; j < 8u; j++) {
+    h[j] = real(0.0);
+    if (s + j < S) { h[j] = x[(s + j) * C + ch]; }
+  }
+  out[gid] = vec4<u32>(bitcast<vec2<u32>>(vec4<real>(h[0], h[1], h[2], h[3])), bitcast<vec2<u32>>(vec4<real>(h[4], h[5], h[6], h[7])));
+}
+
+//@kernel k_attnh
+// k_attnd (attention, see there) with half arithmetic (FP16 mode). The logits read q and k straight from the buffers, 8 channels
+// per 16-byte load; only the weights go through workgroup memory (vec4<f16> of 4 tokens, each written
+// whole by the thread that holds them); the values come transposed (vt, from k_tokens_t), 8 tokens of
+// one channel per load. Products and sums of 8 terms are f16, everything across them f32.
 // Scalars: P, S, heads. Groups: heads * ceil(P / 64).
 //@group 256
-@group(0) @binding(1) var<storage, read> q: array<vec4<real>>;
-@group(0) @binding(2) var<storage, read> k: array<vec4<real>>;
-@group(0) @binding(3) var<storage, read> v: array<vec4<real>>;
-@group(0) @binding(4) var<storage, read_write> out: array<vec4<real>>;
-const SV = 5u;  // vectors per row of a logits operand tile: 4 and one of padding
-// Logits: queries at [0, 320) and keys at [320, 640), row-major with SV vectors per row.
-// Values phase: weights at [0, 256) (query * 4 + token quad), values at [256, 512) (token * 16 + quad).
-var<workgroup> sm: array<vec4<f32>, 640>;
-var<workgroup> red: array<f32, 1024>;  // [64 queries][16 threads]: partial maxima, then partial sums
+@group(0) @binding(1) var<storage, read> q: array<vec4<u32>>;
+@group(0) @binding(2) var<storage, read> k: array<vec4<u32>>;
+@group(0) @binding(3) var<storage, read> vt: array<vec4<u32>>;
+@group(0) @binding(4) var<storage, read_write> out: array<vec4<f16>>;
+var<workgroup> sw: array<vec4<f16>, 1024>;  // [64 queries][16 token quads]: the weights of a tile
+var<workgroup> red: array<vec4<f32>, 256>;  // [thread]: the maxima, then the sums, of its part of its 4 rows
+
+fn h0(v: vec4<u32>) -> vec4<f16> { return bitcast<vec4<f16>>(v.xy); }
+fn h1(v: vec4<u32>) -> vec4<f16> { return bitcast<vec4<f16>>(v.zw); }
+fn dot8(a: vec4<u32>, b: vec4<u32>) -> f16 { return dot(h0(a), h0(b)) + dot(h1(a), h1(b)); }
 
 fn group(g: u32, li: u32) {
   let Pq = pu(0u);
   let S = pu(1u);
   let heads = pu(2u);
-  let C4 = heads * 16u;  // vectors per token
+  let C8 = heads * 8u;  // loads per token
+  let S8 = (S + 7u) / 8u;
   let pblocks = (Pq + 63u) / 64u;
   if (g >= heads * pblocks) { return; }
   let hd = g / pblocks;
   let p0 = (g % pblocks) * 64u;
   let tx = li % 16u;
   let ty = li / 16u;
-  // Logits loads: vector li % 4 of the 16-channel chunk of row li / 4, for queries and keys.
-  let lr = li / 4u;
-  let lq = li % 4u;
-  let qbase = min(p0 + lr, Pq - 1u) * C4 + hd * 16u + lq;
-  // Values loads: vector li % 16 of token li / 16 of a 16-token chunk.
-  let vt = li / 16u;
+  // Rows past P and tokens past S are clamped to the last one; their results are not used.
+  var qb: array<u32, 4>;
+  for (var r = 0u; r < 4u; r++) { qb[r] = min(p0 + ty + 16u * r, Pq - 1u) * C8 + hd * 8u; }
+  let vbase = (hd * 64u + 4u * tx) * S8;
   var o: array<vec4<f32>, 4>;
   var top = vec4<f32>(kLowest);
-  var part = vec4<f32>(0.0);  // this thread's share of each row's sum of weights
+  var part = vec4<f32>(0.0);
   for (var r = 0u; r < 4u; r++) { o[r] = vec4<f32>(0.0); }
   for (var s0 = 0u; s0 < S; s0 += 64u) {
-    let kbase = min(s0 + lr, S - 1u) * C4 + hd * 16u + lq;
+    var kb: array<u32, 4>;
+    for (var c = 0u; c < 4u; c++) { kb[c] = min(s0 + 4u * tx + c, S - 1u) * C8 + hd * 8u; }
     var l: array<vec4<f32>, 4>;  // l[r][c]: query ty + 16 r, token s0 + 4 tx + c
     for (var r = 0u; r < 4u; r++) { l[r] = vec4<f32>(0.0); }
-    for (var c0 = 0u; c0 < 16u; c0 += 4u) {
-      workgroupBarrier();
-      sm[lr * SV + lq] = vec4<f32>(q[qbase + c0]);
-      sm[320u + lr * SV + lq] = vec4<f32>(k[kbase + c0]);
-      workgroupBarrier();
-      for (var j = 0u; j < 4u; j++) {
-        let qv = (j + tx) % 4u;
-        let kb = 320u + tx * 4u * SV + qv;
-        let b0 = sm[kb];
-        let b1 = sm[kb + SV];
-        let b2 = sm[kb + 2u * SV];
-        let b3 = sm[kb + 3u * SV];
-        for (var r = 0u; r < 4u; r++) {
-          let a = sm[(ty + 16u * r) * SV + qv];
-          l[r] += vec4<f32>(dot(a, b0), dot(a, b1), dot(a, b2), dot(a, b3));
-        }
+    for (var j = 0u; j < 8u; j++) {
+      let b0 = k[kb[0] + j];
+      let b1 = k[kb[1] + j];
+      let b2 = k[kb[2] + j];
+      let b3 = k[kb[3] + j];
+      for (var r = 0u; r < 4u; r++) {
+        let a = q[qb[r] + j];
+        l[r] += vec4<f32>(vec4<f16>(dot8(a, b0), dot8(a, b1), dot8(a, b2), dot8(a, b3)));
       }
     }
-    // Scaled logits; source tokens past S get the lowest value. Then the row maxima.
     let valid = vec4<u32>(s0 + tx * 4u) + vec4<u32>(0u, 1u, 2u, 3u) < vec4<u32>(S);
-    for (var r = 0u; r < 4u; r++) {
-      l[r] = select(vec4<f32>(kLowest), l[r] * 0.125, valid);  // 1 / sqrt(64)
-      red[(ty + 16u * r) * 16u + tx] = max(max(l[r].x, l[r].y), max(l[r].z, l[r].w));
-    }
+    for (var r = 0u; r < 4u; r++) { l[r] = select(vec4<f32>(kLowest), l[r] * 0.125, valid); }  // 1 / sqrt(64)
+    // The 16 threads with the same ty hold the same 4 rows.
+    red[li] = vec4<f32>(max(max(l[0].x, l[0].y), max(l[0].z, l[0].w)), max(max(l[1].x, l[1].y), max(l[1].z, l[1].w)),
+                        max(max(l[2].x, l[2].y), max(l[2].z, l[2].w)), max(max(l[3].x, l[3].y), max(l[3].z, l[3].w)));
     workgroupBarrier();
     var grown = top;
-    for (var t = 0u; t < 16u; t++) {
-      grown = max(grown, vec4<f32>(red[ty * 16u + t], red[(ty + 16u) * 16u + t], red[(ty + 32u) * 16u + t],
-                                   red[(ty + 48u) * 16u + t]));
-    }
+    for (var t = 0u; t < 16u; t++) { grown = max(grown, red[ty * 16u + t]); }
     let shrink = exp(top - grown);  // 0 on the first tile, 1 for rows whose maximum did not grow
     top = grown;
     part *= shrink;
@@ -557,37 +644,152 @@ fn group(g: u32, li: u32) {
       o[r] *= shrink[r];
       l[r] = select(vec4<f32>(0.0), exp(l[r] - vec4<f32>(top[r])), valid);  // the weights
       part[r] += (l[r].x + l[r].y) + (l[r].z + l[r].w);
+      sw[(ty + 16u * r) * 16u + tx] = vec4<f16>(l[r]);
     }
-    for (var t0 = 0u; t0 < 64u; t0 += 16u) {
-      if (tx / 4u == t0 / 16u) {
-        for (var r = 0u; r < 4u; r++) { sm[(ty + 16u * r) * 4u + tx % 4u] = l[r]; }
+    workgroupBarrier();
+    for (var t = 0u; t < 8u; t++) {
+      let at = s0 / 8u + t;
+      if (at >= S8) { break; }
+      let v0 = vt[vbase + at];
+      let v1 = vt[vbase + S8 + at];
+      let v2 = vt[vbase + 2u * S8 + at];
+      let v3 = vt[vbase + 3u * S8 + at];
+      for (var r = 0u; r < 4u; r++) {
+        let wa = sw[(ty + 16u * r) * 16u + 2u * t];
+        let wb = sw[(ty + 16u * r) * 16u + 2u * t + 1u];
+        o[r] += vec4<f32>(vec4<f16>(dot(wa, h0(v0)) + dot(wb, h1(v0)), dot(wa, h0(v1)) + dot(wb, h1(v1)),
+                                    dot(wa, h0(v2)) + dot(wb, h1(v2)), dot(wa, h0(v3)) + dot(wb, h1(v3))));
       }
-      sm[256u + li] = vec4<f32>(v[min(s0 + t0 + vt, S - 1u) * C4 + hd * 16u + tx]);
-      workgroupBarrier();
-      for (var j = 0u; j < 4u; j++) {
-        let vb = 256u + j * 64u + tx;
-        let b0 = sm[vb];
-        let b1 = sm[vb + 16u];
-        let b2 = sm[vb + 32u];
-        let b3 = sm[vb + 48u];
-        for (var r = 0u; r < 4u; r++) {
-          let w = sm[(ty + 16u * r) * 4u + j];
-          o[r] = fma(vec4<f32>(w.x), b0, fma(vec4<f32>(w.y), b1, fma(vec4<f32>(w.z), b2, fma(vec4<f32>(w.w), b3, o[r]))));
-        }
-      }
-      workgroupBarrier();
     }
+    workgroupBarrier();
   }
   // Row sums from the 16 partial sums, then the outputs.
-  for (var r = 0u; r < 4u; r++) { red[(ty + 16u * r) * 16u + tx] = part[r]; }
+  red[li] = part;
   workgroupBarrier();
   var sum = vec4<f32>(0.0);
-  for (var t = 0u; t < 16u; t++) {
-    sum += vec4<f32>(red[ty * 16u + t], red[(ty + 16u) * 16u + t], red[(ty + 32u) * 16u + t], red[(ty + 48u) * 16u + t]);
-  }
+  for (var t = 0u; t < 16u; t++) { sum += red[ty * 16u + t]; }
   for (var r = 0u; r < 4u; r++) {
     let p = p0 + ty + 16u * r;
-    if (p < Pq) { out[p * C4 + hd * 16u + tx] = vec4<real>(o[r] / sum[r]); }
+    if (p < Pq) { out[p * heads * 16u + hd * 16u + tx] = vec4<f16>(o[r] / sum[r]); }
+  }
+}
+
+//@kernel k_tokens_t4
+// Values of attention, transposed for k_attnd: out[(channel * S4 + s / 4)] holds channel `channel` of
+// tokens s .. s + 3 (zeros past S). Scalars: S, C (channels), S4 = ceil(S / 4).
+@group(0) @binding(1) var<storage, read> x: array<real>;
+@group(0) @binding(2) var<storage, read_write> out: array<vec4<real>>;
+
+fn run(gid: u32) {
+  let S = pu(0u);
+  let C = pu(1u);
+  let S4 = pu(2u);
+  if (gid >= C * S4) { return; }
+  let ch = gid / S4;
+  let s = (gid % S4) * 4u;
+  var h: array<real, 4>;
+  for (var j = 0u; j < 4u; j++) {
+    h[j] = real(0.0);
+    if (s + j < S) { h[j] = x[(s + j) * C + ch]; }
+  }
+  out[gid] = vec4<real>(h[0], h[1], h[2], h[3]);
+}
+
+//@kernel k_attnd
+// Attention with 64 channels per head, without a weights buffer: out = softmax(q k^T / 8) v per head
+// (FP32; k_attnh is the FP16 form). One workgroup: 64 queries of one head; it walks the source tokens 64
+// at a time. Thread (ty, tx) holds queries ty + 16 r (r < 4) and, per tile, the logits of tokens
+// 4 tx .. + 3. Per tile: the logits; the largest logit of each query so far, from the 16 threads that
+// share its row (when it grows, the outputs and partial sums so far are scaled to the new reference);
+// then out += weights v. Each thread keeps the sum of its own weights; a row's 16 partial sums are added
+// at the end. Operand tiles in workgroup memory gained nothing here: q and k are read straight from the
+// buffers. The logits read q and k straight
+// from the buffers; only the weights go through workgroup memory (a vec4 of 4 tokens, written whole by
+// the thread that holds them); the values come transposed (vt, from k_tokens_t4), 4 tokens of one
+// channel per load. The row maxima and sums share the weights' memory.
+// Scalars: P, S, heads. Groups: heads * ceil(P / 64).
+//@group 256
+@group(0) @binding(1) var<storage, read> q: array<vec4<real>>;
+@group(0) @binding(2) var<storage, read> k: array<vec4<real>>;
+@group(0) @binding(3) var<storage, read> vt: array<vec4<real>>;
+@group(0) @binding(4) var<storage, read_write> out: array<vec4<real>>;
+var<workgroup> sw: array<vec4<f32>, 1024>;  // [64 queries][16 token quads]: the weights of a tile
+
+fn group(g: u32, li: u32) {
+  let Pq = pu(0u);
+  let S = pu(1u);
+  let heads = pu(2u);
+  let C4 = heads * 16u;  // loads per token
+  let S4 = (S + 3u) / 4u;
+  let pblocks = (Pq + 63u) / 64u;
+  if (g >= heads * pblocks) { return; }
+  let hd = g / pblocks;
+  let p0 = (g % pblocks) * 64u;
+  let tx = li % 16u;
+  let ty = li / 16u;
+  var qb: array<u32, 4>;
+  for (var r = 0u; r < 4u; r++) { qb[r] = min(p0 + ty + 16u * r, Pq - 1u) * C4 + hd * 16u; }
+  let vbase = (hd * 64u + 4u * tx) * S4;
+  var o: array<vec4<f32>, 4>;
+  var top = vec4<f32>(kLowest);
+  var part = vec4<f32>(0.0);
+  for (var r = 0u; r < 4u; r++) { o[r] = vec4<f32>(0.0); }
+  for (var s0 = 0u; s0 < S; s0 += 64u) {
+    var kb: array<u32, 4>;
+    for (var c = 0u; c < 4u; c++) { kb[c] = min(s0 + 4u * tx + c, S - 1u) * C4 + hd * 16u; }
+    var l: array<vec4<f32>, 4>;  // l[r][c]: query ty + 16 r, token s0 + 4 tx + c
+    for (var r = 0u; r < 4u; r++) { l[r] = vec4<f32>(0.0); }
+    for (var j = 0u; j < 16u; j++) {
+      let b0 = vec4<f32>(k[kb[0] + j]);
+      let b1 = vec4<f32>(k[kb[1] + j]);
+      let b2 = vec4<f32>(k[kb[2] + j]);
+      let b3 = vec4<f32>(k[kb[3] + j]);
+      for (var r = 0u; r < 4u; r++) {
+        let a = vec4<f32>(q[qb[r] + j]);
+        l[r] += vec4<f32>(dot(a, b0), dot(a, b1), dot(a, b2), dot(a, b3));
+      }
+    }
+    let valid = vec4<u32>(s0 + tx * 4u) + vec4<u32>(0u, 1u, 2u, 3u) < vec4<u32>(S);
+    for (var r = 0u; r < 4u; r++) { l[r] = select(vec4<f32>(kLowest), l[r] * 0.125, valid); }  // 1 / sqrt(64)
+    // The 16 threads with the same ty hold the same 4 rows.
+    sw[li] = vec4<f32>(max(max(l[0].x, l[0].y), max(l[0].z, l[0].w)), max(max(l[1].x, l[1].y), max(l[1].z, l[1].w)),
+                        max(max(l[2].x, l[2].y), max(l[2].z, l[2].w)), max(max(l[3].x, l[3].y), max(l[3].z, l[3].w)));
+    workgroupBarrier();
+    var grown = top;
+    for (var t = 0u; t < 16u; t++) { grown = max(grown, sw[ty * 16u + t]); }
+    workgroupBarrier();
+    let shrink = exp(top - grown);  // 0 on the first tile, 1 for rows whose maximum did not grow
+    top = grown;
+    part *= shrink;
+    for (var r = 0u; r < 4u; r++) {
+      o[r] *= shrink[r];
+      l[r] = select(vec4<f32>(0.0), exp(l[r] - vec4<f32>(top[r])), valid);  // the weights
+      part[r] += (l[r].x + l[r].y) + (l[r].z + l[r].w);
+      sw[(ty + 16u * r) * 16u + tx] = l[r];
+    }
+    workgroupBarrier();
+    for (var t = 0u; t < 16u; t++) {
+      let at = s0 / 4u + t;
+      if (at >= S4) { break; }
+      let v0 = vec4<f32>(vt[vbase + at]);
+      let v1 = vec4<f32>(vt[vbase + S4 + at]);
+      let v2 = vec4<f32>(vt[vbase + 2u * S4 + at]);
+      let v3 = vec4<f32>(vt[vbase + 3u * S4 + at]);
+      for (var r = 0u; r < 4u; r++) {
+        let w = sw[(ty + 16u * r) * 16u + t];
+        o[r] += vec4<f32>(dot(w, v0), dot(w, v1), dot(w, v2), dot(w, v3));
+      }
+    }
+    workgroupBarrier();
+  }
+  // Row sums from the 16 partial sums, then the outputs.
+  sw[li] = part;
+  workgroupBarrier();
+  var sum = vec4<f32>(0.0);
+  for (var t = 0u; t < 16u; t++) { sum += sw[ty * 16u + t]; }
+  for (var r = 0u; r < 4u; r++) {
+    let p = p0 + ty + 16u * r;
+    if (p < Pq) { out[p * heads * 16u + hd * 16u + tx] = vec4<real>(o[r] / sum[r]); }
   }
 }
 

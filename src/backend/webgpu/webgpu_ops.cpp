@@ -538,12 +538,10 @@ class Context {
   }
 
   // The module of one kernel instance: header, prelude, its section, the entry point. The instance name
-  // is the section's name followed by `_r{R}c{C}` (replaces $R and $C), flags (`_v4`: keeps the lines
-  // marked `//?v4 `; without flags the lines marked `//?s ` are kept) and `_f32` (the output is f32), in
-  // that order, each optional.
+  // is the section's name followed by `_r{R}c{C}` (replaces $R and $C) and `_f32` (the output is f32),
+  // each optional.
   std::string module_source(const std::string& name, Kernel* k) const {
     std::string base = name, out_type = "real", R = "1", C = "4";
-    std::vector<std::string> flags;
     auto strip = [&](const std::string& suffix) {
       if (base.size() > suffix.size() && base.compare(base.size() - suffix.size(), suffix.size(), suffix) == 0) {
         base.resize(base.size() - suffix.size());
@@ -552,7 +550,6 @@ class Context {
       return false;
     };
     if (strip("_f32")) out_type = "f32";
-    if (strip("_v4")) flags.push_back("v4");
     const size_t rc = base.rfind("_r");
     if (rc != std::string::npos && !source_.kernels.count(base)) {
       const std::string tail = base.substr(rc + 2);
@@ -561,21 +558,7 @@ class Context {
     }
     auto it = source_.kernels.find(base);
     if (it == source_.kernels.end()) fail("kernel " + name + " not found");
-    std::string body;
-    for (size_t pos = 0; pos < it->second.size();) {
-      size_t end = it->second.find('\n', pos);
-      if (end == std::string::npos) end = it->second.size();
-      std::string line = it->second.substr(pos, end - pos);
-      pos = end + 1;
-      if (line.rfind("//?", 0) == 0) {
-        const size_t sp = line.find(' ');
-        const std::string flag = line.substr(3, sp - 3);
-        const bool keep = flag == "s" ? flags.empty() : std::find(flags.begin(), flags.end(), flag) != flags.end();
-        if (!keep) continue;
-        line = line.substr(sp + 1);
-      }
-      body += line + "\n";
-    }
+    std::string body = it->second;
     body = replace_all(body, "$O", out_type);
     body = replace_all(body, "$R", R);
     body = replace_all(body, "$C", C);
@@ -866,7 +849,20 @@ class WebGpuOps : public Ops {
     if (q.c != heads * 64 || k.c != q.c || v.c != q.c || k.n() != v.n()) fail("attention: needs 64 channels per head");
     auto out = std::make_shared<GpuTensor>(ctx_, q.h, q.w, q.c);
     const int P = q.n(), S = k.n();
-    ctx_->run_groups("k_attn", static_cast<long long>(heads) * ((P + 63) / 64), q.d(), k.d(), v.d(), out->d(), P, S, heads);
+    const long long groups = static_cast<long long>(heads) * ((P + 63) / 64);
+    if (ctx_->fp16()) {
+      // The values transposed and packed: 8 tokens of one channel per 16-byte load.
+      const int S8 = (S + 7) / 8;
+      Buffer vt(ctx_, static_cast<size_t>(q.c) * S8 * 16);
+      ctx_->run("k_tokens_t", static_cast<long long>(q.c) * S8, v.d(), vt.view(), S, q.c, S8);
+      ctx_->run_groups("k_attnh", groups, q.d(), k.d(), vt.view(), out->d(), P, S, heads);
+    } else {
+      // The values transposed: 4 tokens of one channel per load.
+      const int S4 = (S + 3) / 4;
+      Buffer vt(ctx_, static_cast<size_t>(q.c) * S4 * 4 * sizeof(float));
+      ctx_->run("k_tokens_t4", static_cast<long long>(q.c) * S4, v.d(), vt.view(), S, q.c, S4);
+      ctx_->run_groups("k_attnd", groups, q.d(), k.d(), vt.view(), out->d(), P, S, heads);
+    }
     return out;
   }
 
@@ -966,8 +962,10 @@ class WebGpuOps : public Ops {
     const int n = h * w, flags = (bias ? 1 : 0) | (residual ? 2 : 0);
     const int R = mm_rows_, C = mm_cols_;
     const long long groups = static_cast<long long>((out_c + 16 * C - 1) / (16 * C)) * ((n + 16 * R - 1) / (16 * R));
-    std::string name = "k_mm_r" + std::to_string(R) + "c" + std::to_string(C);
-    if (in_c % 4 == 0) name += "_v4";
+    // Half arithmetic only for outputs in the storage type: the read-out's float logits lose too much in it
+    // (mass error 2e-6 -> 3e-3 in ops_test).
+    const char* kernel = in_c % 8 == 0 && ctx_->fp16() && !f32 ? "k_mmh" : in_c % 4 == 0 ? "k_mmd" : "k_mm";
+    std::string name = std::string(kernel) + "_r" + std::to_string(R) + "c" + std::to_string(C);
     if (f32 && ctx_->fp16()) name += "_f32";
     ctx_->run_groups(name, groups, x, weights, bias ? vec(*bias) : weights, residual ? dev(residual).d() : weights, out->d(), n,
                      in_c, out_c, flags, act_code(act), scale);
@@ -991,7 +989,7 @@ class WebGpuOps : public Ops {
 
   ContextPtr ctx_;
   [[maybe_unused]] int threads_ = 1;  // host read-out workers (one in the browser)
-  int mm_rows_ = 4, mm_cols_ = 4;  // per thread of k_mm; JMT_WEBGPU_MM=r{R}c{C} for tuning
+  int mm_rows_ = 4, mm_cols_ = 4;  // per thread of the products; JMT_WEBGPU_MM=r{R}c{C} for tuning
 };
 
 }  // namespace

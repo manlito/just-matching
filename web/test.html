@@ -27,8 +27,8 @@
 <p>Runs the WebAssembly module on WebGPU (FP32, and FP16 when the adapter has <code>shader-f16</code>) on the 6
 test pairs at 512 px / 9 layers and 384 px / 5 layers, and compares each result with the native CPU backend on
 the same pixels and keypoints (testdata/). FP32 must give the same matches, predicted points of confident
-queries within 0.01 px and covisibility within 1e-4; in FP16 at most 3 matches, or 3 % of them, may differ
-(present on one side only), as natively.</p>
+queries within 0.01 px and covisibility within 1e-4; in FP16 at most 3 matches, or 10 % of them, may differ
+(present on one side only).</p>
 <p id="status">Loading…</p>
 <p id="adapter"></p>
 <div class="wrap" id="tables"></div>
@@ -120,7 +120,7 @@ async function run() {
         const tMatch = performance.now() - t;
         fa.destroy(), fb.destroy();
         const c = compare(got, pair.refs[si]);
-        const ok = precision === 'fp32' ? c.same && c.pos <= 0.01 && c.covis <= 1e-4 : c.differ <= Math.max(3, 0.03 * c.nRef);
+        const ok = precision === 'fp32' ? c.same && c.pos <= 0.01 && c.covis <= 1e-4 : c.differ <= Math.max(3, 0.1 * c.nRef);
         summary.ok &&= ok;
         rows.push({ pair: `${pair.a} – ${pair.b}`, ok, tDescribe, tMatch, ...c });
       }

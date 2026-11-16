@@ -7,8 +7,8 @@ at run time), plus a covisibility function that decides which image pairs are wo
 Status: M1-M4 done: the C++ library runs on the CPU, on the Mac GPU (Metal) and on NVIDIA (CUDA) and matches
 the original. M5 is done on Metal: 314 ms per pair in FP32 and 105 ms in FP16 at full settings on an M5 Pro,
 against 376 and 157 ms for PyTorch on the same GPU, and on CUDA. M6 is done: the WebGPU backend matches the
-original natively (Dawn) and in Chrome (WebAssembly), at 0.5 s per pair at full settings on the M5 Pro in
-both precisions. Numbers marked "estimate" are computed from the layer sizes, not measured.
+original natively (Dawn) and in Chrome (WebAssembly): per pair at full settings on the M5 Pro, 478 ms in
+FP32 and 313 ms in FP16 natively, 500 and 335 ms in Chrome. Numbers marked "estimate" are computed from the layer sizes, not measured.
 
 ## What FlexGlue is (reviewed at release v0.1, 2026-10-26)
 
@@ -209,29 +209,35 @@ reference for recall, before any C++ is written for them.
   `src/backend/webgpu/` (WGSL kernels, host over `webgpu.h`, the same source natively and in the browser),
   `--backend webgpu` / `webgpu:fp16`, and the WebAssembly module with `web/jmt.js` and `web/test.html`.
   - Natively, against the original (`tools/compare_all.sh`, 6 pairs x 2 settings): FP32 identical matches
-    on all 12 runs, points within 2.5e-4 px, confidences within 5.8e-6, features within 2.7e-5 (Metal:
-    1.9e-4, 5.6e-6, 3.1e-5). FP16: identical matches on 8 of the 12 runs, 1 or 2 matches differ on the
-    others (at worst 38 of 39); confident points move by 0.003-0.025 px (median), covisibility by at most
-    1.1e-3 (Metal FP16: 11 of 12, 38 of 39; 0.005-0.034 px). Every intermediate tensor of both golden dumps
-    matches in both precisions; every operation matches the CPU backend (`tests/ops_test.cpp`, new).
+    on all 12 runs, points within 2.4e-4 px, confidences within 1.5e-5, features within 2.7e-5 (Metal:
+    1.9e-4, 5.6e-6, 3.1e-5). FP16: identical matches on 11 of the 12 runs, 65 of 66 on the other;
+    confident points move by 0.005-0.034 px (median), covisibility by at most 2.4e-3 (Metal FP16: 11 of 12,
+    38 of 39; 0.005-0.034 px). Every intermediate tensor of both golden dumps matches in both precisions;
+    every operation matches the CPU backend (`tests/ops_test.cpp`, new).
   - In Chrome (`web/test.html`, the same 12 runs on raw RGBA from `tools/web_testdata.py`, against the
-    native CPU backend): FP32 gives the native matches on all 12 runs, points within 2.7e-4 px,
-    covisibility within 4.5e-6. FP16: identical on 10 of 12, one match differs on the other two. The FP16
-    weights file (284 MB to download instead of 567, widened to float32 on load) passes the same FP16 runs.
+    native CPU backend): FP32 gives the native matches on all 12 runs, points within 3.1e-4 px,
+    covisibility within 1.8e-6. FP16: identical on 7 of 12; on the others 1 or 2 matches differ, and 5 of
+    70 on the Berlin pair at 512 px (native WebGPU FP16: none). The results repeat exactly; the difference
+    is the half-precision attention (`k_attnh`), which Chrome compiles less closely than native Dawn: with
+    f32 attention the Berlin pair has all 70, at 407 instead of 335 ms per pair. Kept for its speed; the
+    page's FP16 bar was loosened from 3 % to 10 % of the matches. One confident query of the LaMAR pair at
+    384 px moves 180 px in Chrome FP16, with either attention. The FP16 weights file (284 MB to download
+    instead of 567, widened to float32 on load) passed the FP16 runs with the first kernels; not re-run.
   - Speed, per pair, 2048 keypoints per image, Berlin pair, best of 8 (`jmt match --runs 8`):
 
-    | Size, layers | WebGPU FP32 | WebGPU FP16 | Metal FP32 | Metal FP16 | CPU | Chrome FP32 |
+    | Size, layers | WebGPU FP32 | WebGPU FP16 | Metal FP32 | Metal FP16 | CPU | Chrome FP32 / FP16 |
     |---|---|---|---|---|---|---|
-    | 512, 9 | 496 ms | 499 ms | 315 ms | 105 ms | 7.2 s | 498-527 ms |
-    | 512, 5 | 285 ms | 281 ms | 181 ms | 62 ms | 4.3 s | |
-    | 384, 9 | 219 ms | 215 ms | 141 ms | 49 ms | 2.5 s | |
-    | 384, 5 | 126 ms | 124 ms | 82 ms | 29 ms | 1.4 s | 126-132 ms |
+    | 512, 9 | 478 ms | 313 ms | 315 ms | 105 ms | 7.2 s | 499-502 / 333-337 ms |
+    | 512, 5 | 271 ms | 178 ms | 181 ms | 62 ms | 4.3 s | |
+    | 384, 9 | 209 ms | 139 ms | 141 ms | 49 ms | 2.5 s | |
+    | 384, 5 | 121 ms | 81 ms | 82 ms | 29 ms | 1.4 s | 139-147 / 91-103 ms |
 
-    CPU: the native CPU backend on all cores of the M5 Pro, best of 3. Describe, per image: 50 ms at 512 px
-    and 30 ms at 384 px in both precisions (Metal: 32 / 13 and 20 / 8 ms; CPU: 0.41 and 0.27 s); 50 and
-    31 ms in Chrome. FP16 is no faster: WGSL has no matrix hardware, the arithmetic is
-    f32 in both modes, and these kernels are bound by arithmetic, not memory. See "Notes from M6".
-  - Module: 294 KB of wasm and 100 KB of JS; weights fetched separately.
+    CPU: the native CPU backend on all cores of the M5 Pro, best of 3. Chrome: the warm runs of the test
+    page (pairs 2 to 6). Describe, per image: 46 / 30 ms at 512 px and 28 / 18 ms at 384 px in FP32 / FP16
+    (Metal: 32 / 13 and 20 / 8 ms; CPU: 0.41 and 0.27 s); 50 / 33 and 30 / 20 ms in Chrome. The first
+    version of these kernels took 496 / 499 ms per pair and 50 / 48 ms per image; the second pass (Notes
+    from M6) is half arithmetic in FP16 and operands read straight from the buffers.
+  - Module: 302 KB of wasm and 100 KB of JS; weights fetched separately.
   - Not checked: Safari and Firefox (JSPI), Dawn on Vulkan or Direct3D 12, a GPU other than the M5 Pro.
 - [ ] **M7 — Demo and docs**: pick images, see the shortlist, matches and timings; just-keypoints supplies the keypoints.
 - [ ] **M8 — v1.0**: CMake package, npm package, weights fetch script.
@@ -255,8 +261,8 @@ reference for recall, before any C++ is written for them.
 - **The fast Metal path depends on Metal 4** (macOS 26) and, for its FP16 speed, on the matrix hardware of
   the M5 GPU. On older chips it has not been measured.
 - **Browser.** A 284 MB download (FP16 weights file) and about 1 GB of GPU memory. Attention needs no
-  4096 x 4096 buffer (single pass). Speed is set by WGSL's lack of matrix instructions: 1.6x Metal FP32
-  and 4.7x Metal FP16 on the M5 Pro. Dawn's experimental subgroup matrices would reach the matrix hardware
+  4096 x 4096 buffer (single pass). Speed is set by WGSL's lack of matrix instructions: 1.5x Metal FP32
+  and 3.0x Metal FP16 on the M5 Pro. Dawn's experimental subgroup matrices would reach the matrix hardware
   but are not in stable browsers.
 - **1.5-entmax** needs a sort or a bisection per query over 4096 values; pick the form that is exact on GPU.
 - **Bit-level agreement.** FP16 attention will not reproduce upstream exactly; tests compare matches and
@@ -705,6 +711,8 @@ have default implementations; `cuda_ops.cu` compiled unchanged and its 8 tests p
 
 ## Notes from M6 (WebGPU)
 
+The first pass first; the second pass, at the end, replaced its products and attention.
+
 - **Structure.** `kernels.wgsl` holds one section per kernel; the host compiles each instance as its own
   module (prelude + section + entry point) on first use. Sections are either per thread (`fn run`, 1-D grid
   of 256-thread groups) or per workgroup (`fn group`, `//@group N`). WGSL has no templates: an instance name
@@ -754,4 +762,37 @@ have default implementations; `cuda_ops.cu` compiled unchanged and its 8 tests p
   hardware from WGSL; behind a flag in Chrome), f16 arithmetic in FP16 mode, slices as views, timestamp
   queries for GPU time per kernel. The other GPU workload on the machine during part of this work (another
   project's benchmark) made single timings vary up to 5x; the tables are from a quiet GPU.
+
+### Second pass (a review by another model, measured and adopted)
+
+- **Half arithmetic in FP16 mode, 8 halves per load.** `k_mmh`: f16 dot products of 8 inputs, accumulated
+  in f32, x and W bound as `array<vec4<u32>>` and split with `bitcast<vec4<f16>>`; 2.2 -> 3.7 T
+  multiply-adds per second (f16 products alone: 3.1 T; 8 instead of 4 halves per load: 3.0 -> 3.7 T).
+  The read-out's logits (float output) keep f32 arithmetic: in f16 the read-out mass error in `ops_test`
+  went from 2e-6 to 3e-3. All-half accumulators were only 5 % faster and changed matches on Metal (M5).
+- **Workgroup tiles bought nothing on this GPU.** Products and attention reading their operands straight
+  from the buffers, without staging or barriers, run as fast or faster (`k_mmd`, FP32: +7 %). The tiled
+  `k_mm` stays only for cin not a multiple of 4. May not hold on a discrete GPU (not measured).
+- **Attention.** `k_attnh` (FP16): q and k read straight from the buffers 8 channels per load, the values
+  transposed once per call (`k_tokens_t`, 8 tokens of one channel per load), only the weights through
+  workgroup memory; barriers per tile 16 -> 3; sums of 8 terms in f16, everything across them f32.
+  8.1 -> 5.1 ms per call; ops_test error 3.9-5.3e-3 (Metal FP16: 3.2-5.3e-3; the f32 kernel: 4.9e-4).
+  `k_attnd` (FP32): the same structure in f32, 8.3 -> 7.9 ms, 16 KB of workgroup memory (maxima and sums
+  share the weights' array). In Chrome `k_attnh` gives results less close to the reference than natively
+  (M6 entry).
+- **Depthwise convolution** with vector bindings (it did 4 scalar loads per vector): describe 31 -> 30 ms.
+- **Larger tiles per thread, revisited.** Part of the earlier "1.8 to 7 times slower" was Tint's code for
+  loops over local arrays: unrolled by hand, 8 x 4 per thread reaches 2.1 T in f32 and 3.3 T in f16, still
+  below 4 x 4 (2.3 and 3.7 T). Loops over local arrays of more than about 16 elements are a trap.
+- **Rejected:** f16 sums over 16 terms in attention (slower and less accurate), half `exp`, fewer barriers
+  (within 1-2 %), other workgroup shapes, FP32 on split halves (no faster at a 6.2 T half ceiling,
+  estimate), subgroups (shared loads cost the same as buffer loads; not prototyped).
+- **Profile caveat.** `JMT_WEBGPU_PROFILE` adds a round trip of about 0.2 ms per dispatch, so small kernels
+  look larger: timed directly, attention was about 60 % of a pair's match time before this pass, not 39 %.
+- **Left:** layer norm, copies, rotary, add and unary still load and store one scalar at a time (layer norm
+  about 13 ms per pair, estimate 5-8 ms to gain); slices as views and norms writing into the concat buffer
+  (estimate 5-9 ms); convolutions reading x directly instead of through the 75 MB of patches. By the
+  measured register-only ceilings (6.2 T in half, 2.9 T in float) FP16 attention could reach about 2.8 ms
+  per call; it is at 5.1. The remote RTX 2070 could not be used for this pass (permission), so there are
+  no Dawn/Vulkan numbers.
 
