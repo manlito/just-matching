@@ -73,6 +73,9 @@ int jmt_backend_available(jmt_backend backend) {
 #ifdef JMT_HAVE_METAL
   if (backend == JMT_BACKEND_METAL) return 1;
 #endif
+#ifdef JMT_HAVE_CUDA
+  if (backend == JMT_BACKEND_CUDA) return 1;
+#endif
   return backend == JMT_BACKEND_CPU;
 }
 
@@ -93,6 +96,9 @@ jmt_ctx* jmt_create(const jmt_config* config) {
     if (config->backend == JMT_BACKEND_CPU) ctx->ops = jmt::make_cpu_ops(config->num_threads);
 #ifdef JMT_HAVE_METAL
     if (config->backend == JMT_BACKEND_METAL) ctx->ops = jmt::make_metal_ops(config->device, fp16);
+#endif
+#ifdef JMT_HAVE_CUDA
+    if (config->backend == JMT_BACKEND_CUDA) ctx->ops = jmt::make_cuda_ops(config->device, fp16);
 #endif
     ctx->input_size = config->input_size > 0 ? config->input_size : 512;
     if (ctx->input_size % 32 != 0) throw std::runtime_error("input_size must be a multiple of 32");

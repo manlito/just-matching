@@ -3,6 +3,8 @@ project(just_matching VERSION 0.1.0 LANGUAGES CXX)
 
 option(JMT_BUILD_CLI "Build the jmt command line tool" ON)
 option(JMT_BUILD_TESTS "Build tests" ON)
+set(JMT_CUDA "AUTO" CACHE STRING "CUDA backend: AUTO (build it when a CUDA compiler is found), ON or OFF")
+set_property(CACHE JMT_CUDA PROPERTY STRINGS AUTO ON OFF)
 set(JMT_METAL "AUTO" CACHE STRING "Metal backend (Apple platforms): AUTO (build it when Metal.framework is found), ON or OFF")
 set_property(CACHE JMT_METAL PROPERTY STRINGS AUTO ON OFF)
 
@@ -13,6 +15,25 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
+# CUDA backend: needs only the CUDA toolkit (nvcc and its runtime library).
+if(NOT JMT_CUDA STREQUAL "OFF")
+  if(NOT CMAKE_CUDA_COMPILER AND NOT DEFINED ENV{CUDACXX})
+    # Toolkit installed but not on PATH (common outside login shells).
+    find_program(JMT_NVCC nvcc HINTS ENV CUDA_PATH PATHS /opt/cuda /usr/local/cuda PATH_SUFFIXES bin)
+    if(JMT_NVCC)
+      set(CMAKE_CUDA_COMPILER "${JMT_NVCC}")
+    endif()
+  endif()
+  include(CheckLanguage)
+  check_language(CUDA)
+  if(CMAKE_CUDA_COMPILER)
+    enable_language(CUDA)
+    set(JMT_HAVE_CUDA ON)
+  elseif(JMT_CUDA STREQUAL "ON")
+    message(FATAL_ERROR "JMT_CUDA=ON but no CUDA compiler was found (set CUDACXX or CMAKE_CUDA_COMPILER)")
+  endif()
+endif()
 
 # Metal backend: needs only Metal.framework and Foundation. Shaders are compiled at run time, so no Metal
 # toolchain is needed to build.
@@ -44,6 +65,12 @@ if(NOT MSVC)
 endif()
 
 set(jmt_backends cpu)
+if(JMT_HAVE_CUDA)
+  target_sources(jmt PRIVATE src/backend/cuda/cuda_ops.cu)
+  target_compile_definitions(jmt PUBLIC JMT_HAVE_CUDA)
+  set_target_properties(jmt PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+  list(APPEND jmt_backends cuda cuda:fp16)
+endif()
 if(JMT_HAVE_METAL)
   set(metal_src "${CMAKE_CURRENT_SOURCE_DIR}/src/backend/metal/kernels.metal")
   set(metal_cpp "${CMAKE_CURRENT_BINARY_DIR}/metal_kernels.cpp")
