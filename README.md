@@ -3,11 +3,20 @@
 Image matching (FlexGlue) and covisibility with minimal dependencies, the companion of
 [just-keypoints](../just-keypoints). No PyTorch, no ONNX Runtime at run time. Plan and status: [PLAN.md](PLAN.md).
 
-Status: the CPU reference backend and the Metal and CUDA backends work and match the original FlexGlue.
-On an M5 Pro, Metal takes 0.31 s per pair at full settings and 0.105 s in FP16, against 0.38 s and 0.16 s
-for PyTorch on the same GPU and 7.5 s on the CPU; describing an image takes 31 ms (13 ms in FP16).
-CUDA takes 0.73 s per pair on a laptop RTX 2070 Max-Q, and 0.35 s in FP16, where its kernels use the tensor
-cores. The WebGPU backend and the covisibility functions are planned.
+Status: the CPU reference backend and the Metal and CUDA backends work and reproduce the original
+FlexGlue. On the 6 test pairs at two settings, in FP32, they return the same matches as the original;
+predicted points agree within 0.0004 px. How to check this yourself, with the commands and their output:
+[docs/reproducing.md](docs/reproducing.md).
+
+Per pair at full settings (512 px, 9 layers, 2048 keypoints per image), against the original under
+PyTorch on the same GPU:
+
+| | jmt FP32 | PyTorch FP32 | jmt FP16 | PyTorch FP16 | describe per image, jmt FP32 / FP16 |
+|---|---|---|---|---|---|
+| M5 Pro, Metal | 0.31 s | 0.38 s | 0.105 s | 0.16 s | 31 / 13 ms |
+| RTX 2070 Max-Q laptop, CUDA | 0.42 s | 0.63 s | 0.14 s | 0.21 s | 54 / 18 ms |
+
+The WebGPU backend and the covisibility functions are planned.
 
 ## Build
 
@@ -75,11 +84,14 @@ results, with the GPU kept busy while the host finishes each pair.
 
 ## Validation against the original
 
+Step by step, with what each command prints and how to read it: [docs/reproducing.md](docs/reproducing.md).
+In short:
+
 ```sh
-python tools/compare.py a.jpg b.jpg --a upstream --b "cmd:build/release/jmt match"
-python tools/compare.py a.jpg b.jpg --a upstream --b "cmd:build/release/jmt match --backend metal"
+python tools/compare.py a.jpg b.jpg --b "cmd:build/release/jmt match --backend metal" --save build/repro
+diff build/repro/a-b.512x9.a.txt build/repro/a-b.512x9.b.txt   # the original's matches vs jmt's
+tools/compare_all.sh metal                   # the 6 test pairs at two settings against the original
 python tools/dump_golden.py a.jpg b.jpg      # then: cmake -S . -B build/release && ctest --test-dir build/release
-tools/compare_all.sh metal:fp16              # the 6 test pairs at two settings against the original
 ```
 
 ## Licenses

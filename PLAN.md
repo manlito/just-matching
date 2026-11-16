@@ -154,7 +154,7 @@ reference for recall, before any C++ is written for them.
   Done: `src/backend/cuda/cuda_ops.cu`, FP32 and FP16 (`--backend cuda`, `cuda:fp16`). FP32 gives the
   original's matches on the 6 pairs x 2 settings (points within 1.9e-4 px). Per pair at 512 px / 9 layers
   on an RTX 2070 Max-Q: 726 ms in FP32, 349 ms in FP16 (tensor cores). See Notes from M4.
-- [ ] **M5 — Fast**
+- [x] **M5 — Fast**
   GEMM and attention kernels tuned per backend, pairs batched, zero allocations per pair. Benchmark table
   against PyTorch and the upstream ONNX models.
   Done on Metal (M5 Pro, macOS 26). Per pair, 2048 keypoints per image, Berlin pair, best of 8 runs;
@@ -176,9 +176,33 @@ reference for recall, before any C++ is written for them.
   The second batch of the same pairs creates no device buffers (`tests/batch_test.cpp`).
   See "Notes from M5, second pass". The fast kernels need macOS 26; older systems use the kernels of the
   first pass (786 ms in FP32, 549 ms in FP16).
-  Open: on CUDA, the read-out on the device, the fused operations and attention without the logits buffer
-  (the hooks in `core/ops.h` are there, CUDA uses their defaults; not compiled or run on the NVIDIA machine
-  since these changes). PyTorch and ONNX Runtime on the NVIDIA machine are not measured.
+  Done on CUDA (RTX 2070 Max-Q laptop): the same hooks, attention without the logits buffer in both modes
+  (tensor cores, `mma.sync` from inline PTX; FP32 on operands split in two halves), the read-out and
+  preprocessing on the device. Per pair,
+  2048 keypoints per image, Berlin pair, best of 8 runs over three sweeps; PyTorch (2.15, CUDA 13.2,
+  `tools/bench_torch.py --impl upstream:cuda`) measured the same way on the same day:
+
+  | Size, layers | CUDA FP32 | PyTorch CUDA FP32 | CUDA FP16 | PyTorch CUDA FP16 | FP32 / FP16 after M4 |
+  |---|---|---|---|---|---|
+  | 512, 9 | 417 ms | 629 ms | 141 ms | 207 ms | 726 / 349 ms |
+  | 512, 5 | 245 ms | 360 ms | 83 ms | 121 ms | 434 / 219 ms |
+  | 384, 9 | 190 ms | 249 ms | 54 ms | 97 ms | 331 / 173 ms |
+
+  Describe, per image: 54 ms in FP32 and 18 ms in FP16 at 512 px, 40 and 14 ms at 384 px (PyTorch: 54
+  and 31 ms in both precisions; after M4: 66 / 30 and 47 / 19 ms).
+  ONNX Runtime 1.32, CUDA provider, upstream's release v0.1 models (512 px, 9 layers only): describe 66
+  ms, match 660 ms with the FP32 matcher (90 matches, see the Mac notes); the FP16 matcher runs in 184 ms
+  but returns NaN covisibility and no matches on this GPU. FP16 is 1.5 to 1.8 times PyTorch's speed,
+  FP32 1.3 to 1.5 times. With its attention through the float logits buffer (`JMT_CUDA_SPLIT=0`), FP32
+  takes 634 / 367 / 282 ms. In a batch of 8: 419 / 246 / 191 ms per pair in FP32 and 144 / 85 / 66 ms in
+  FP16: no gain, one pair already fills the GPU. GPU memory in use: 0.93 GB in FP32, 0.54 GB in FP16 (M4:
+  1.5 / 0.8 GB).
+  Agreement (`tools/compare_all.sh` through `tools/remote.sh`, 6 pairs x 2 settings): FP32 identical
+  matches on all 12 runs, points within 4.1e-4 px, confidences within 1.5e-5 (through the logits buffer:
+  2.5e-4 px, 1.1e-5). FP16: 98.5 to 100 % of the
+  matches per pair (identical on 9 of the 12 runs; 1 match differs on each of the others), as after M4.
+  The second batch creates no device buffers on CUDA either. See "Notes from M5 (CUDA)".
+  Open: the products of describe at small grids, slices and concatenations as views.
 - [ ] **M6 — Runs in the browser** (WebGPU via Dawn, then Emscripten; FP16 when `shader-f16` is available)
 - [ ] **M7 — Demo and docs**: pick images, see the shortlist, matches and timings; just-keypoints supplies the keypoints.
 - [ ] **M8 — v1.0**: CMake package, npm package, weights fetch script.
@@ -561,3 +585,89 @@ What the measurements showed, in the order tried. All times are GPU time per pai
 - Peak memory: 2.8 GB in FP16, 3.2 GB in FP32 (first pass: 3.1 GB in FP16).
 - Not done: slices and concatenations as views (4 ms), the depthwise convolution, float logits in FP16
   attention (a float tile as the left operand of the second product gave wrong results; not investigated).
+
+## Notes from M5 (CUDA)
+
+Same laptop as M4 (RTX 2070 Max-Q, CUDA 13.4). Starting point: the Metal M5 branch, whose new `Ops` hooks
+have default implementations; `cuda_ops.cu` compiled unchanged and its 8 tests passed.
+
+- **The hooks.** `linear_fused`: bias, activation and residual applied to the tile before it is stored, in
+  all three product kernels (`k_gemm`, `k_gemm_tc`, `k_linear_small`). `layer_norm_act`: the activation in
+  the same pass. `readout_device` / `sample_at`: `k_readout`, a port of the Metal kernel (one warp per
+  query). `preprocess_u8`: `k_preprocess`, the resize taps from the host and every step rounded as written
+  (`__fmul_rn` and friends, no fused multiply-adds), so the input is the host's to the last bit.
+  `finish` waits for the device; `flush` has nothing to do (a kernel starts when it is launched).
+  `device_allocations` counts `cudaMalloc` calls: the batch test creates 728 buffers, the second batch none.
+- **Queuing a pair never waits.** `cudaMemcpy` from pageable memory waits for the device to go idle first,
+  and every rotary call uploaded its cos and sin tables that way (36 per pair), so the host stopped in the
+  middle of every pair. Uploads are now `cudaMemcpyAsync` on the stream (the driver stages pageable memory
+  before it returns), and the tables are uploaded once per address, as `Ops::rotary` allows.
+- **Attention without the logits buffer** (`k_flash`, FP16 mode). A warp takes 16 queries of one head and
+  walks the source tokens 64 at a time; logits, row maxima, weights and the product with the values stay
+  in registers, and a row is rescaled when its maximum grows, as in Metal's `k_attn`. The products use
+  `mma.sync.m16n8k8` (sm_75) through inline PTX rather than `nvcuda::wmma`: its register layout is
+  documented, and the accumulator of the logits is laid out like the left operand of the second product,
+  so the weights go from one to the other without leaving the registers (with `wmma` the layout is
+  opaque and the tile would go through shared memory). Keys and values are read with `ldmatrix` (its
+  `.trans` form gives the value operand), from tiles whose rows are padded to 72 values so that the 8 rows
+  of one read fall on distinct banks.
+  Warps per block (16 queries each), per pair at 512 px / 9 layers: 2: 241 ms, 4: 171, 8: 152, 16: 148.
+  Asking for 2 to 4 blocks per SM (`__launch_bounds__`, fewer registers) made it slower: 4 warps x 3
+  blocks 170 ms, x 4 185 ms. 16 warps needs 128 registers with a few spilled and is still the fastest:
+  a larger block shares the key and value tiles among more queries. Attention is now 1.5 to 2.1 ms per
+  call (8 to 12 T multiply-adds per second; the clock moves with the power cap), against 5.5 ms for the
+  two passes over the logits (3.1 + 2.5 ms, same profile run).
+- **FP32 attention on split halves.** The same kernel with every operand split into two halves,
+  x = hi + lo (hi = half(x), lo = half(x - hi)), and three products per tile (hi hi + hi lo + lo hi,
+  float accumulation): about 22 bits per product instead of 24. Pair at 512 px / 9 layers: 634 -> 417 ms.
+  - First version: the same matches as the original on all 12 runs, but points moved by up to 2e-3 px
+    instead of 2.5e-4, and on the LaMAR pair one confident query moved 4.1 px (confidence 0.018).
+  - Not the logits: splitting queries and keys in three halves (6 products, about 33 bits) changed
+    nothing (last-layer tokens 3.9e-3 from the golden dump either way; 3.2e-4 through the float buffer).
+  - The output accumulator: each output summed its 4096 source tokens inside the tensor-core instruction,
+    whose float accumulation on this GPU does not round as float additions do. With a fresh accumulator
+    per step of 32 tokens, added to the outputs with float additions, tokens are within 4.1e-4 of the
+    golden dump and the 12 runs within 4.1e-4 px (the LaMAR query: 4.1e-4 px). Cost: 4 % (409 -> 417 ms).
+    It is the default; `JMT_CUDA_SPLIT=0` goes back to the float logits buffer.
+  - The same fresh accumulator in FP16 mode changed nothing measurable (its error is set by half
+    storage), so FP16 keeps one accumulator.
+  - Tried before this and dropped: plain float kernels (no tensor cores) without the logits buffer. One
+    query per thread (64 query values and 64 outputs in registers, keys and values read as broadcasts):
+    661 ms per pair, 1.4 T multiply-adds per second, slower than the two passes. Four lanes sharing four
+    queries (a quarter of the shared-memory reads, two shuffles per logit): 697 ms. Both run at the
+    1.4 to 1.6 T the two passes over the logits reach at these shapes.
+- **Layer norm** with 16-byte loads (`k_layer_norm_vec`): a group of g channels is held by g / 8 lanes (FP16)
+  or g / 4 (FP32), several groups per warp when g is small. The per-head norms (g = 64) had run at 61 GB/s
+  with a warp per group and 2-byte loads: 7.4 -> 1.5 ms per pair for their 54 calls; all layer norms of a
+  pair and its two images 15 -> 6 ms.
+- **Depthwise 7x7 convolution** (`k_dwconv7_vec`): a thread takes 16 bytes of channels and 4 neighbouring
+  outputs of a row, so every input it loads serves the taps of all 4; the sum runs in the same order as
+  before (bitwise the same in FP32). 15 -> 2.8 ms for the two images.
+- **Read-out.** The Metal kernel scans the row 30 times for the bisection and up to 40 times for Newton's
+  method. Here many rows have thousands of cells above -1 (the cells that can have weight), so the
+  bisection ran on most rows: 5 ms per pair. Gathering those cells into shared memory did not help (a
+  list of 1024 overflowed; 4096 allowed only 4 warps per SM: 3.3 ms). What did: three passes of a 256-bin
+  histogram, each within the bin the previous one chose, place the 512th largest y in a cell of width
+  2^-24; the cells that share it stand in as copies of their largest value, and the y that count (at most
+  512) go to shared memory for Newton's method. 1.6 ms per pair. Against the golden dumps: coarse
+  positions within 3.3e-7 (median), masses within 1e-5, as close as the host version; in FP16, on the same
+  device logits, the host and the device read-outs move as many unconfident queries (41 and 42 of 512).
+- **The profile** (`JMT_CUDA_PROFILE=1`) now brackets every launch with two events instead of waiting
+  after it. Waiting let the GPU's clock drop between kernels and inflated the totals several times (3.8 s
+  of attention reported for a pair that took 0.63 s). Even with events, totals vary by up to 30 % from run to run
+  on this laptop (power cap), so the tables use the best wall time of several runs.
+- **Results** (Berlin pair, 2048 keypoints per image, best of 8 runs over two sweeps; table in M5 above).
+  FP16 at 512 px / 9 layers: 349 ms after M4, 274 with the hooks (fused products, device read-out,
+  uploads that do not wait, warp layer norm), 148 with `k_flash`, 143 with the vectorized layer norm,
+  depthwise convolution and the histogram read-out. FP32: 726 -> 634 ms with the same steps, 417 with
+  attention on split halves (the two passes over 512 MB of float logits had been 53 % of its kernel
+  time).
+- **Batches.** `jmt_match_batch` gains nothing here (FP16 at 512 px: 143 ms alone, 145 ms per pair in a
+  batch of 8): one pair fills the GPU, and the host's part (4 ms) already overlaps.
+- **Where the time is now** (FP16, profile of both images and the pair, 195 ms of kernel time in that run;
+  another run gave 139): products 89 ms, attention 78, copies for slices and concatenations 8, layer norm 6,
+  depthwise convolution 3, read-out 2. About a quarter of the products' time is the two images: the
+  products of stage 3 (32 x 32 tokens) fill only 32 blocks for 36 SMs and run at 6 T.
+- Not done: products with smaller tiles for the small grids of describe, slices and concatenations as
+  views (the value slice could go to `k_flash` with its stride). The products of FP32 mode (about 300 ms of
+  kernel time per pair and its two images) could use the same split halves on the tensor cores.
