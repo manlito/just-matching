@@ -154,7 +154,7 @@ reference for recall, before any C++ is written for them.
   Done: `src/backend/cuda/cuda_ops.cu`, FP32 and FP16 (`--backend cuda`, `cuda:fp16`). FP32 gives the
   original's matches on the 6 pairs x 2 settings (points within 1.9e-4 px). Per pair at 512 px / 9 layers
   on an RTX 2070 Max-Q: 726 ms in FP32, 349 ms in FP16 (tensor cores). See Notes from M4.
-- [ ] **M5 — Fast**
+- [x] **M5 — Fast**
   GEMM and attention kernels tuned per backend, pairs batched, zero allocations per pair. Benchmark table
   against PyTorch and the upstream ONNX models.
   Done on Metal (M5 Pro, macOS 26). Per pair, 2048 keypoints per image, Berlin pair, best of 8 runs;

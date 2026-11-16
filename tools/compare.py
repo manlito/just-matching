@@ -18,8 +18,14 @@ Reported per pair, a against b:
     conf      largest difference of the query confidences
     covis     covisibility score of a and of b
     matches   number of matches of a and of b, and how many are the same pair
+
+--save DIR writes the matches of each implementation as text, one match per line (keypoint index in A,
+keypoint index in B, their pixel positions in FlexGlue's convention, the score), to
+DIR/<A>-<B>.<size>x<layers>.a.txt and .b.txt; `diff` on the two files without the score column shows
+exactly which matches differ (see docs/reproducing.md).
 """
 import argparse
+import os
 
 import torch
 
@@ -34,6 +40,7 @@ def main():
     ap.add_argument("--layers", type=int, default=9)
     ap.add_argument("--size", type=int, default=512)
     ap.add_argument("--keypoints", type=int, default=2048)
+    ap.add_argument("--save", help="directory for the match lists of both implementations, as text")
     args = ap.parse_args()
     if len(args.images) % 2:
         ap.error("images must come in pairs")
@@ -62,6 +69,8 @@ def main():
         ma, mb = out[0]["matches0"], out[1]["matches0"]
         na, nb = int((ma > -1).sum()), int((mb > -1).sum())
         same = int(((ma == mb) & (ma > -1)).sum())
+        if args.save:
+            save_matches(args.save, f"{args.size}x{args.layers}", p0, p1, out, xy)
         print(f"{p0.split('/')[-1]} - {p1.split('/')[-1]}: feat {feat:.2e}  tokens {tokens:.2e}  "
               f"pos max {pos:.2e} median {med:.2e} px  conf {conf:.2e}  "
               f"covis {out[0]['covisibility']:.4f} / {out[1]['covisibility']:.4f}  "
@@ -71,6 +80,18 @@ def main():
         worst["same"] = min(worst["same"], same / max(na, nb, 1))
     print(f"worst: feat {worst['feat']:.2e}  tokens {worst['tokens']:.2e}  pos {worst['pos']:.2e} px  "
           f"conf {worst['conf']:.2e}  same matches {100 * worst['same']:.2f} %")
+
+
+def save_matches(directory, setting, p0, p1, out, xy):
+    os.makedirs(directory, exist_ok=True)
+    name = f"{os.path.splitext(os.path.basename(p0))[0]}-{os.path.splitext(os.path.basename(p1))[0]}.{setting}"
+    for tag, o in zip("ab", out):
+        m, sc = o["matches0"], o["scores0"]
+        with open(os.path.join(directory, f"{name}.{tag}.txt"), "w") as f:
+            f.write("# idx_a idx_b x_a y_a x_b y_b score\n")
+            for i in torch.nonzero(m > -1).flatten().tolist():
+                j = int(m[i])
+                f.write(f"{i} {j} {xy[0][i, 0]:.2f} {xy[0][i, 1]:.2f} {xy[1][j, 0]:.2f} {xy[1][j, 1]:.2f} {float(sc[i]):.4f}\n")
 
 
 if __name__ == "__main__":
