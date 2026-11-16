@@ -60,7 +60,7 @@ namespace {
 // Device helpers
 // ---------------------------------------------------------------------------------------------
 
-enum : int { kGelu = 0, kRelu = 1 };
+enum : int { kNoAct = 0, kGelu = 1, kRelu = 2 };  // activations; a zeroed Gemm has none
 constexpr int kBlock = 256;    // threads per block of the one-dimensional kernels
 
 __device__ __forceinline__ float ld(float v) { return v; }
@@ -78,6 +78,33 @@ template <int T>
 __device__ __forceinline__ void st_row(__half* p, const float* v) {
   #pragma unroll
   for (int q = 0; q < T / 2; ++q) reinterpret_cast<__half2*>(p)[q] = __floats2half2_rn(v[2 * q], v[2 * q + 1]);
+}
+
+__device__ __forceinline__ float activate(float v, int act) {
+  if (act == kGelu) return 0.5f * v * (1.0f + erff(v * 0.70710678118654752440f));
+  if (act == kRelu) return fmaxf(v, 0.0f);
+  return v;
+}
+
+__device__ __forceinline__ float warp_sum(float v) {
+  #pragma unroll
+  for (int s = 16; s > 0; s >>= 1) v += __shfl_xor_sync(0xffffffffu, v, s);
+  return v;
+}
+__device__ __forceinline__ int warp_sum(int v) {
+  #pragma unroll
+  for (int s = 16; s > 0; s >>= 1) v += __shfl_xor_sync(0xffffffffu, v, s);
+  return v;
+}
+__device__ __forceinline__ float warp_max(float v) {
+  #pragma unroll
+  for (int s = 16; s > 0; s >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, s));
+  return v;
+}
+__device__ __forceinline__ int warp_min(int v) {
+  #pragma unroll
+  for (int s = 16; s > 0; s >>= 1) v = min(v, __shfl_xor_sync(0xffffffffu, v, s));
+  return v;
 }
 
 __device__ __forceinline__ long long thread_index() {
@@ -114,6 +141,9 @@ struct Gemm {
   float scale;
   int vec;  // rows of the output start at multiples of 4 values: full tiles are stored 4 values at a time
   float* group_top;  // k_gemm_tc, kTops and kSoftmax: see there
+  // kPlain only: out = act(product) + residual, residual laid out as out (same strides, storage type).
+  const void* residual;
+  int act;
 };
 
 // Row maxima are shared between blocks as integers that order like the floats they encode, so that
@@ -260,6 +290,7 @@ __global__ void k_gemm(const X* x, const W* w, const float* bias, int* tops, Gem
   #pragma unroll
   for (int t = 0; t < MT; ++t) bv[t] = bias && o0 + tx * MT + t < a.cout ? bias[o0 + tx * MT + t] : 0.0f;
   const bool full = a.vec && row0 + ROWS <= a.n && o0 + OUTS <= a.cout;  // the same for the whole block
+  const O* res = MODE == kPlain && a.residual ? static_cast<const O*>(a.residual) + blockIdx.z * a.o_batch : nullptr;
   #pragma unroll
   for (int r = 0; r < MR; ++r) {
     const long long row = row0 + ty * MR + r;
@@ -275,6 +306,15 @@ __global__ void k_gemm(const X* x, const W* w, const float* bias, int* tops, Gem
     for (int t = 0; t < MT; ++t) {
       v[t] = acc[r][t] * scale + bv[t];
       if (o0 + tx * MT + t < a.cout) best = fmaxf(best, v[t]);
+    }
+    if (MODE == kPlain) {
+      #pragma unroll
+      for (int t = 0; t < MT; ++t) v[t] = activate(v[t], a.act);
+      if (res && row < a.n) {
+        #pragma unroll
+        for (int t = 0; t < MT; ++t)
+          if (o0 + tx * MT + t < a.cout) v[t] += ld(res[row * a.o_row + o0 + tx * MT + t]);
+      }
     }
     O* dst = out + row * a.o_row + o0 + tx * MT;
     if (full) {
@@ -461,6 +501,7 @@ __global__ void k_gemm_tc(const X* x, const __half* w, const float* bias, int* t
     for (int i = tid; i < ROWS; i += THREADS) rowtop[i] = INT_MIN;
   __syncthreads();
   const int lc = lane & 15, lr = lane >> 4;
+  const O* res = MODE == kPlain && a.residual ? static_cast<const O*>(a.residual) + blockIdx.z * a.o_batch : nullptr;
   #pragma unroll
   for (int fr = 0; fr < 4; ++fr) {
     const int r0 = wr * 64 + fr * 16 + lr;  // this thread's rows: r0 + 2 t
@@ -495,6 +536,11 @@ __global__ void k_gemm_tc(const X* x, const __half* w, const float* bias, int* t
         v[0][t] -= best, v[1][t] -= best;
       }
       if (row < a.n) {
+        if (MODE == kPlain) {
+          v[0][t] = activate(v[0][t], a.act), v[1][t] = activate(v[1][t], a.act);
+          if (res && oa < a.cout) v[0][t] += ld(res[row * a.o_row + oa]);
+          if (res && ob < a.cout) v[1][t] += ld(res[row * a.o_row + ob]);
+        }
         if (oa < a.cout) st(out + row * a.o_row + oa, v[0][t]);
         if (ob < a.cout) st(out + row * a.o_row + ob, v[1][t]);
       }
@@ -511,7 +557,7 @@ __global__ void k_gemm_tc(const X* x, const __half* w, const float* bias, int* t
 // Grid: n * cout.
 template <typename R, typename O>
 __global__ void k_linear_small(const R* x, const R* w, const float* bias, int n, int cin, int cout, float scale,
-                               O* out) {
+                               int act, const O* residual, O* out) {
   const long long i = thread_index();
   if (i >= static_cast<long long>(n) * cout) return;
   const long long tok = i / cout;
@@ -519,7 +565,9 @@ __global__ void k_linear_small(const R* x, const R* w, const float* bias, int n,
   const R* xr = x + tok * cin;
   float acc = 0.0f;
   for (int k = 0; k < cin; ++k) acc = fmaf(ld(xr[k]), ld(w[static_cast<long long>(k) * cout + o]), acc);
-  st(out + i, acc * scale + (bias ? bias[o] : 0.0f));
+  float v = activate(acc * scale + (bias ? bias[o] : 0.0f), act);
+  if (residual) v += ld(residual[i]);
+  st(out + i, v);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -562,9 +610,9 @@ __global__ void k_dwconv7(const R* x, const R* taps, const R* bias, int h, int w
 // Normalization and elementwise operations
 // ---------------------------------------------------------------------------------------------
 
-// LayerNorm over groups of g channels. One thread per (token, group). Grid: n * (c / g).
+// LayerNorm over groups of g channels, then an activation. One thread per (token, group). Grid: n * (c / g).
 template <typename R>
-__global__ void k_layer_norm(const R* x, const R* gain, const R* bias, int n, int c, int g, float eps, R* out) {
+__global__ void k_layer_norm(const R* x, const R* gain, const R* bias, int n, int c, int g, float eps, int act, R* out) {
   const long long i = thread_index();
   if (i >= static_cast<long long>(n) * (c / g)) return;
   const R* xr = x + i * g;
@@ -577,13 +625,43 @@ __global__ void k_layer_norm(const R* x, const R* gain, const R* bias, int n, in
     var = fmaf(d, d, var);
   }
   const float inv = 1.0f / sqrtf(var / static_cast<float>(g) + eps);
-  for (int j = 0; j < g; ++j) st(out + i * g + j, (ld(xr[j]) - mean) * inv * ld(gain[j]) + ld(bias[j]));
+  for (int j = 0; j < g; ++j) st(out + i * g + j, activate((ld(xr[j]) - mean) * inv * ld(gain[j]) + ld(bias[j]), act));
+}
+
+// The same for g a multiple of 32 up to 1024: one warp per (token, group), each lane holding channels
+// lane + 32 i in registers (coalesced loads), mean and variance reduced across the warp.
+// Blocks of 256 threads (8 groups). Grid: ceil(groups / 8).
+template <typename R>
+__global__ void k_layer_norm_warp(const R* x, const R* gain, const R* bias, long long groups, int g, float eps, int act,
+                                  R* out) {
+  const int lane = threadIdx.x & 31;
+  const long long grp = static_cast<long long>(blockIdx.x) * 8 + (threadIdx.x >> 5);
+  if (grp >= groups) return;
+  const int per = g >> 5;
+  const R* xr = x + grp * g;
+  float v[32];
+  float s = 0;
+  #pragma unroll
+  for (int i = 0; i < 32; ++i)
+    if (i < per) v[i] = ld(xr[lane + 32 * i]), s += v[i];
+  const float mean = warp_sum(s) / static_cast<float>(g);
+  float sq = 0;
+  #pragma unroll
+  for (int i = 0; i < 32; ++i)
+    if (i < per) v[i] -= mean, sq = fmaf(v[i], v[i], sq);
+  const float inv = 1.0f / sqrtf(warp_sum(sq) / static_cast<float>(g) + eps);
+  #pragma unroll
+  for (int i = 0; i < 32; ++i)
+    if (i < per) {
+      const int j = lane + 32 * i;
+      st(out + grp * g + j, activate(v[i] * inv * ld(gain[j]) + ld(bias[j]), act));
+    }
 }
 
 // LayerNorm for wide groups: one block per (token, group), the sums reduced over the block.
 // Grid: n * (c / g) blocks.
 template <typename R>
-__global__ void k_layer_norm_wide(const R* x, const R* gain, const R* bias, int g, float eps, R* out) {
+__global__ void k_layer_norm_wide(const R* x, const R* gain, const R* bias, int g, float eps, int act, R* out) {
   __shared__ float red[kBlock];
   const long long base = static_cast<long long>(blockIdx.x) * g;
   float sum = 0;
@@ -595,7 +673,8 @@ __global__ void k_layer_norm_wide(const R* x, const R* gain, const R* bias, int 
     var = fmaf(d, d, var);
   }
   const float inv = 1.0f / sqrtf(block_sum(red, var) / static_cast<float>(g) + eps);
-  for (int j = threadIdx.x; j < g; j += kBlock) st(out + base + j, (ld(x[base + j]) - mean) * inv * ld(gain[j]) + ld(bias[j]));
+  for (int j = threadIdx.x; j < g; j += kBlock)
+    st(out + base + j, activate((ld(x[base + j]) - mean) * inv * ld(gain[j]) + ld(bias[j]), act));
 }
 
 template <typename R>
@@ -603,7 +682,7 @@ __global__ void k_unary(const R* x, long long count, int op, R* out) {
   const long long i = thread_index();
   if (i >= count) return;
   const float v = ld(x[i]);
-  st(out + i, op == kGelu ? 0.5f * v * (1.0f + erff(v * 0.70710678118654752440f)) : fmaxf(v, 0.0f));
+  st(out + i, activate(v, op));
 }
 
 template <typename R>
@@ -700,6 +779,113 @@ __global__ void k_sample(const R* x, const float* pts, int h, int w, int c, int 
   const float p00 = ld(x[(static_cast<long long>(y0) * w + x0) * c + ch]), p01 = ld(x[(static_cast<long long>(y0) * w + x1) * c + ch]);
   const float p10 = ld(x[(static_cast<long long>(y1) * w + x0) * c + ch]), p11 = ld(x[(static_cast<long long>(y1) * w + x1) * c + ch]);
   st(out + i, p00 * (1 - tx) * (1 - ty) + p01 * tx * (1 - ty) + p10 * (1 - tx) * ty + p11 * tx * ty);
+}
+
+// Match read-out of one query from its logits over the h x w cells (see Ops::readout and core/readout.h,
+// which this follows). One warp per query; lane l scans cells l, l + 32, ... and the warp reduces.
+// Blocks of 256 threads (8 queries). Grid: ceil(N / 8).
+//
+// The 1.5-entmax threshold tau solves sum over T of max(y - tau, 0)^2 = 1 with y = (logit - top) / 2 and
+// T the 512 largest logits (the reference sorts them and uses a closed form per prefix; the root is the
+// same). The sum is convex and decreasing in tau and is at least 1 at tau = -1, so Newton's method from
+// -1 climbs to the root without passing it. Cells with y <= -1 never count; when more than 512 cells lie
+// above -1, the 512th largest y is found by bisection and the cells below it are left out.
+// Every lane ends a butterfly reduction with the same value, so the loops branch alike on all lanes.
+__global__ void k_readout(const float* logits, int N, int h, int w, float* coarse, float* mass) {
+  const int lane = threadIdx.x & 31, q = blockIdx.x * 8 + (threadIdx.x >> 5);
+  if (q >= N) return;
+  const int P = h * w;
+  const float* row = logits + static_cast<long long>(q) * P;
+  // Largest logit and the first cell that has it.
+  float best = -INFINITY;
+  int at = P;
+  for (int s = lane; s < P; s += 32) {
+    const float v = row[s];
+    if (v > best) best = v, at = s;
+  }
+  const float top = warp_max(best);
+  const int arg = warp_min(best == top ? at : P);
+  // Cells that can have weight: y > cut. `extra` copies of the value `cut` stand for the cells that tie
+  // at the 512th place.
+  float cut = -1.0f;
+  int count = 0;
+  for (int s = lane; s < P; s += 32) count += (row[s] - top) * 0.5f > cut;
+  count = warp_sum(count);
+  int extra = 0;
+  if (count > 512) {
+    float lo = -1.0f, hi = 0.0f;  // count(y > lo) >= 512 > count(y > hi)
+    for (int it = 0; it < 30; ++it) {
+      const float mid = 0.5f * (lo + hi);
+      int c = 0;
+      for (int s = lane; s < P; s += 32) c += (row[s] - top) * 0.5f > mid;
+      if (warp_sum(c) >= 512) lo = mid;
+      else hi = mid;
+    }
+    int c = 0;
+    for (int s = lane; s < P; s += 32) c += (row[s] - top) * 0.5f > hi;
+    cut = hi, extra = 512 - warp_sum(c);
+  }
+  float tau = -1.0f;
+  for (int it = 0; it < 40; ++it) {
+    float a = 0, b = 0;
+    for (int s = lane; s < P; s += 32) {
+      const float y = (row[s] - top) * 0.5f;
+      const float d = y > cut ? fmaxf(y - tau, 0.0f) : 0.0f;
+      a += d, b = fmaf(d, d, b);
+    }
+    const float gap = fmaxf(cut - tau, 0.0f), de = gap * static_cast<float>(extra);
+    a = warp_sum(a) + de, b = warp_sum(b) + de * gap;
+    const float next = tau + (b - 1.0f) / (2.0f * a);
+    if (!(next > tau)) break;
+    tau = next;
+  }
+  if (lane != 0) return;
+  // Expected cell-centre position in the 3 x 3 window around the best cell, and the window's mass.
+  const int by = arg / w, bx = arg % w;
+  float px = 0, py = 0, total = 0, inside = 0;
+  for (int dy = -1; dy <= 1; ++dy)
+    for (int dx = -1; dx <= 1; ++dx) {
+      int ny = by + dy, nx = bx + dx;
+      const bool in = ny >= 0 && ny < h && nx >= 0 && nx < w;
+      ny = min(max(ny, 0), h - 1), nx = min(max(nx, 0), w - 1);
+      float p = fmaxf((row[ny * w + nx] - top) * 0.5f - tau, 0.0f);
+      p *= p;
+      px += p * ((static_cast<float>(nx) + 0.5f) / static_cast<float>(w) * 2.0f - 1.0f);
+      py += p * ((static_cast<float>(ny) + 0.5f) / static_cast<float>(h) * 2.0f - 1.0f);
+      total += p;
+      if (in) inside += p;
+    }
+  coarse[2 * q] = px / total, coarse[2 * q + 1] = py / total;
+  mass[q] = inside;
+}
+
+// Network input from 8-bit pixels: bilinear resize to oh x ow of pixel / 255, then (v - mean) / std per
+// channel. ch bytes per pixel (1: grey; 3 or 4: R, G, B first). The source rows and columns come from the
+// host (taps: 3 floats per output row, then 3 per output column: first index, second index, weight of the
+// second), and the arithmetic is rounded step by step as written (no fused multiply-adds), so the result
+// is the host's (core/preprocess.h) to the last bit. Grid: oh * ow.
+template <typename R>
+__global__ void k_preprocess(const unsigned char* img, const float* taps, int stride, int ch, int oh, int ow, float3 mean,
+                             float3 sd, R* out) {
+  const long long i = thread_index();
+  if (i >= static_cast<long long>(oh) * ow) return;
+  const float* ty3 = taps + 3 * (i / ow);
+  const float* tx3 = taps + 3 * (oh + i % ow);
+  const int y0 = static_cast<int>(ty3[0]), y1 = static_cast<int>(ty3[1]), x0 = static_cast<int>(tx3[0]), x1 = static_cast<int>(tx3[1]);
+  const float ty = ty3[2], tx = tx3[2];
+  const float m[3] = {mean.x, mean.y, mean.z}, d[3] = {sd.x, sd.y, sd.z};
+  #pragma unroll
+  for (int c = 0; c < 3; ++c) {
+    const int o = ch == 1 ? 0 : c;
+    const float p00 = __fdiv_rn(static_cast<float>(img[static_cast<long long>(y0) * stride + x0 * ch + o]), 255.0f);
+    const float p01 = __fdiv_rn(static_cast<float>(img[static_cast<long long>(y0) * stride + x1 * ch + o]), 255.0f);
+    const float p10 = __fdiv_rn(static_cast<float>(img[static_cast<long long>(y1) * stride + x0 * ch + o]), 255.0f);
+    const float p11 = __fdiv_rn(static_cast<float>(img[static_cast<long long>(y1) * stride + x1 * ch + o]), 255.0f);
+    const float top = __fadd_rn(__fmul_rn(p00, __fsub_rn(1.0f, tx)), __fmul_rn(p01, tx));
+    const float bottom = __fadd_rn(__fmul_rn(p10, __fsub_rn(1.0f, tx)), __fmul_rn(p11, tx));
+    const float v = __fadd_rn(__fmul_rn(top, __fsub_rn(1.0f, ty)), __fmul_rn(bottom, ty));
+    st(out + i * 3 + c, __fdiv_rn(__fsub_rn(v, m[c]), d[c]));
+  }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -811,6 +997,7 @@ class Pool {
       return p;
     }
     void* p = nullptr;
+    ++created_;
     cudaError_t status = cudaMalloc(&p, bytes);
     if (status == cudaErrorMemoryAllocation) {  // give back what is cached and try once more
       cudaGetLastError();
@@ -822,6 +1009,7 @@ class Pool {
     return p;
   }
   void release(void* p, size_t bytes) { free_.emplace(std::max<size_t>(bytes, 16), p); }
+  long created() const { return created_; }
   void trim() {
     for (auto& kv : free_) cudaFree(kv.second);
     free_.clear();
@@ -830,6 +1018,7 @@ class Pool {
  private:
   int device_;
   std::multimap<size_t, void*> free_;
+  long created_ = 0;  // cudaMalloc calls
 };
 using PoolPtr = std::shared_ptr<Pool>;
 
@@ -842,8 +1031,11 @@ class Buffer {
   Buffer& operator=(const Buffer&) = delete;
   template <typename T>
   T* as() const { return static_cast<T*>(p_); }
+  // Queued after the work launched so far. From pageable memory the driver stages the bytes before it
+  // returns, so src may change at once; unlike cudaMemcpy it does not wait for the device to go idle, which
+  // would stall the host in the middle of every pair.
   void upload(const void* src, size_t bytes) {
-    if (bytes) JMT_CUDA_CHECK(cudaMemcpy(p_, src, bytes, cudaMemcpyHostToDevice));
+    if (bytes) JMT_CUDA_CHECK(cudaMemcpyAsync(p_, src, bytes, cudaMemcpyHostToDevice, 0));
   }
   void download(void* dst, size_t bytes) const {
     if (bytes) JMT_CUDA_CHECK(cudaMemcpy(dst, p_, bytes, cudaMemcpyDeviceToHost));
@@ -855,7 +1047,8 @@ class Buffer {
   void* p_;
 };
 
-// Elements are float, or __half when `half` is set.
+// Elements are float, or __half when `half` is set (the read-out's positions and masses are float in both
+// modes).
 struct CudaTensor : Tensor {
   bool half;
   Buffer buf;
@@ -892,6 +1085,7 @@ class CudaOps : public Ops {
     if (e && std::string(e) == "k16") chunk_ = 16;
     else if (e && *e && std::string(e) != "k8") fail("unknown JMT_CUDA_GEMM");
     if ((e = std::getenv("JMT_CUDA_TENSOR"))) tensor_ = std::atoi(e);
+    if ((e = std::getenv("JMT_CUDA_READOUT"))) readout_device_ = std::atoi(e) != 0;
     threads_ = std::max(1u, std::thread::hardware_concurrency());
   }
   ~CudaOps() override {
@@ -922,14 +1116,45 @@ class CudaOps : public Ops {
     return upload(v.data(), out_h, out_w, 3);
   }
 
+  TensorPtr preprocess_u8(const unsigned char* data, int height, int width, int stride, int channels, int out_h,
+                          int out_w, const float mean[3], const float std[3]) override {
+    const size_t bytes = static_cast<size_t>(height - 1) * stride + static_cast<size_t>(width) * channels;
+    Buffer image(pool_, (bytes + 4095) / 4096 * 4096);  // rounded up so images of similar size reuse it
+    image.upload(data, bytes);
+    // Source rows and columns of the resize, computed here so they match the host implementation exactly.
+    std::vector<float> taps(static_cast<size_t>(out_h + out_w) * 3);
+    for (int i = 0; i < out_h + out_w; ++i) {
+      float* t = taps.data() + 3 * i;
+      int i0, i1;
+      if (i < out_h) resize_source(i, out_h, height, &i0, &i1, t + 2);
+      else resize_source(i - out_h, out_w, width, &i0, &i1, t + 2);
+      t[0] = static_cast<float>(i0), t[1] = static_cast<float>(i1);
+    }
+    Buffer dtaps(pool_, taps.size() * sizeof(float));
+    dtaps.upload(taps.data(), taps.size() * sizeof(float));
+    Ptr out = make(out_h, out_w, 3);
+    g_profile.tag("preprocess");
+    launch(k_preprocess<R>, static_cast<long long>(out_h) * out_w, image.template as<unsigned char>(), dtaps.template as<float>(),
+           stride, channels, out_h, out_w, make_float3(mean[0], mean[1], mean[2]), make_float3(std[0], std[1], std[2]),
+           out->buf.template as<R>());
+    return out;
+  }
+
   TensorPtr linear(const TensorPtr& xp, const Param& weight, const Param* bias) override {
+    return linear_fused(xp, weight, bias, Act::None, nullptr);
+  }
+
+  TensorPtr linear_fused(const TensorPtr& xp, const Param& weight, const Param* bias, Act act,
+                         const TensorPtr& residual) override {
     const CudaTensor& x = dev(xp);
     if (weight.shape.size() != 2 || weight.shape[1] != x.c) fail("linear: shape mismatch");
     const int out_c = weight.shape[0], in_c = weight.shape[1];
+    if (residual && (residual->n() != x.n() || residual->c != out_c)) fail("linear: residual shape mismatch");
     const bool by_output = tensor_product(x.n(), in_c, out_c);
     const R* w = matrix(weight, in_c, out_c, by_output, [&](int o, int i) { return weight.data[static_cast<size_t>(o) * in_c + i]; });
     g_profile.tag("linear %d -> %d, n %d", in_c, out_c, x.n());
-    return product(x.buf.template as<R>(), x.h, x.w, in_c, w, by_output, bias, out_c);
+    return product(x.buf.template as<R>(), x.h, x.w, in_c, w, by_output, bias, out_c, act_code(act),
+                   residual ? dev(residual).buf.template as<R>() : nullptr);
   }
 
   TensorPtr conv(const TensorPtr& xp, const Param& weight, const Param& bias, int k, int stride, int pad) override {
@@ -945,7 +1170,7 @@ class CudaOps : public Ops {
     const R* w = matrix(weight, cols, out_c, by_output, [&](int o, int i) {  // input i = (ky, kx, channel)
       return weight.data[(static_cast<size_t>(o) * in_c + i % in_c) * k * k + i / in_c];
     });
-    return product(patches->buf.template as<R>(), oh, ow, cols, w, by_output, &bias, out_c);
+    return product(patches->buf.template as<R>(), oh, ow, cols, w, by_output, &bias, out_c, kNoAct, nullptr);
   }
 
   TensorPtr dwconv7(const TensorPtr& xp, const Param& weight, const Param& bias) override {
@@ -963,17 +1188,25 @@ class CudaOps : public Ops {
   }
 
   TensorPtr layer_norm(const TensorPtr& xp, const Param& gain, const Param& bias, float eps) override {
+    return layer_norm_act(xp, gain, bias, eps, Act::None);
+  }
+
+  TensorPtr layer_norm_act(const TensorPtr& xp, const Param& gain, const Param& bias, float eps, Act act) override {
     const CudaTensor& x = dev(xp);
     const int g = static_cast<int>(gain.size());
     if (g <= 0 || x.c % g != 0) fail("layer_norm: shape mismatch");
     Ptr out = make(x.h, x.w, x.c);
     const long long groups = static_cast<long long>(x.n()) * (x.c / g);
+    const int a = act_code(act);
     g_profile.tag("layer_norm c%d g%d n %d", x.c, g, x.n());
-    if (g >= kBlock && groups <= INT_MAX)
+    if (g % 32 == 0 && g <= 1024 && (groups + 7) / 8 <= INT_MAX)
+      launch_grid(k_layer_norm_warp<R>, dim3(static_cast<unsigned>((groups + 7) / 8)), dim3(kBlock), x.buf.template as<R>(),
+                  vec<R>(gain), vec<R>(bias), groups, g, eps, a, out->buf.template as<R>());
+    else if (g >= kBlock && groups <= INT_MAX)
       launch_grid(k_layer_norm_wide<R>, dim3(static_cast<unsigned>(groups)), dim3(kBlock), x.buf.template as<R>(),
-                  vec<R>(gain), vec<R>(bias), g, eps, out->buf.template as<R>());
+                  vec<R>(gain), vec<R>(bias), g, eps, a, out->buf.template as<R>());
     else
-      launch(k_layer_norm<R>, groups, x.buf.template as<R>(), vec<R>(gain), vec<R>(bias), x.n(), x.c, g, eps,
+      launch(k_layer_norm<R>, groups, x.buf.template as<R>(), vec<R>(gain), vec<R>(bias), x.n(), x.c, g, eps, a,
              out->buf.template as<R>());
     return out;
   }
@@ -1042,13 +1275,10 @@ class CudaOps : public Ops {
     const CudaTensor& x = dev(xp);
     const int pairs = x.c / heads / 2;
     if (static_cast<int>(cos.size()) != x.n() * pairs) fail("rotary: shape mismatch");
-    Buffer c(pool_, cos.size() * sizeof(float)), s(pool_, sin.size() * sizeof(float));
-    c.upload(cos.data(), cos.size() * sizeof(float));
-    s.upload(sin.data(), sin.size() * sizeof(float));
     Ptr out = make(x.h, x.w, x.c);
     g_profile.tag("rotary");
-    launch(k_rotary<R>, static_cast<long long>(x.n()) * heads * pairs, x.buf.template as<R>(), c.template as<float>(),
-           s.template as<float>(), x.n(), heads, pairs, out->buf.template as<R>());
+    launch(k_rotary<R>, static_cast<long long>(x.n()) * heads * pairs, x.buf.template as<R>(), table(cos), table(sin), x.n(),
+           heads, pairs, out->buf.template as<R>());
     return out;
   }
 
@@ -1137,7 +1367,58 @@ class CudaOps : public Ops {
     for (auto& th : pool) th.join();
   }
 
+  bool has_device_readout() const override { return readout_device_; }
+
+  void readout_device(const TensorPtr& queryp, const TensorPtr& searchp, float temperature, TensorPtr* coarse,
+                      TensorPtr* mass) override {
+    const CudaTensor &query = dev(queryp), &search = dev(searchp);
+    const int N = query.n(), P = search.n(), d = query.c;
+    if (d % 16 != 0) fail("readout: the number of channels must be a multiple of 16");
+    auto c = std::make_shared<CudaTensor>(pool_, 1, N, 2, false), m = std::make_shared<CudaTensor>(pool_, 1, N, 1, false);
+    *coarse = c, *mass = m;
+    if (N == 0) return;
+    Buffer logits(pool_, static_cast<size_t>(N) * P * sizeof(float));
+    Gemm a{};
+    a.n = N, a.cin = d, a.cout = P, a.scale = temperature;
+    a.x_row = d, a.w_in = 1, a.w_out = d, a.o_row = P;
+    g_profile.tag("readout logits N %d P %d", N, P);
+    gemm<kPlain>(query.buf.template as<R>(), search.buf.template as<R>(), nullptr, nullptr, a, logits.template as<float>(), 1);
+    g_profile.tag("readout N %d P %d", N, P);
+    launch_grid(k_readout, dim3((N + 7) / 8), dim3(kBlock), logits.template as<float>(), N, search.h, search.w,
+                c->buf.template as<float>(), m->buf.template as<float>());
+  }
+
+  TensorPtr sample_at(const TensorPtr& xp, const TensorPtr& ptsp) override {
+    const CudaTensor& x = dev(xp);
+    const CudaTensor& pts = static_cast<const CudaTensor&>(*ptsp);
+    if (pts.half || pts.c != 2) fail("sample_at: points must be a float tensor of pairs");
+    const int n = pts.n();
+    Ptr out = make(1, n, x.c);
+    g_profile.tag("sample");
+    launch(k_sample<R>, static_cast<long long>(n) * x.c, x.buf.template as<R>(), pts.buf.template as<float>(), x.h, x.w, x.c, n,
+           out->buf.template as<R>());
+    return out;
+  }
+
+  long device_allocations() const override { return pool_->created() + static_cast<long>(params_.size()); }
+  // Kernels start when they are launched: there is nothing to flush.
+  void flush() override {}
+  void finish() override { JMT_CUDA_CHECK(cudaDeviceSynchronize()); }
+
  private:
+  static int act_code(Act a) { return a == Act::Gelu ? kGelu : a == Act::Relu ? kRelu : kNoAct; }
+
+  // Device copy of a table the caller keeps unchanged at one address (the rotary cos and sin, see
+  // Ops::rotary), made on first use.
+  const float* table(const std::vector<float>& v) {
+    auto& slot = tables_[v.data()];
+    if (!slot || slot->n != v.size()) {
+      slot = std::make_unique<Table>(pool_, v.size());
+      slot->buf.upload(v.data(), v.size() * sizeof(float));
+    }
+    return slot->buf.template as<float>();
+  }
+
   static const CudaTensor& dev(const TensorPtr& t) {
     const CudaTensor& x = static_cast<const CudaTensor&>(*t);
     if (x.half != kHalf) fail("tensor has another element type");
@@ -1234,19 +1515,21 @@ class CudaOps : public Ops {
     });
   }
 
-  // out (h * w, out_c) = x (h * w, in_c) * W + bias; W as `matrix` made it.
-  TensorPtr product(const R* x, int h, int w, int in_c, const R* weights, bool by_output, const Param* bias, int out_c) {
+  // out (h * w, out_c) = act(x (h * w, in_c) * W + bias) + residual; W as `matrix` made it.
+  TensorPtr product(const R* x, int h, int w, int in_c, const R* weights, bool by_output, const Param* bias, int out_c,
+                    int act, const R* residual) {
     Ptr out = make(h, w, out_c);
     const int n = h * w;
     const float* b = bias ? vec<float>(*bias) : nullptr;
     if (!by_output && (out_c < 32 || n < 32 || in_c % 16 != 0)) {
-      launch(k_linear_small<R, R>, static_cast<long long>(n) * out_c, x, weights, b, n, in_c, out_c, 1.0f,
+      launch(k_linear_small<R, R>, static_cast<long long>(n) * out_c, x, weights, b, n, in_c, out_c, 1.0f, act, residual,
              out->buf.template as<R>());
     } else {
       Gemm a{};
       a.n = n, a.cin = in_c, a.cout = out_c, a.scale = 1.0f;
       a.x_row = in_c, a.o_row = out_c;
       a.w_in = by_output ? 1 : out_c, a.w_out = by_output ? in_c : 1;
+      a.act = act, a.residual = residual;
       gemm<kPlain>(x, weights, b, nullptr, a, out->buf.template as<R>(), 1);
     }
     return out;
@@ -1263,6 +1546,13 @@ class CudaOps : public Ops {
 
   PoolPtr pool_;
   std::map<std::pair<const float*, int>, void*> params_;
+  struct Table {
+    size_t n;
+    Buffer buf;
+    Table(const PoolPtr& pool, size_t n_) : n(n_), buf(pool, n_ * sizeof(float)) {}
+  };
+  std::map<const float*, std::unique_ptr<Table>> tables_;
+  bool readout_device_ = true;  // JMT_CUDA_READOUT=0: the read-out's selection on host threads, as before M5
   int chunk_ = 8, threads_ = 1;
   int tensor_ = 1;  // FP16: use the tensor cores (JMT_CUDA_TENSOR=0 turns them off)
 };
