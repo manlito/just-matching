@@ -178,23 +178,29 @@ reference for recall, before any C++ is written for them.
   first pass (786 ms in FP32, 549 ms in FP16).
   Done on CUDA (RTX 2070 Max-Q laptop): the same hooks, attention without the logits buffer in FP16 mode
   (tensor cores, `mma.sync` from inline PTX), the read-out and preprocessing on the device. Per pair,
-  2048 keypoints per image, Berlin pair, best of 8 runs over two sweeps:
+  2048 keypoints per image, Berlin pair, best of 8 runs over three sweeps; PyTorch (2.15, CUDA 13.2,
+  `tools/bench_torch.py --impl upstream:cuda`) measured the same way on the same day:
 
-  | Size, layers | CUDA FP32 | CUDA FP16 | FP32 / FP16 after M4 |
-  |---|---|---|---|
-  | 512, 9 | 634 ms | 143 ms | 726 / 349 ms |
-  | 512, 5 | 382 ms | 86 ms | 434 / 219 ms |
-  | 384, 9 | 291 ms | 54 ms | 331 / 173 ms |
+  | Size, layers | CUDA FP32 | PyTorch CUDA FP32 | CUDA FP16 | PyTorch CUDA FP16 | FP32 / FP16 after M4 |
+  |---|---|---|---|---|---|
+  | 512, 9 | 634 ms | 629 ms | 141 ms | 207 ms | 726 / 349 ms |
+  | 512, 5 | 367 ms | 360 ms | 83 ms | 121 ms | 434 / 219 ms |
+  | 384, 9 | 282 ms | 249 ms | 54 ms | 97 ms | 331 / 173 ms |
 
-  Describe, per image: 54 ms in FP32 and 19 ms in FP16 at 512 px, 41 and 14 ms at 384 px (after M4: 66 /
-  30 and 47 / 19 ms). In a batch of 8: 643 / 383 / 293 ms per pair in FP32 and 145 / 87 / 68 ms in FP16:
+  Describe, per image: 54 ms in FP32 and 18 ms in FP16 at 512 px, 40 and 14 ms at 384 px (PyTorch: 54
+  and 31 ms in both precisions; after M4: 66 / 30 and 47 / 19 ms).
+  ONNX Runtime 1.32, CUDA provider, upstream's release v0.1 models (512 px, 9 layers only): describe 66
+  ms, match 660 ms with the FP32 matcher (90 matches, see the Mac notes); the FP16 matcher runs in 184 ms
+  but returns NaN covisibility and no matches on this GPU. FP16 is 1.5 to 1.8 times PyTorch's speed. FP32
+  is PyTorch's speed at 512 px and 13 % slower at 384 px: its attention still goes through the float
+  logits buffer (with `JMT_CUDA_SPLIT=1`, 425 / 245 / 190 ms, 1.3 to 1.5 times faster than PyTorch). In a batch of 8: 643 / 383 / 293 ms per pair in FP32 and 145 / 87 / 68 ms in FP16:
   no gain, one pair already fills the GPU. GPU memory in use: 1.4 GB in FP32, 0.54 GB in FP16 (M4: 1.5 /
   0.8 GB). FP32 attention on split halves (`JMT_CUDA_SPLIT=1`): 425 / 245 / 190 ms, not the default.
   Agreement (`tools/compare_all.sh` through `tools/remote.sh`, 6 pairs x 2 settings): FP32 identical
   matches on all 12 runs, points within 2.5e-4 px, confidences within 1.1e-5. FP16: 98.5 to 100 % of the
   matches per pair (identical on 9 of the 12 runs; 1 match differs on each of the others), as after M4.
   The second batch creates no device buffers on CUDA either. See "Notes from M5 (CUDA)".
-  Open: PyTorch and ONNX Runtime on the NVIDIA machine are not measured.
+  Open: exact FP32 attention without the logits buffer, the one place PyTorch is still ahead.
 - [ ] **M6 — Runs in the browser** (WebGPU via Dawn, then Emscripten; FP16 when `shader-f16` is available)
 - [ ] **M7 — Demo and docs**: pick images, see the shortlist, matches and timings; just-keypoints supplies the keypoints.
 - [ ] **M8 — v1.0**: CMake package, npm package, weights fetch script.
