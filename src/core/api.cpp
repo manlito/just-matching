@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <deque>
 #include <exception>
 #include <memory>
@@ -25,6 +26,8 @@ struct jmt_ctx {
   std::unique_ptr<jmt::Ops> ops;
   int input_size = 512;
   std::deque<jmt_result> results;  // one per pair of the last call; a deque keeps the addresses stable
+  std::vector<int32_t> shortlist_idx;  // what the last jmt_pair_list points into
+  std::vector<float> shortlist_score;
 };
 
 namespace {
@@ -50,6 +53,22 @@ jmt::MatchOptions to_options(const jmt_match_options* options) {
 
 // Pairs in flight on the device ahead of the one the host is finishing.
 const int kPipeline = 4;
+
+const std::vector<float>& global_of(jmt_ctx* ctx, const jmt_features* f) {
+  if (f->global.empty()) f->global = ctx->model->global_vector(f->tensor);
+  return f->global;
+}
+
+jmt::FlexGlue::Image0 image0_of(jmt_ctx* ctx, const jmt_features* f) {
+  if (!f->search0) f->search0 = ctx->model->search0(*ctx->ops, f->tensor);
+  return {f->tensor, f->search0};
+}
+
+float dot(const std::vector<float>& a, const std::vector<float>& b) {
+  double s = 0;
+  for (size_t k = 0; k < a.size(); ++k) s += static_cast<double>(a[k]) * b[k];
+  return static_cast<float>(s);
+}
 }  // namespace
 
 namespace jmt {
@@ -210,6 +229,88 @@ int jmt_match(jmt_ctx* ctx, const jmt_features* a, const float* xy_a, int n_a, c
   }
   const jmt_pair pair = {a, xy_a, n_a, b, xy_b, n_b};
   return jmt_match_batch(ctx, &pair, 1, options, m);
+}
+
+int jmt_covisibility(jmt_ctx* ctx, const jmt_features* a, const jmt_features* b, int level, float* score) {
+  try {
+    if (!ctx || !a || !b || !score) throw std::runtime_error("null argument");
+    if (level == 1) {
+      *score = dot(global_of(ctx, a), global_of(ctx, b));
+    } else if (level == 2) {
+      *score = ctx->model->grid_scores(*ctx->ops, {{image0_of(ctx, a), image0_of(ctx, b)}})[0];
+    } else {
+      throw std::runtime_error("covisibility level must be 1 or 2 (level 3 is jmt_matches.covisibility)");
+    }
+    return 0;
+  } catch (const std::exception& e) {
+    g_error = e.what();
+    return -1;
+  }
+}
+
+void jmt_shortlist_options_default(jmt_shortlist_options* o) {
+  *o = jmt_shortlist_options{};
+  o->k = 10;
+}
+
+int jmt_shortlist(jmt_ctx* ctx, const jmt_features* const* images, int n, const jmt_shortlist_options* options,
+                  jmt_pair_list* out) {
+  try {
+    if (!ctx || !out || n < 0 || (n && !images)) throw std::runtime_error("bad argument");
+    for (int i = 0; i < n; ++i)
+      if (!images[i]) throw std::runtime_error("bad argument");
+    jmt_shortlist_options o;
+    jmt_shortlist_options_default(&o);
+    if (options) o = *options;
+    // Level 1 for every pair, then the k best partners of every image.
+    std::vector<float> sim(static_cast<size_t>(n) * n, 0.0f);
+    for (int i = 0; i < n; ++i)
+      for (int j = i + 1; j < n; ++j)
+        sim[static_cast<size_t>(i) * n + j] = sim[static_cast<size_t>(j) * n + i] =
+            dot(global_of(ctx, images[i]), global_of(ctx, images[j]));
+    std::vector<char> keep(static_cast<size_t>(n) * n, 0);
+    std::vector<int> order;
+    const int k = std::min(std::max(o.k, 0), n - 1);
+    for (int i = 0; i < n && k > 0; ++i) {
+      order.clear();
+      for (int j = 0; j < n; ++j)
+        if (j != i) order.push_back(j);
+      const float* row = sim.data() + static_cast<size_t>(i) * n;
+      std::partial_sort(order.begin(), order.begin() + k, order.end(),
+                        [&](int x, int y) { return row[x] > row[y] || (row[x] == row[y] && x < y); });
+      for (int r = 0; r < k; ++r) keep[static_cast<size_t>(std::min(i, order[r])) * n + std::max(i, order[r])] = 1;
+    }
+    for (int i = 0; i < n; ++i)
+      for (int j = i + 1; j <= i + o.neighbours && j < n; ++j) keep[static_cast<size_t>(i) * n + j] = 1;
+    std::vector<std::pair<int, int>> kept;
+    for (int i = 0; i < n; ++i)
+      for (int j = i + 1; j < n; ++j)
+        if (keep[static_cast<size_t>(i) * n + j]) kept.emplace_back(i, j);
+    std::vector<float> score(kept.size());
+    if (o.rerank) {
+      std::vector<std::pair<jmt::FlexGlue::Image0, jmt::FlexGlue::Image0>> pairs;
+      pairs.reserve(kept.size());
+      for (const auto& p : kept) pairs.emplace_back(image0_of(ctx, images[p.first]), image0_of(ctx, images[p.second]));
+      score = ctx->model->grid_scores(*ctx->ops, pairs);
+    } else {
+      for (size_t p = 0; p < kept.size(); ++p) score[p] = sim[static_cast<size_t>(kept[p].first) * n + kept[p].second];
+    }
+    std::vector<size_t> rank;
+    for (size_t p = 0; p < kept.size(); ++p)
+      if (!o.rerank || score[p] >= o.min_score) rank.push_back(p);
+    std::stable_sort(rank.begin(), rank.end(), [&](size_t x, size_t y) { return score[x] > score[y]; });
+    ctx->shortlist_idx.clear(), ctx->shortlist_score.clear();
+    for (size_t p : rank) {
+      ctx->shortlist_idx.push_back(kept[p].first), ctx->shortlist_idx.push_back(kept[p].second);
+      ctx->shortlist_score.push_back(score[p]);
+    }
+    out->n = static_cast<int>(ctx->shortlist_score.size());
+    out->idx = ctx->shortlist_idx.data(), out->score = ctx->shortlist_score.data();
+    return 0;
+  } catch (const std::exception& e) {
+    g_error = e.what();
+    return -1;
+  }
 }
 
 void jmt_destroy(jmt_ctx* ctx) { delete ctx; }

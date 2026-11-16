@@ -209,23 +209,50 @@ FlexGlue::Tokens FlexGlue::decode_pair(Ops& ops, const TensorPtr& f0, const Tens
 FlexGlue::HeadWork FlexGlue::head_queue(Ops& ops, int layer, const std::vector<float>& pts, const TensorPtr& cf_i,
                                         const TensorPtr& cf_j, const Trace& trace, const std::string& tag) const {
   const std::string p = idx("heads.", layer);
-  HeadWork work;
-  work.n = static_cast<int>(pts.size() / 2), work.h = cf_j->h, work.w = cf_j->w, work.layer = layer;
-  const int n = work.n;
-  if (n == 0) return work;
+  const int n = static_cast<int>(pts.size() / 2);
+  if (n == 0) {
+    HeadWork work;
+    work.h = cf_j->h, work.w = cf_j->w, work.layer = layer;
+    return work;
+  }
   TensorPtr search = ops.l2_normalize(lin(ops, p + ".to_search", cf_j));
   TensorPtr f_query = ops.sample(cf_i, pts.data(), n);
   TensorPtr query = ops.l2_normalize(lin(ops, p + ".to_search", f_query));
+  return head_tail(ops, layer, n, query, search, f_query, cf_j, "", trace, tag);
+}
+
+// Sampling commutes with input_proj (bilinear weights sum to 1), so the 512-channel tokens are needed
+// only at the query points and at their best cells.
+FlexGlue::HeadWork FlexGlue::head0_queue(Ops& ops, const std::vector<float>& pts, const TensorPtr& f_i,
+                                         const TensorPtr& f_j, const TensorPtr& search_j) const {
+  const int n = static_cast<int>(pts.size() / 2);
+  if (n == 0) {
+    HeadWork work;
+    work.h = f_j->h, work.w = f_j->w;
+    return work;
+  }
+  TensorPtr s = ops.sample(f_i, pts.data(), n);
+  TensorPtr query = ops.l2_normalize(lin(ops, "desc0", s));
+  return head_tail(ops, 0, n, query, search_j, lin(ops, "input_proj", s), f_j, "input_proj", nullptr, "");
+}
+
+FlexGlue::HeadWork FlexGlue::head_tail(Ops& ops, int layer, int n, const TensorPtr& query, const TensorPtr& search,
+                                       const TensorPtr& f_query, const TensorPtr& src_j, const std::string& match_proj,
+                                       const Trace& trace, const std::string& tag) const {
+  const std::string p = idx("heads.", layer);
+  HeadWork work;
+  work.n = n, work.h = search->h, work.w = search->w, work.layer = layer;
   const float temperature = w_.get(p + ".temperature").data[0];
   TensorPtr f_match;
   if (ops.has_device_readout()) {
     ops.readout_device(query, search, temperature, &work.coarse_t, &work.mass_t);
-    f_match = ops.sample_at(cf_j, work.coarse_t);
+    f_match = ops.sample_at(src_j, work.coarse_t);
   } else {
     ops.readout(query, search, temperature, &work.coarse, &work.mass);
-    f_match = ops.sample(cf_j, work.coarse.data(), n);
+    f_match = ops.sample(src_j, work.coarse.data(), n);
     if (trace) work.coarse_t = ops.upload(work.coarse.data(), 1, n, 2), work.mass_t = ops.upload(work.mass.data(), 1, n, 1);
   }
+  if (!match_proj.empty()) f_match = lin(ops, match_proj, f_match);
   if (trace) trace("coarse" + tag, work.coarse_t), trace("mass" + tag, work.mass_t);
   // Sub-cell offset: a distribution over 17 bin edges spanning +-1 cell per axis; the 18th output is unused.
   TensorPtr x = ops.concat(mlp3(ops, p + ".offset_head.query_encoder", f_query),
@@ -368,6 +395,70 @@ void FlexGlue::match(Ops& ops, const TensorPtr& f0, const float* xy0, int n0, fl
                      const float* xy1, int n1, float w1, float h1, const MatchOptions& o, MatchResult* out,
                      const Trace& trace) const {
   match_read(*match_queue(ops, f0, xy0, n0, w0, h0, f1, xy1, n1, w1, h1, o, trace), out);
+}
+
+// ---------------------------------------------------------------- covisibility, levels 1 and 2
+
+std::vector<float> FlexGlue::global_vector(const TensorPtr& features) const {
+  const std::vector<float> f = read(features);
+  const int c = features->c, n = features->n();
+  std::vector<double> sum(c, 0.0);
+  for (int t = 0; t < n; ++t)
+    for (int k = 0; k < c; ++k) sum[k] += f[static_cast<size_t>(t) * c + k];
+  double norm = 0;
+  for (double& s : sum) s /= n, norm += s * s;
+  norm = std::max(std::sqrt(norm), 1e-12);
+  std::vector<float> out(c);
+  for (int k = 0; k < c; ++k) out[k] = static_cast<float>(sum[k] / norm);
+  return out;
+}
+
+TensorPtr FlexGlue::search0(Ops& ops, const TensorPtr& features) const {
+  return ops.l2_normalize(lin(ops, "desc0", features));
+}
+
+std::vector<float> FlexGlue::grid_scores(Ops& ops, const std::vector<std::pair<Image0, Image0>>& pairs, int grid) const {
+  std::vector<float> pts(static_cast<size_t>(grid) * grid * 2);
+  for (int y = 0; y < grid; ++y)
+    for (int x = 0; x < grid; ++x) {
+      pts[2 * (y * grid + x)] = (x + 0.5f) / grid * 2 - 1;
+      pts[2 * (y * grid + x) + 1] = (y + 0.5f) / grid * 2 - 1;
+    }
+  const int n = grid * grid;
+  std::vector<float> scores(pairs.size(), 0.0f);
+  // Pairs go in chunks, so a GPU backend has every head of a chunk queued before the first is read; the
+  // way back needs the way there on the host (offsets are added there).
+  const size_t chunk = 8;
+  std::vector<HeadWork> work;
+  std::vector<std::vector<float>> there;
+  std::vector<float> back, conf;
+  for (size_t first = 0; first < pairs.size(); first += chunk) {
+    const size_t count = std::min(chunk, pairs.size() - first);
+    // Direction d of pair p: from image i to image j.
+    auto ends = [&](size_t k, const Image0** i, const Image0** j) {
+      const std::pair<Image0, Image0>& pr = pairs[first + k / 2];
+      *i = k % 2 ? &pr.second : &pr.first, *j = k % 2 ? &pr.first : &pr.second;
+    };
+    work.assign(2 * count, HeadWork());
+    there.assign(2 * count, std::vector<float>());
+    const Image0 *i, *j;
+    for (size_t k = 0; k < work.size(); ++k) ends(k, &i, &j), work[k] = head0_queue(ops, pts, i->features, j->features, j->search);
+    ops.flush();
+    for (size_t k = 0; k < work.size(); ++k) head_read(work[k], &there[k], &conf);
+    for (size_t k = 0; k < work.size(); ++k) ends(k, &i, &j), work[k] = head0_queue(ops, there[k], j->features, i->features, i->search);
+    ops.flush();
+    for (size_t k = 0; k < work.size(); ++k) {
+      ends(k, &i, &j);
+      head_read(work[k], &back, &conf);
+      // Error in pixels of image i's network input; one cell is 8 of them.
+      const float sx = 4.0f * i->features->w, sy = 4.0f * i->features->h;
+      int returned = 0;
+      for (int a = 0; a < n; ++a)
+        if (std::hypot((back[2 * a] - pts[2 * a]) * sx, (back[2 * a + 1] - pts[2 * a + 1]) * sy) < 8.0f) ++returned;
+      scores[first + k / 2] += 0.5f * static_cast<float>(returned) / n;
+    }
+  }
+  return scores;
 }
 
 }  // namespace jmt

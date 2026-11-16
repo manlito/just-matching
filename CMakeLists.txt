@@ -189,6 +189,9 @@ if(JMT_BUILD_TESTS)
   add_executable(batch_test tests/batch_test.cpp)
   target_include_directories(batch_test PRIVATE src)
   target_link_libraries(batch_test PRIVATE jmt)
+  add_executable(shortlist_test tests/shortlist_test.cpp)
+  target_include_directories(shortlist_test PRIVATE src)
+  target_link_libraries(shortlist_test PRIVATE jmt)
   # Each operation of every GPU backend against the CPU backend; needs no weights or golden files.
   add_executable(ops_test tests/ops_test.cpp)
   target_include_directories(ops_test PRIVATE src)
@@ -213,6 +216,8 @@ if(JMT_BUILD_TESTS)
                COMMAND golden_test "${CMAKE_CURRENT_SOURCE_DIR}/weights/flexglue.jmtw" "${golden}" ${backend})
       add_test(NAME batch_${backend_name}_${name}
                COMMAND batch_test "${CMAKE_CURRENT_SOURCE_DIR}/weights/flexglue.jmtw" "${golden}" ${backend})
+      add_test(NAME shortlist_${backend_name}_${name}
+               COMMAND shortlist_test "${CMAKE_CURRENT_SOURCE_DIR}/weights/flexglue.jmtw" "${golden}" ${backend})
     endforeach()
   endforeach()
 endif()
