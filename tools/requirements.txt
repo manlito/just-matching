@@ -1,0 +1,6 @@
+# Dev-only: used to export weights and validate against the original FlexGlue.
+# Never a runtime dependency of the library.
+torch
+numpy
+opencv-python-headless
+matplotlib
