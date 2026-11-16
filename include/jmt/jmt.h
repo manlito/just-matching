@@ -108,6 +108,41 @@ typedef struct {
 int jmt_match_batch(jmt_ctx* ctx, const jmt_pair* pairs, int n_pairs, const jmt_match_options* options,
                     jmt_matches* matches);
 
+/* ---- Covisibility: which pairs are worth matching, from the features alone. */
+
+/* Score of a pair at a level of cost:
+     1  cosine similarity of the two images' mean feature vectors: a dot product once both are known (each
+        image's vector is computed on first use and kept with its features). In practice 0.8 to 1: compare
+        pairs with each other rather than with a fixed bar.
+     2  a 16 x 16 grid of points of each image through FlexGlue's layer-0 head to the other image and
+        back; the share of points that return within one cell (8 pixels of the network input), mean of
+        both directions, in [0, 1]. About 0.3 G multiply-adds per pair; each image keeps a 64-channel
+        map (1 MB in FP32) with its features after first use.
+   Level 3, FlexGlue's own score, is jmt_matches.covisibility. Returns 0 on success. */
+int jmt_covisibility(jmt_ctx* ctx, const jmt_features* a, const jmt_features* b, int level, float* score);
+
+typedef struct {
+  int k;            /* partners kept per image, by level 1; a pair is kept when either image keeps it.
+                       Default 10; >= n - 1 keeps every pair */
+  int neighbours;   /* also keep (i, i + 1) .. (i, i + neighbours), for images given in capture order.
+                       Default 0 */
+  int rerank;       /* 1: score the kept pairs with level 2 and sort by that score. Default 0 */
+  float min_score;  /* with rerank: drop pairs whose level-2 score is below it. Default 0 */
+} jmt_shortlist_options;
+
+/* Pairs of images, owned by the context; valid until the next jmt_shortlist or jmt_destroy on it. */
+typedef struct {
+  int n;
+  const int32_t* idx; /* [n][2]: indices into the images given, first < second */
+  const float* score; /* [n] level 1, or level 2 with rerank */
+} jmt_pair_list;
+
+void jmt_shortlist_options_default(jmt_shortlist_options* options);
+
+/* The pairs of n images worth matching, best first. options may be NULL. Returns 0 on success. */
+int jmt_shortlist(jmt_ctx* ctx, const jmt_features* const* images, int n, const jmt_shortlist_options* options,
+                  jmt_pair_list* pairs);
+
 void jmt_destroy(jmt_ctx* ctx);
 
 /* Message for the last failure on the calling thread. */

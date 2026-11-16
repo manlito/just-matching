@@ -8,7 +8,8 @@ Status: M1-M4 done: the C++ library runs on the CPU, on the Mac GPU (Metal) and 
 the original. M5 is done on Metal: 314 ms per pair in FP32 and 105 ms in FP16 at full settings on an M5 Pro,
 against 376 and 157 ms for PyTorch on the same GPU, and on CUDA. M6 is done: the WebGPU backend matches the
 original natively (Dawn) and in Chrome (WebAssembly): per pair at full settings on the M5 Pro, 478 ms in
-FP32 and 313 ms in FP16 natively, 500 and 335 ms in Chrome. Numbers marked "estimate" are computed from the layer sizes, not measured.
+FP32 and 313 ms in FP16 natively, 500 and 335 ms in Chrome. C2 is done: `jmt_covisibility` (levels 1 and 2)
+and `jmt_shortlist` on every backend. Numbers marked "estimate" are computed from the layer sizes, not measured.
 
 ## What FlexGlue is (reviewed at release v0.1, 2026-10-26)
 
@@ -82,7 +83,8 @@ int  jmt_match(jmt_ctx*, const jmt_features* a, const float* xy_a, int na,
                const jmt_match_options*, jmt_matches*);
 int  jmt_match_batch(jmt_ctx*, const jmt_pair* pairs, int n_pairs, const jmt_match_options*, jmt_matches*);
 int  jmt_covisibility(jmt_ctx*, const jmt_features* a, const jmt_features* b, int level, float* score);
-int  jmt_shortlist(jmt_ctx*, const jmt_features* const* images, int n, int k, jmt_pairs*);
+int  jmt_shortlist(jmt_ctx*, const jmt_features* const* images, int n, const jmt_shortlist_options*,
+                   jmt_pair_list*);
 void jmt_features_free(jmt_features*);
 void jmt_destroy(jmt_ctx*);
 ```
@@ -92,8 +94,9 @@ void jmt_destroy(jmt_ctx*);
 - `jmt_match_options`: `n_layers`, `filter_threshold` (0.1), `max_distance_px` (3), `min_covisibility`,
   `early_stop_decay`.
 - `jmt_features` can be saved and loaded, so a capture is described once (not written yet).
-- Implemented so far: `jmt_create`, `jmt_describe`, `jmt_match`, `jmt_match_batch`; see `include/jmt/jmt.h`.
-  `jmt_covisibility` and `jmt_shortlist` belong to the covisibility track.
+- `jmt_shortlist_options`: `k` (partners per image by level 1), `neighbours` (capture order), `rerank`
+  (level 2), `min_score`. `jmt_pair_list`: `idx` int32 `[n,2]`, `score`, best first.
+- Implemented so far: everything above except saving features; see `include/jmt/jmt.h`.
 
 ## Covisibility
 
@@ -246,7 +249,13 @@ reference for recall, before any C++ is written for them.
 
 - [ ] **C1** — levels 1 and 2 evaluated in Python. Partly done in M1 on sample scenes (`tools/covis.py`): all levels
   separate different scenes. Open: recall within one real capture, against MegaLoc; then choose the pooling.
-- [ ] **C2** — `jmt_shortlist` and `jmt_covisibility` levels 1-2 on CPU. Needs only `describe` and the layer-0 head, so it can land before the transformer.
+- [x] **C2** — `jmt_shortlist` and `jmt_covisibility` levels 1-2 on CPU.
+  Done, on every backend (it is written against the backend operations, like the rest of the graph):
+  level 1 is the mean feature vector (the pooling is C1's open choice), level 2 the layer-0 grid round
+  trip of `tools/covis.py`. `jmt shortlist IMAGE... [--k K] [--neighbours N] [--rerank] [--min-score S]`.
+  Against the reference (`tools/compare_covis.py`, 8 images of 5 scenes, all 28 pairs): level 1 within
+  6.0e-5 (1.2e-4 in FP16), level 2 within 3 of 512 grid points (4 in WebGPU FP16) on CPU, Metal and WebGPU
+  in both precisions. On the 53 images of `covis.py` with k = 5 it keeps the same 156 pairs. See "Notes from C2".
 - [ ] **C3** — level 3 with early stop, on each backend once that backend passes M2-M4.
 - [ ] **C4** — shortlist view in the demo.
 
@@ -796,3 +805,24 @@ The first pass first; the second pass, at the end, replaced its products and att
   per call; it is at 5.1. The remote RTX 2070 could not be used for this pass (permission), so there are
   no Dawn/Vulkan numbers.
 
+## Notes from C2 (covisibility levels 1 and 2)
+
+- **Level 2 without the 512-channel tokens.** `desc0` (64 x 256) equals `heads.0.to_search` after
+  `input_proj` to 4.8e-7, and bilinear sampling commutes with a linear layer (the weights sum to 1), so
+  the search map is `l2_normalize(desc0(features))`, computed once per image and kept with its features
+  (1 MB in FP32), and `input_proj` runs only on the sampled points (the query and its best cell). A pair
+  is four layer-0 heads of 256 queries: about 0.3 G multiply-adds (estimate), instead of 1.3 G with the
+  token maps of both images. `FlexGlue::head_tail` is the part both head forms share.
+- **Batching.** The way back starts from the way there, whose offsets are added on the host, so a pair
+  needs two round trips. `grid_scores` queues 8 pairs (16 heads) before reading any of them.
+- **Speed**, the 53 images of `covis.py`, k = 5 and rerank (156 pairs), per reranked pair including each
+  image's first search map: Metal 2.5 ms in FP32, 2.0 ms in FP16; WebGPU FP16 3.9 ms; CPU 25 ms (PyTorch
+  MPS in `covis.py`: 6.7 ms). Level 1 for all 1378 pairs: 11 ms on the CPU, 18-43 ms on a GPU (reading
+  the 53 feature maps back once).
+- **Level 2 and scale.** The Berlin pair (a close-up of the same facade) scores 0.11 at level 2 and 0.80 at
+  level 1; the LaMAR look-alikes (not the same place) score 0.39 and 0.985. A grid of 16 x 16 points mostly
+  lands outside a close-up, so level 2 under-rates scale changes and does not reject look-alikes. That is
+  why `min_score` is off by default; level 3 decides. Whether level 2 re-ranks partial overlap inside one
+  capture well is C1's question.
+- **Not done:** a faster CPU level 2 (10 times Metal; where its time goes is not measured), the shortlist in the WebAssembly module, saving the kept per-image vectors with
+  the features.

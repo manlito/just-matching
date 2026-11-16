@@ -1,12 +1,14 @@
 // jmt: command line front end of the just-matching library.
 //
 //   jmt match A B --kpts-a A.jkpt --kpts-b B.jkpt [--out OUT.jmtt] [options]
+//   jmt shortlist IMAGE... [--out OUT.jmtt] [options]
 //
 // A, B: images (PNG, JPEG, ...). The keypoint files are just-keypoints outputs (`jkp extract --out`), or any
 // container with a float32 tensor "keypoints" (N, 2) in pixels with (0,0) at the centre of the top-left pixel.
 // OUT holds matches (K, 2: index in A, index in B), scores (K), a_in_b (Na, 2), b_in_a (Nb, 2), conf_a (Na),
 // conf_b (Nb), covisibility (1), stop_layer (1), all float32; with --dump-features also features_a and
 // features_b (h, w, 256).
+// The shortlist file holds pairs (K, 2: image indices), scores (K) and level1 (N, N), all float32.
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -43,7 +45,24 @@ void usage() {
                "  --threads N            CPU threads (default all)\n"
                "  --dump-features        also write the dense features to OUT\n"
                "  --runs N               repeat N times and report the fastest run (default 1)\n"
-               "  --batch N              also time N copies of the pair through jmt_match_batch\n");
+               "  --batch N              also time N copies of the pair through jmt_match_batch\n"
+               "usage: jmt shortlist IMAGE... [--out OUT.jmtt] [options]\n"
+               "  --k K                  partners kept per image by level 1 (default 10)\n"
+               "  --neighbours N         also keep the N next images in the order given (default 0)\n"
+               "  --rerank               score the kept pairs with level 2 (layer-0 grid round trip)\n"
+               "  --min-score S          with --rerank, drop pairs scoring below S (default 0)\n"
+               "  --backend, --weights, --size, --threads as for match\n");
+}
+
+void set_backend(const std::string& b, jmt_config* config) {
+  if (b == "cpu") config->backend = JMT_BACKEND_CPU;
+  else if (b == "metal") config->backend = JMT_BACKEND_METAL;
+  else if (b == "metal:fp16") config->backend = JMT_BACKEND_METAL, config->precision = JMT_PRECISION_FP16;
+  else if (b == "cuda") config->backend = JMT_BACKEND_CUDA;
+  else if (b == "cuda:fp16") config->backend = JMT_BACKEND_CUDA, config->precision = JMT_PRECISION_FP16;
+  else if (b == "webgpu") config->backend = JMT_BACKEND_WEBGPU;
+  else if (b == "webgpu:fp16") config->backend = JMT_BACKEND_WEBGPU, config->precision = JMT_PRECISION_FP16;
+  else throw std::runtime_error("unknown backend " + b);
 }
 
 double now_ms() {
@@ -63,9 +82,88 @@ struct Image {
   jmt_image view() const { return jmt_image{pixels, w, h, 0, JMT_FORMAT_RGB8}; }
 };
 
+// jmt shortlist: describe every image, then the pairs worth matching.
+int shortlist(int argc, char** argv) {
+  std::string out_path, weights = "weights/flexglue.jmtw";
+  std::vector<std::string> paths;
+  jmt_config config;
+  jmt_config_default(&config);
+  jmt_shortlist_options options;
+  jmt_shortlist_options_default(&options);
+  for (int i = 2; i < argc; ++i) {
+    std::string a = argv[i];
+    auto value = [&]() -> std::string {
+      if (i + 1 >= argc) throw std::runtime_error("missing value for " + a);
+      return argv[++i];
+    };
+    if (a == "--out") out_path = value();
+    else if (a == "--weights") weights = value();
+    else if (a == "--backend") set_backend(value(), &config);
+    else if (a == "--size") config.input_size = std::stoi(value());
+    else if (a == "--threads") config.num_threads = std::stoi(value());
+    else if (a == "--k") options.k = std::stoi(value());
+    else if (a == "--neighbours") options.neighbours = std::stoi(value());
+    else if (a == "--rerank") options.rerank = 1;
+    else if (a == "--min-score") options.min_score = std::stof(value());
+    else if (a.rfind("--", 0) == 0) throw std::runtime_error("unknown option " + a);
+    else paths.push_back(a);
+  }
+  const int n = static_cast<int>(paths.size());
+  if (n < 2) throw std::runtime_error("at least two images are required");
+  config.weights_path = weights.c_str();
+  jmt_ctx* ctx = jmt_create(&config);
+  if (!ctx) throw std::runtime_error(jmt_last_error());
+  std::vector<jmt_features*> features;
+  double t0 = now_ms();
+  for (const std::string& p : paths) {
+    Image image(p);
+    jmt_image view = image.view();
+    features.push_back(jmt_describe(ctx, &view));
+    if (!features.back()) throw std::runtime_error(jmt_last_error());
+  }
+  jmt::ops_of(ctx).finish();
+  const double t_describe = now_ms() - t0;
+  t0 = now_ms();
+  std::vector<float> level1(static_cast<size_t>(n) * n, 1.0f);
+  for (int i = 0; i < n; ++i)
+    for (int j = i + 1; j < n; ++j) {
+      float s;
+      if (jmt_covisibility(ctx, features[i], features[j], 1, &s)) throw std::runtime_error(jmt_last_error());
+      level1[static_cast<size_t>(i) * n + j] = level1[static_cast<size_t>(j) * n + i] = s;
+    }
+  const double t_level1 = now_ms() - t0;
+  t0 = now_ms();
+  jmt_pair_list list;
+  if (jmt_shortlist(ctx, features.data(), n, &options, &list)) throw std::runtime_error(jmt_last_error());
+  const double t_shortlist = now_ms() - t0;
+  for (int p = 0; p < list.n; ++p)
+    std::printf("%s %s %.4f\n", paths[list.idx[2 * p]].c_str(), paths[list.idx[2 * p + 1]].c_str(), list.score[p]);
+  std::printf("%d of %d pairs; describe %.0f ms per image, level 1 for all pairs %.1f ms, shortlist %.1f ms",
+              list.n, n * (n - 1) / 2, t_describe / n, t_level1, t_shortlist);
+  if (options.rerank && list.n) std::printf(" (%.2f ms per reranked pair, with the first use of each image)", t_shortlist / list.n);
+  std::printf("\n");
+  if (!out_path.empty()) {
+    std::vector<float> idx(list.idx, list.idx + 2 * static_cast<size_t>(list.n));
+    jmt::write_container(out_path, {{"kind", "shortlist"}, {"model", "flexglue"}},
+                         {{"pairs", {list.n, 2}, idx.data()}, {"scores", {list.n}, list.score},
+                          {"level1", {n, n}, level1.data()}});
+  }
+  for (jmt_features* f : features) jmt_features_free(f);
+  jmt_destroy(ctx);
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
+  if (argc >= 2 && std::strcmp(argv[1], "shortlist") == 0) {
+    try {
+      return shortlist(argc, argv);
+    } catch (const std::exception& e) {
+      std::fprintf(stderr, "error: %s\n", e.what());
+      return 1;
+    }
+  }
   if (argc < 2 || std::strcmp(argv[1], "match") != 0) {
     usage();
     return 2;
@@ -89,17 +187,7 @@ int main(int argc, char** argv) {
       else if (a == "--kpts-b") kpts_b = value();
       else if (a == "--out") out_path = value();
       else if (a == "--weights") weights = value();
-      else if (a == "--backend") {
-        std::string b = value();
-        if (b == "cpu") config.backend = JMT_BACKEND_CPU;
-        else if (b == "metal") config.backend = JMT_BACKEND_METAL;
-        else if (b == "metal:fp16") config.backend = JMT_BACKEND_METAL, config.precision = JMT_PRECISION_FP16;
-        else if (b == "cuda") config.backend = JMT_BACKEND_CUDA;
-        else if (b == "cuda:fp16") config.backend = JMT_BACKEND_CUDA, config.precision = JMT_PRECISION_FP16;
-        else if (b == "webgpu") config.backend = JMT_BACKEND_WEBGPU;
-        else if (b == "webgpu:fp16") config.backend = JMT_BACKEND_WEBGPU, config.precision = JMT_PRECISION_FP16;
-        else throw std::runtime_error("unknown backend " + b);
-      }
+      else if (a == "--backend") set_backend(value(), &config);
       else if (a == "--runs") runs = std::stoi(value());
       else if (a == "--batch") batch = std::stoi(value());
       else if (a == "--size") config.input_size = std::stoi(value());

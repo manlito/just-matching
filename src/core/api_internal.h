@@ -9,6 +9,10 @@
 struct jmt_features {
   jmt::TensorPtr tensor;  // (size / 8, size / 8, 256)
   int width = 0, height = 0;  // of the original image
+  // Made on first use by the covisibility functions and kept: the L2-normalized mean feature vector
+  // (level 1) and the layer-0 search map (level 2, see FlexGlue::search0).
+  mutable std::vector<float> global;
+  mutable jmt::TensorPtr search0;
 };
 
 namespace jmt {

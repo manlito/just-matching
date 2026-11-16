@@ -65,6 +65,20 @@ class FlexGlue {
 
   int max_layers() const { return n_layers_; }
 
+  // ---- Covisibility levels 1 and 2 ("mean" and "grid0" in tools/covis.py).
+
+  // Level 1: the L2-normalized mean of the features over all cells (256 values). Reads the features back.
+  std::vector<float> global_vector(const TensorPtr& features) const;
+  // The layer-0 head's search descriptors of every cell, L2-normalized: (h, w, 64). desc0 is input_proj
+  // followed by heads.0.to_search, so this is the head's own search map without the 512-channel tokens.
+  TensorPtr search0(Ops& ops, const TensorPtr& features) const;
+  struct Image0 {
+    TensorPtr features, search;  // search: search0(features)
+  };
+  // Level 2 for every pair: a grid x grid lattice of cell centres of each image through the layer-0 head
+  // to the other image and back; the share that returns within one cell, mean of both directions.
+  std::vector<float> grid_scores(Ops& ops, const std::vector<std::pair<Image0, Image0>>& pairs, int grid = 16) const;
+
  private:
   struct Tokens {
     TensorPtr x0, x1;
@@ -95,6 +109,14 @@ class FlexGlue {
                      const Trace& trace) const;
   HeadWork head_queue(Ops& ops, int layer, const std::vector<float>& pts, const TensorPtr& cf_i, const TensorPtr& cf_j,
                       const Trace& trace, const std::string& tag) const;
+  // The layer-0 head straight from the features: points of image i against the search map of image j.
+  HeadWork head0_queue(Ops& ops, const std::vector<float>& pts, const TensorPtr& f_i, const TensorPtr& f_j,
+                       const TensorPtr& search_j) const;
+  // What both forms share once the query descriptors are known: read-out and offsets. The match is sampled
+  // from src_j, then passed through the linear layer match_proj when it is not empty.
+  HeadWork head_tail(Ops& ops, int layer, int n, const TensorPtr& query, const TensorPtr& search,
+                     const TensorPtr& f_query, const TensorPtr& src_j, const std::string& match_proj,
+                     const Trace& trace, const std::string& tag) const;
   void head_read(HeadWork& work, std::vector<float>* refined, std::vector<float>* confidence) const;
 
   const Weights& w_;

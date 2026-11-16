@@ -18,6 +18,7 @@ python tools/dump_golden.py $A/berlin1.jpg $A/berlin2.jpg                   # ->
 python tools/compare.py $A/berlin1.jpg $A/berlin2.jpg --b "cmd:build/release/jmt match"   # original vs the C++ library
 python tools/presets.py $A/berlin*.jpg $A/lamar*.jpg --neg $A/lamar_cab_1446.jpg $A/lamar_cab_1450.jpg
 python tools/covis.py SCENE_DIR... --single IMAGE...                        # cheap covisibility scores vs FlexGlue's
+python tools/compare_covis.py IMAGE... --backend metal                      # jmt shortlist's levels 1 and 2 vs the reference
 ```
 
 | File | Purpose |
@@ -31,6 +32,7 @@ python tools/covis.py SCENE_DIR... --single IMAGE...                        # ch
 | `dump_golden.py` | golden test vectors from the reference pass |
 | `presets.py` | accuracy and time against input size, layer count and precision, on synthetic pairs with exact ground truth |
 | `covis.py` | evaluates the covisibility levels of the plan on folders of images |
+| `compare_covis.py` | levels 1 and 2 of `jmt shortlist` against `covis.py`'s reference, every pair of the images given |
 | `compare_all.sh` | `compare.py` on the 6 test pairs at 512 px / 9 layers and 384 px / 5 layers for one backend: `tools/compare_all.sh metal:fp16 [--save DIR]`; `JMT="tools/remote.sh user@host DIR build/release/jmt"` runs the CLI on another machine |
 | `bench_torch.py` | time of the original under PyTorch on the pair `bench.sh` uses, FP32 and FP16, for the benchmark table |
 | `bench.sh` | wall time and GPU time per kernel of the `jmt` CLI on the Berlin pair: `tools/bench.sh metal:fp16` (WebGPU: wall time per kernel, a round trip each) |

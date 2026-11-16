@@ -16,8 +16,8 @@ PyTorch on the same GPU:
 | M5 Pro, Metal | 0.31 s | 0.38 s | 0.105 s | 0.16 s | 31 / 13 ms |
 | RTX 2070 Max-Q laptop, CUDA | 0.42 s | 0.63 s | 0.14 s | 0.21 s | 54 / 18 ms |
 
-WebGPU (Dawn natively, Chrome in the browser) on the M5 Pro: see PLAN.md, M6. The covisibility functions
-are planned.
+WebGPU (Dawn natively, Chrome in the browser) on the M5 Pro: see PLAN.md, M6. Covisibility levels 1 and 2
+(which pairs to match, from the features alone) and the shortlist are in; level 3 is FlexGlue's own score.
 
 ## Build
 
@@ -74,6 +74,17 @@ Options: `--backend cpu|metal|metal:fp16|cuda|cuda:fp16|webgpu|webgpu:fp16`, `--
 time N copies of the pair as one batch), `--weights FILE`, `--size N` (network input, default 512), `--layers N` (0..9, default 9),
 `--filter T`, `--max-px D`, `--min-covisibility S`, `--early-stop D`, `--threads N`, `--dump-features`.
 
+The pairs of a set of images worth matching, best first:
+
+```sh
+build/release/jmt shortlist images/*.jpg --k 10 --neighbours 2 --rerank --out pairs.jmtt
+```
+
+Options: `--k K` (partners kept per image by level 1, the mean feature vector; default 10), `--neighbours N`
+(also the N next images in the order given), `--rerank` (score the kept pairs with level 2, a grid of points
+through the layer-0 head and back), `--min-score S` (with `--rerank`, drop pairs below S), and `--backend`,
+`--weights`, `--size`, `--threads`.
+
 ## C API
 
 ```c
@@ -103,6 +114,19 @@ returns them.
 
 For many pairs, `jmt_match_batch` takes an array of `jmt_pair` and fills an array of `jmt_matches`: the same
 results, with the GPU kept busy while the host finishes each pair.
+
+Which pairs to match, from the features `jmt_describe` already computed:
+
+```c
+jmt_shortlist_options so;
+jmt_shortlist_options_default(&so);          /* k = 10 partners per image by level 1 */
+so.rerank = 1;                               /* sort the kept pairs by level 2 */
+jmt_pair_list pairs;
+jmt_shortlist(ctx, features, n_images, &so, &pairs);   /* pairs.idx[2*i], pairs.idx[2*i+1], pairs.score[i] */
+
+float s;
+jmt_covisibility(ctx, fa, fb, 2, &s);        /* one pair, level 1 or 2 */
+```
 
 ## Validation against the original
 
