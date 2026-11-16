@@ -13,13 +13,11 @@
 // (Ops::linear_fused). FP16 mode runs the products on the tensor cores (k_gemm_tc, through the toolkit's
 // warp matrix interface; no library), with float accumulation.
 //
-// Attention in FP16 mode (k_flash) keeps logits, weights and the product with the values of a tile of
-// queries in registers on the tensor cores and rescales when a row's maximum grows, so there is no logits
-// buffer. FP32 mode makes two passes over a buffer of heads x P x S float logits (k_gemm with kTops and
-// kSoftmax): exact float arithmetic. JMT_CUDA_SPLIT=1 runs FP32 attention through k_flash too, with
-// every operand split into two halves (37 % faster per pair, about 22 bits per product: matches stay the
-// same, but a confident point can move by pixels, see PLAN.md); JMT_CUDA_FLASH=0 sends FP16 mode through
-// the logits buffer as well.
+// Attention (k_flash) keeps logits, weights and the product with the values of a tile of queries in
+// registers on the tensor cores and rescales when a row's maximum grows, so there is no logits buffer. In
+// FP32 mode every operand is split into two halves (see there). JMT_CUDA_SPLIT=0 sends FP32 mode, and
+// JMT_CUDA_FLASH=0 both modes, through two passes over a buffer of heads x P x S float logits (k_gemm /
+// k_gemm_tc with kTops and kSoftmax).
 //
 // The read-out (k_readout: the 1.5-entmax threshold over the 512 largest logits) and the preprocessing of
 // 8-bit images (k_preprocess) run on the device, so a pair needs no round trip before its results are read.
@@ -618,19 +616,20 @@ __device__ __forceinline__ unsigned pack_half2(float a, float b) {
   return *reinterpret_cast<const unsigned*>(&h);
 }
 
-// For float tensors (FP32 mode with JMT_CUDA_SPLIT=1) the same kernel runs with every operand split in two
-// halves, x = hi + lo (hi = half(x), lo = half(x - hi)): a product is hi hi + hi lo + lo hi, accumulated in
-// float, which keeps about 22 bits of each term instead of 24. Keys and values then take 4 tiles of shared
-// memory, so a step covers 32 source tokens instead of 64. Measured on the 6 test pairs: the same
-// matches as float, but logits of a few hundred lose ~1e-4 and a query whose two best cells are close can
-// move to the other one (4 px on one confident query), so it is not the default.
+// For float tensors (FP32 mode) the same kernel runs with every operand split in two halves, x = hi + lo
+// (hi = half(x), lo = half(x - hi)): a product is hi hi + hi lo + lo hi, accumulated in float, which keeps
+// about 22 bits of each term instead of 24. Keys and values then take 4 tiles of shared memory, so a step
+// covers 32 source tokens instead of 64. The tensor cores of this GPU do not round their float
+// accumulation as float additions do: an output summed over 4096 tokens inside the instruction was off by
+// 10 times the error of float (a confident point moved 4 px on one test pair). So each step's products go
+// to a fresh accumulator, which is added to the outputs with float additions; that brings the error back
+// to that of the float path (splitting queries and keys in three halves instead of two did not).
 __device__ __forceinline__ void split_half2(float a, float b, unsigned* hi, unsigned* lo) {
   const __half2 h = __floats2half2_rn(a, b);
   const float2 f = __half22float2(h);
   const __half2 l = __floats2half2_rn(a - f.x, b - f.y);
   *hi = *reinterpret_cast<const unsigned*>(&h), *lo = *reinterpret_cast<const unsigned*>(&l);
 }
-
 template <typename T, int W, int MINB>
 __global__ void __launch_bounds__(W * 32, MINB) k_flash(const T* q, const T* k, const T* v, int P, int S, int q_row,
                                                         int k_row, int v_row, int o_row, T* out) {
@@ -719,11 +718,11 @@ __global__ void __launch_bounds__(W * 32, MINB) k_flash(const T* q, const T* k, 
       }
       #pragma unroll
       for (int kk = 0; kk < 8; ++kk) {
-        mma16816(c[nt], qa[0][kk][0], qa[0][kk][1], kb[0][kk]);
-        if constexpr (kSplit) {
-          mma16816(c[nt], qa[0][kk][0], qa[0][kk][1], kb[1][kk]);
+        if constexpr (kSplit) {  // the small terms first
           mma16816(c[nt], qa[1][kk][0], qa[1][kk][1], kb[0][kk]);
+          mma16816(c[nt], qa[0][kk][0], qa[0][kk][1], kb[1][kk]);
         }
+        mma16816(c[nt], qa[0][kk][0], qa[0][kk][1], kb[0][kk]);
       }
     }
     if (s0 + KT > S) {
@@ -751,7 +750,13 @@ __global__ void __launch_bounds__(W * 32, MINB) k_flash(const T* q, const T* k, 
       }
     }
     // Weights, their sums, and the product with the values: the weights of tokens nt * 8 ... + 7 are the
-    // left operand of k-slice nt.
+    // left operand of k-slice nt. Split mode (float) adds the step's products in a fresh accumulator and
+    // that to the outputs with float additions (see the comment above the kernel).
+    float ps[kSplit ? 8 : 1][4];
+    if constexpr (kSplit) {
+      #pragma unroll
+      for (int dt = 0; dt < 8; ++dt) ps[dt][0] = ps[dt][1] = ps[dt][2] = ps[dt][3] = 0.0f;
+    }
     #pragma unroll
     for (int nt = 0; nt < NT; ++nt) {
       const float p0 = exp2f((c[nt][0] - top[0]) * kScale), p1 = exp2f((c[nt][1] - top[0]) * kScale);
@@ -771,12 +776,20 @@ __global__ void __launch_bounds__(W * 32, MINB) k_flash(const T* q, const T* k, 
       }
       #pragma unroll
       for (int dt = 0; dt < 8; ++dt) {
-        mma16816(o[dt], a[0][0], a[0][1], vb[0][dt]);
         if constexpr (kSplit) {
-          mma16816(o[dt], a[0][0], a[0][1], vb[1][dt]);
-          mma16816(o[dt], a[1][0], a[1][1], vb[0][dt]);
+          mma16816(ps[dt], a[1][0], a[1][1], vb[0][dt]);
+          mma16816(ps[dt], a[0][0], a[0][1], vb[1][dt]);
+          mma16816(ps[dt], a[0][0], a[0][1], vb[0][dt]);
+        } else {
+          mma16816(o[dt], a[0][0], a[0][1], vb[0][dt]);
         }
       }
+    }
+    if constexpr (kSplit) {
+      #pragma unroll
+      for (int dt = 0; dt < 8; ++dt)
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) o[dt][i] += ps[dt][i];
     }
     if (step + 1 < steps) stash(buf ^ 1);
     __syncthreads();
@@ -1975,7 +1988,7 @@ class CudaOps : public Ops {
   std::map<const float*, std::unique_ptr<Table>> tables_;
   bool readout_device_ = true;  // JMT_CUDA_READOUT=0: the read-out's selection on host threads
   int flash_ = 16;              // JMT_CUDA_FLASH: warps per attention block; 0 = attention through the logits buffer
-  bool split_ = false;          // JMT_CUDA_SPLIT=1: FP32 attention through k_flash on split halves
+  bool split_ = true;           // JMT_CUDA_SPLIT=0: FP32 attention through the float logits buffer
   int chunk_ = 8, threads_ = 1;
   int tensor_ = 1;  // FP16: use the tensor cores (JMT_CUDA_TENSOR=0 turns them off)
 };
