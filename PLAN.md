@@ -4,7 +4,9 @@ Minimal-dependency image matching for bundle-adjustment pipelines: FlexGlue, wri
 `../just-keypoints` (C++ core, hand-written CPU / CUDA / Metal / WebGPU kernels, no PyTorch or ONNX Runtime
 at run time), plus a covisibility function that decides which image pairs are worth matching.
 
-Status: M1 and M2 done: the C++ library runs on the CPU and matches the original. No GPU backend yet. Numbers marked "estimate" are computed
+Status: M1-M3 done: the C++ library runs on the CPU and on the Mac GPU (Metal) and matches the original.
+Metal after a first tuning pass (M5, in progress): 794 ms per pair in FP32 and 557 ms in FP16 at full
+settings, 2x and 3.5x the time PyTorch takes on the same GPU. Numbers marked "estimate" are computed
 from the layer sizes, not measured.
 
 ## What FlexGlue is (reviewed at release v0.1, 2026-10-26)
@@ -132,11 +134,38 @@ reference for recall, before any C++ is written for them.
   and score as the original. Every intermediate tensor of two golden dumps (384 px / 9 layers,
   256 px / 3 layers) matches within 1e-5 of its largest value (tokens after 9 layers: 5.1e-4 on values up to 67). Speed is not a goal here: on the M5 Pro, 0.59 s per
   image and 7.5 s per pair at 512 px / 9 layers (4.4 s with 5 layers, 2.5 s at 384 px); 67 s on one thread.
-- [ ] **M3 — Runs on the Mac GPU** (Metal, FP32 then FP16)
+- [x] **M3 — Runs on the Mac GPU** (Metal, FP32 and FP16)
+  Done (M5 Pro): `jmt match --backend metal` matches the original on the same 6 pairs and 2 settings as M2:
+  identical matches, predicted points within 4.5e-4 px, confidence within 1.4e-5, features within 2.5e-5;
+  every intermediate tensor matches the golden dumps as on the CPU. `--backend metal:fp16` (tensors and
+  weights stored as half, arithmetic in float): 5 of 6 pairs with identical matches, 686 of 687 on the
+  sixth; confident points move by 0.003-0.02 px (median), covisibility by at most 3e-4.
+  Not tuned yet, per pair with 2048 keypoints per image, best of 4 runs:
+
+  | Size, layers | Metal FP32 | Metal FP16 | PyTorch MPS FP32 / FP16 | CPU |
+  |---|---|---|---|---|
+  | 512, 9 | 1090 ms | 918 ms | 395 / 158 ms | 7.5 s |
+  | 512, 5 | 625 ms | 519 ms | 223 ms / - | 4.4 s |
+  | 384, 9 | 452 ms | 377 ms | 172 ms / - | 2.5 s |
+
+  Describe: 87 ms per image in FP32, 67 ms in FP16 (PyTorch MPS: 44 ms; CPU: 590 ms).
 - [ ] **M4 — Runs on NVIDIA** (CUDA; order of M3/M4 depends on the machine in use)
 - [ ] **M5 — Fast**
   GEMM and attention kernels tuned per backend, pairs batched, zero allocations per pair. Benchmark table
   against PyTorch and the upstream ONNX models.
+  In progress (Metal). Per pair, 2048 keypoints per image, best of 5 runs, M5 Pro; FP32 results unchanged
+  (identical matches to the original on the 6 pairs, points within 2.6e-4 px):
+
+  | Size, layers | Metal FP32 | Metal FP16 | PyTorch MPS FP32 / FP16 |
+  |---|---|---|---|
+  | 512, 9 | 794 ms (M3: 1090) | 557 ms (M3: 918) | 395 / 158 ms |
+  | 512, 5 | 452 ms (M3: 625) | 321 ms (M3: 519) | 223 ms / - |
+  | 384, 9 | 337 ms (M3: 452) | 247 ms (M3: 377) | 172 ms / - |
+
+  Describe: 70 ms per image in FP32, 55 ms in FP16 (M3: 87 and 67; PyTorch MPS: 44).
+  FP16 now also stores the attention weights as half, which is where most of its gain comes from and
+  costs some agreement: over the 6 pairs, 97.1 % to 100 % of the matches are the same as the original's
+  (M3: 99.85 % to 100 %), confident points still move by 0.003-0.02 px (median).
 - [ ] **M6 — Runs in the browser** (WebGPU via Dawn, then Emscripten; FP16 when `shader-f16` is available)
 - [ ] **M7 — Demo and docs**: pick images, see the shortlist, matches and timings; just-keypoints supplies the keypoints.
 - [ ] **M8 — v1.0**: CMake package, npm package, weights fetch script.
@@ -259,3 +288,65 @@ in the same scene. "Covisible" here means "same scene", so this tests scene sepa
   must see the same pixels for the comparison to mean anything.
 - `tests/golden_test.cpp` checks every stage against a golden dump (`ctest`, 2 dumps, 5 s) and is the main
   debugging tool for new backends. Golden maps are stored (c, h, w); the test converts.
+
+## Notes from M3
+
+- `src/backend/metal/kernels.metal` and `metal_ops.mm`; dependencies: Metal.framework and Foundation only.
+  The `Ops` interface did not change. Context, buffer pool, run-time shader compilation and the profiler
+  (`JMT_METAL_PROFILE=1`) follow just-keypoints.
+- The matrix product (`k_linear`) is register-tiled: one thread computes 4 tokens x 8 output channels, with
+  weights stored input-major and padded so the 8 weights of an input are adjacent. Of the variants tried
+  (`JMT_METAL_LINEAR`), 4 x 8 is the fastest: 1090 ms per pair against 1300 (2 x 8), 1417 (8 x 8),
+  1651 (4 x 16) and 1685 (1 x 8). All 354 products of a pair take 420 ms of GPU time.
+- Attention, first attempt: one thread per (query, head) walking the 4096 source tokens with a running
+  softmax, 100+ vector registers of state. 18 s per pair, 97 % of the GPU time: per-thread state that large
+  is what makes a GPU kernel slow, not the arithmetic. Now four passes over a float buffer (heads, P, S):
+  transpose the keys, logits as a tiled product, exp and row sums, weighted sum of the values as a tiled
+  product. 730 ms per pair, and each product runs at the speed of `k_linear`.
+- That buffer is 512 MB at 512 px (8 heads x 4096 x 4096 floats) and is float in FP16 mode too. Peak
+  memory of a run is 3.8 GB, of which 1.1 GB is the weights held twice (host copy and device copy).
+- GPU time per pair at 512 px / 9 layers, FP32: products 420 ms, softmax 280 ms, attention values 235 ms,
+  attention logits 220 ms, everything else 70 ms. Next for M5: the softmax (one thread per row, three
+  scalar passes over 4096 values), fusing the small operations around each product (bias, norm, GELU, add),
+  and FP16 arithmetic where it is safe. FP16 storage alone gains only 16 %.
+- The read-out computes its logits on the GPU and selects the 512 largest per query on host threads
+  (shared memory, no copy). A bisection for the entmax threshold would keep it on the GPU.
+- Image preprocessing runs on the host (512 x 512 x 3 values).
+- GELU uses a polynomial erf (Abramowitz-Stegun 7.1.26, error below 1.5e-7): Metal has no erf.
+- FP16 golden tests are a sanity check only: on a hard pair up to 10 % of the unconfident queries land on
+  another cell. `tools/compare.py`, which looks at confident queries and matches, is the FP16 check.
+- The CLI accepts options before, between or after the two images, so `compare.py` can pass
+  `"cmd:build/release/jmt match --backend metal"`.
+
+## Notes from M5 (Metal, in progress)
+
+What the measurements showed, in the order tried. All times are GPU time per pair at 512 px / 9 layers.
+
+- **Attention is bound by memory traffic through its weights buffer** (heads x P x S values, 512 MB in
+  float). Vectorizing the softmax pass changed nothing (281 -> 271 ms). Fusing logits and softmax into one
+  kernel did: a threadgroup holds 4 queries of one head (one thread per 8 source tokens), the row maximum
+  and row sum are reduced in threadgroup memory, and the buffer is written once and read once instead of
+  written twice and read three times. Logits + softmax: 500 -> 280 ms. In FP16 the buffer is half: 162 ms.
+- **The matrix product is bound by how often a thread reloads weights, and by registers.** Time is
+  inversely proportional to the tokens per thread (1 x 8: 1514 ms, 2 x 8: 761, 4 x 8: 431), and collapses
+  once a thread holds more than 32 float accumulators (8 x 8: 836, 4 x 16: 1187, 16 x 4: 7183).
+  8 tokens x 4 channels is the best shape: 318 ms.
+- **Did nothing:** storing weights contiguously per output block (431 -> 431), loading the inputs four at
+  a time (431 -> 431), the shape of the attention value product (4 x 8, 2 x 16, 1 x 32, 8 x 4: 212-274 ms).
+  32-bit instead of 64-bit offsets in the inner loops gave 7 %.
+- **Made it worse:** grouping the product's threads by output block instead of by token block (431 ->
+  1232 ms: the threads of a group must share the same input rows). Running attention in chunks of queries
+  to keep the buffer in cache (4 chunks: +8 %, 64 chunks: 4x slower): a small dispatch does not fill the GPU.
+  The chunk size stays as an option (`JMT_METAL_ATTENTION_CHUNK`) because it bounds the buffer's memory.
+- **Half-precision accumulators** in the products (FP16 mode) gained 10-25 % on the products and changed
+  matches; not kept.
+- **Ceiling of this kernel style:** with its memory reads confined to a few kilobytes the attention value
+  product still takes 149 of 214 ms, so about 2.1 T multiply-adds per second is what a thread with 32
+  accumulators reaches on this GPU; the kernels run at 1.3-1.5 T. PyTorch's FP32 time corresponds to about
+  2.9 T over the whole pair, so closing the gap needs a different structure, not more tuning of this one.
+- Where the time is now, FP32: products 318 ms, attention weights 290, attention values 215, layer norm
+  31, the rest 30. FP16: 245, 162, 176, 25, 20.
+- Not done: fusing the small operations around each product (about 60 ms in total), the read-out's
+  selection on the GPU, preprocessing on the GPU, batching pairs.
+- Peak memory: 3.1 GB in FP16 (M3: 3.8 GB in FP32).
+- `tools/bench.sh [backend] [options]` prints the wall time and the GPU time per kernel for the Berlin pair.

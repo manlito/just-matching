@@ -7,6 +7,7 @@
 // OUT holds matches (K, 2: index in A, index in B), scores (K), a_in_b (Na, 2), b_in_a (Nb, 2), conf_a (Na),
 // conf_b (Nb), covisibility (1), stop_layer (1), all float32; with --dump-features also features_a and
 // features_b (h, w, 256).
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -30,6 +31,7 @@ namespace {
 void usage() {
   std::fprintf(stderr,
                "usage: jmt match A B --kpts-a A.jkpt --kpts-b B.jkpt [--out OUT.jmtt] [options]\n"
+               "  --backend B            cpu (default), metal, metal:fp16\n"
                "  --weights FILE         weights file (default weights/flexglue.jmtw)\n"
                "  --size N               network input side, multiple of 32 (default 512)\n"
                "  --layers N             transformer layers, 0..9 (default 9)\n"
@@ -39,6 +41,14 @@ void usage() {
                "  --early-stop D         stop early on non-covisible pairs, decay D in [0,1) (default off)\n"
                "  --threads N            CPU threads (default all)\n"
                "  --dump-features        also write the dense features to OUT\n");
+}
+
+// Waits for the features to be computed (GPU backends return before the work is done).
+void jmt_sync_features(jmt_features* f) {
+  float first[1];
+  std::vector<float> all(f->tensor->size());
+  f->tensor->read(all.data());
+  (void)first;
 }
 
 double now_ms() {
@@ -61,18 +71,20 @@ struct Image {
 }  // namespace
 
 int main(int argc, char** argv) {
-  if (argc < 4 || std::strcmp(argv[1], "match") != 0) {
+  if (argc < 2 || std::strcmp(argv[1], "match") != 0) {
     usage();
     return 2;
   }
   try {
-    std::string path_a = argv[2], path_b = argv[3], kpts_a, kpts_b, out_path, weights = "weights/flexglue.jmtw";
+    std::string kpts_a, kpts_b, out_path, weights = "weights/flexglue.jmtw";
+    std::vector<std::string> images;  // options may come before, between or after the two images
     jmt_config config;
     jmt_config_default(&config);
     jmt_match_options options;
     jmt_match_options_default(&options);
     bool dump_features = false;
-    for (int i = 4; i < argc; ++i) {
+    int runs = 1;
+    for (int i = 2; i < argc; ++i) {
       std::string a = argv[i];
       auto value = [&]() -> std::string {
         if (i + 1 >= argc) throw std::runtime_error("missing value for " + a);
@@ -82,6 +94,14 @@ int main(int argc, char** argv) {
       else if (a == "--kpts-b") kpts_b = value();
       else if (a == "--out") out_path = value();
       else if (a == "--weights") weights = value();
+      else if (a == "--backend") {
+        std::string b = value();
+        if (b == "cpu") config.backend = JMT_BACKEND_CPU;
+        else if (b == "metal") config.backend = JMT_BACKEND_METAL;
+        else if (b == "metal:fp16") config.backend = JMT_BACKEND_METAL, config.precision = JMT_PRECISION_FP16;
+        else throw std::runtime_error("unknown backend " + b);
+      }
+      else if (a == "--runs") runs = std::stoi(value());
       else if (a == "--size") config.input_size = std::stoi(value());
       else if (a == "--layers") options.n_layers = std::stoi(value());
       else if (a == "--filter") options.filter_threshold = std::stof(value());
@@ -90,8 +110,11 @@ int main(int argc, char** argv) {
       else if (a == "--early-stop") options.early_stop_decay = std::stof(value());
       else if (a == "--threads") config.num_threads = std::stoi(value());
       else if (a == "--dump-features") dump_features = true;
-      else throw std::runtime_error("unknown option " + a);
+      else if (a.rfind("--", 0) == 0) throw std::runtime_error("unknown option " + a);
+      else images.push_back(a);
     }
+    if (images.size() != 2) throw std::runtime_error("two images are required");
+    const std::string path_a = images[0], path_b = images[1];
     if (kpts_a.empty() || kpts_b.empty()) throw std::runtime_error("--kpts-a and --kpts-b are required");
     config.weights_path = weights.c_str();
 
@@ -105,17 +128,24 @@ int main(int argc, char** argv) {
     const jmt::Param &ka = file_a.get("keypoints"), &kb = file_b.get("keypoints");
     const int na = static_cast<int>(ka.size() / 2), nb = static_cast<int>(kb.size() / 2);
 
-    t0 = now_ms();
+    // With --runs N everything is run N times and the fastest run is reported (the first one compiles
+    // shaders and fills caches on a GPU backend).
     jmt_image va = image_a.view(), vb = image_b.view();
-    jmt_features* fa = jmt_describe(ctx, &va);
-    jmt_features* fb = fa ? jmt_describe(ctx, &vb) : nullptr;
-    if (!fa || !fb) throw std::runtime_error(jmt_last_error());
-    double t_describe = (now_ms() - t0) / 2;
-
-    t0 = now_ms();
+    jmt_features *fa = nullptr, *fb = nullptr;
     jmt_matches m;
-    if (jmt_match(ctx, fa, ka.data, na, fb, kb.data, nb, &options, &m) != 0) throw std::runtime_error(jmt_last_error());
-    double t_match = now_ms() - t0;
+    double t_describe = 1e30, t_match = 1e30;
+    for (int run = 0; run < std::max(1, runs); ++run) {
+      jmt_features_free(fa), jmt_features_free(fb);
+      t0 = now_ms();
+      fa = jmt_describe(ctx, &va);
+      fb = fa ? jmt_describe(ctx, &vb) : nullptr;
+      if (!fa || !fb) throw std::runtime_error(jmt_last_error());
+      jmt_sync_features(fb);
+      t_describe = std::min(t_describe, (now_ms() - t0) / 2);
+      t0 = now_ms();
+      if (jmt_match(ctx, fa, ka.data, na, fb, kb.data, nb, &options, &m) != 0) throw std::runtime_error(jmt_last_error());
+      t_match = std::min(t_match, now_ms() - t0);
+    }
 
     std::printf("%d matches from %d and %d keypoints, covisibility %.4f, %d layers\n", m.n, na, nb, m.covisibility,
                 m.stop_layer);

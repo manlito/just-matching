@@ -17,6 +17,10 @@ typedef enum { JMT_BACKEND_CPU = 0, JMT_BACKEND_CUDA = 1, JMT_BACKEND_METAL = 2,
 
 typedef enum { JMT_FORMAT_GRAY8 = 0, JMT_FORMAT_RGB8 = 1, JMT_FORMAT_RGBA8 = 2 } jmt_format;
 
+/* FP32 is the reference mode: it matches the original network. FP16 (GPU backends only) stores feature
+   maps and weights as 16-bit floats: faster, with slightly different results. */
+typedef enum { JMT_PRECISION_FP32 = 0, JMT_PRECISION_FP16 = 1 } jmt_precision;
+
 typedef struct {
   jmt_backend backend;
   /* Weights source, first that is set wins: memory blob, file path. Weights are never built in. */
@@ -28,6 +32,10 @@ typedef struct {
   int input_size;
   /* CPU backend worker threads; 0 = all hardware threads. */
   int num_threads;
+  /* GPU backends: device index; 0 = first device. */
+  int device;
+  /* Default JMT_PRECISION_FP32. jmt_create fails when the backend does not support the precision. */
+  jmt_precision precision;
 } jmt_config;
 
 typedef struct {

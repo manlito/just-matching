@@ -69,7 +69,12 @@ void jmt_match_options_default(jmt_match_options* o) {
   o->early_stop_decay = d.early_stop_decay;
 }
 
-int jmt_backend_available(jmt_backend backend) { return backend == JMT_BACKEND_CPU; }
+int jmt_backend_available(jmt_backend backend) {
+#ifdef JMT_HAVE_METAL
+  if (backend == JMT_BACKEND_METAL) return 1;
+#endif
+  return backend == JMT_BACKEND_CPU;
+}
 
 jmt_ctx* jmt_create(const jmt_config* config) {
   try {
@@ -83,7 +88,12 @@ jmt_ctx* jmt_create(const jmt_config* config) {
       throw std::runtime_error("no weights given (weights_path or weights_data)");
     ctx->model = std::make_unique<jmt::FlexGlue>(ctx->weights);
     if (!jmt_backend_available(config->backend)) throw std::runtime_error("backend not available in this build");
-    ctx->ops = jmt::make_cpu_ops(config->num_threads);
+    const bool fp16 = config->precision == JMT_PRECISION_FP16;
+    if (fp16 && config->backend == JMT_BACKEND_CPU) throw std::runtime_error("the cpu backend runs in fp32 only");
+    if (config->backend == JMT_BACKEND_CPU) ctx->ops = jmt::make_cpu_ops(config->num_threads);
+#ifdef JMT_HAVE_METAL
+    if (config->backend == JMT_BACKEND_METAL) ctx->ops = jmt::make_metal_ops(config->device, fp16);
+#endif
     ctx->input_size = config->input_size > 0 ? config->input_size : 512;
     if (ctx->input_size % 32 != 0) throw std::runtime_error("input_size must be a multiple of 32");
     return ctx.release();

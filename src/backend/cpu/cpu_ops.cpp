@@ -9,6 +9,8 @@
 #include <thread>
 
 #include "core/ops.h"
+#include "core/preprocess.h"
+#include "core/readout.h"
 
 namespace jmt {
 namespace {
@@ -36,15 +38,6 @@ inline void axpy4(const float* a, const float* x0, const float* x1, const float*
   for (int i = 0; i < n; ++i) y[i] += a0 * x0[i] + a1 * x1[i] + a2 * x2[i] + a3 * x3[i];
 }
 
-// Bilinear source position for output index i (PyTorch, align_corners = false).
-inline void source(int i, int out, int in, int* i0, int* i1, float* t) {
-  float s = (static_cast<float>(i) + 0.5f) * (static_cast<float>(in) / static_cast<float>(out)) - 0.5f;
-  if (s < 0) s = 0;
-  *i0 = std::min(static_cast<int>(s), in - 1);
-  *i1 = std::min(*i0 + 1, in - 1);
-  *t = s - static_cast<float>(*i0);
-}
-
 class CpuOps : public Ops {
  public:
   explicit CpuOps(int num_threads) {
@@ -62,25 +55,7 @@ class CpuOps : public Ops {
                        const float std[3]) override {
     auto out = make(out_h, out_w, 3);
     parallel_for(out_h, [&](int y_begin, int y_end) {
-      for (int y = y_begin; y < y_end; ++y) {
-        int y0, y1;
-        float ty;
-        source(y, out_h, height, &y0, &y1, &ty);
-        for (int x = 0; x < out_w; ++x) {
-          int x0, x1;
-          float tx;
-          source(x, out_w, width, &x0, &x1, &tx);
-          const float* p00 = rgb + (static_cast<size_t>(y0) * width + x0) * 3;
-          const float* p01 = rgb + (static_cast<size_t>(y0) * width + x1) * 3;
-          const float* p10 = rgb + (static_cast<size_t>(y1) * width + x0) * 3;
-          const float* p11 = rgb + (static_cast<size_t>(y1) * width + x1) * 3;
-          float* o = out->row(y * out_w + x);
-          for (int ch = 0; ch < 3; ++ch) {
-            float top = p00[ch] * (1 - tx) + p01[ch] * tx, bottom = p10[ch] * (1 - tx) + p11[ch] * tx;
-            o[ch] = ((top * (1 - ty) + bottom * ty) - mean[ch]) / std[ch];
-          }
-        }
-      }
+      for (int y = y_begin; y < y_end; ++y) preprocess_row(rgb, height, width, out_h, out_w, mean, std, y, out->row(y * out_w));
     });
     return out;
   }
@@ -238,11 +213,11 @@ class CpuOps : public Ops {
       for (int y = y_begin; y < y_end; ++y) {
         int y0, y1;
         float ty;
-        source(y, out_h, x.h, &y0, &y1, &ty);
+        resize_source(y, out_h, x.h, &y0, &y1, &ty);
         for (int xo = 0; xo < out_w; ++xo) {
           int x0, x1;
           float tx;
-          source(xo, out_w, x.w, &x0, &x1, &tx);
+          resize_source(xo, out_w, x.w, &x0, &x1, &tx);
           const float *p00 = x.row(y0 * x.w + x0), *p01 = x.row(y0 * x.w + x1);
           const float *p10 = x.row(y1 * x.w + x0), *p11 = x.row(y1 * x.w + x1);
           float* o = out->row(y * out_w + xo);
@@ -343,52 +318,18 @@ class CpuOps : public Ops {
                std::vector<float>* mass) override {
     const CpuTensor &query = cpu(queryp), &search = cpu(searchp);
     const int N = query.n(), P = search.n(), d = query.c, h = search.h, w = search.w;
-    const int top_k = std::min(512, P);
     std::vector<float> st(static_cast<size_t>(d) * P);
     for (int s = 0; s < P; ++s)
       for (int j = 0; j < d; ++j) st[static_cast<size_t>(j) * P + s] = search.row(s)[j];
     coarse->assign(static_cast<size_t>(N) * 2, 0.0f);
     mass->assign(N, 0.0f);
     parallel_for(N, [&](int begin, int end) {
-      std::vector<float> logits(P), sorted(P);
-      std::vector<double> tau(top_k);
+      std::vector<float> logits(P);
+      ReadoutScratch scratch;
       for (int i = begin; i < end; ++i) {
         std::fill(logits.begin(), logits.end(), 0.0f);
         for (int j = 0; j < d; ++j) axpy(query.row(i)[j] * temperature, st.data() + static_cast<size_t>(j) * P, logits.data(), P);
-        int best = 0;
-        for (int s = 1; s < P; ++s)
-          if (logits[s] > logits[best]) best = s;
-        const float top = logits[best];
-        sorted = logits;
-        std::partial_sort(sorted.begin(), sorted.begin() + top_k, sorted.end(), std::greater<float>());
-        // Threshold of 1.5-entmax, p = max(y - tau, 0)^2 with y = (logit - top) / 2, from the sorted top_k.
-        double sum = 0, sum_sq = 0;
-        int support = 0;
-        for (int r = 0; r < top_k; ++r) {
-          double y = (static_cast<double>(sorted[r]) - top) / 2, rho = r + 1;
-          sum += y, sum_sq += y * y;
-          double mean = sum / rho, mean_sq = sum_sq / rho;
-          tau[r] = mean - std::sqrt(std::max((1 - rho * (mean_sq - mean * mean)) / rho, 0.0));
-          support += tau[r] <= y;
-        }
-        const double t = tau[std::max(support, 1) - 1];
-        double px = 0, py = 0, total = 0, inside = 0;
-        const int by = best / w, bx = best % w;
-        for (int dy = -1; dy <= 1; ++dy)
-          for (int dx = -1; dx <= 1; ++dx) {
-            int ny = by + dy, nx = bx + dx;
-            bool in = ny >= 0 && ny < h && nx >= 0 && nx < w;
-            ny = std::min(std::max(ny, 0), h - 1), nx = std::min(std::max(nx, 0), w - 1);
-            double y = (static_cast<double>(logits[ny * w + nx]) - top) / 2;
-            double p = std::max(y - t, 0.0);
-            p *= p;
-            px += p * ((nx + 0.5) / w * 2 - 1), py += p * ((ny + 0.5) / h * 2 - 1);
-            total += p;
-            if (in) inside += p;
-          }
-        (*coarse)[2 * i] = static_cast<float>(px / total);
-        (*coarse)[2 * i + 1] = static_cast<float>(py / total);
-        (*mass)[i] = static_cast<float>(inside);
+        readout_row(logits.data(), h, w, scratch, coarse->data() + 2 * static_cast<size_t>(i), mass->data() + i);
       }
     });
   }

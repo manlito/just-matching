@@ -3,12 +3,15 @@
 Image matching (FlexGlue) and covisibility with minimal dependencies, the companion of
 [just-keypoints](../just-keypoints). No PyTorch, no ONNX Runtime at run time. Plan and status: [PLAN.md](PLAN.md).
 
-Status: the CPU reference backend works and matches the original FlexGlue. It is not fast (about 7.5 s per
-pair at full settings). GPU backends (Metal, CUDA, WebGPU) and the covisibility functions are planned.
+Status: the CPU reference backend and the Metal backend work and match the original FlexGlue. Metal is not
+as fast as PyTorch yet: about 0.8 s per pair at full settings on an M5 Pro (0.56 s in FP16), against 7.5 s on
+the CPU and 0.4 s (0.16 s in FP16) for PyTorch on the same GPU.
+CUDA and WebGPU backends and the covisibility functions are planned.
 
 ## Build
 
-Needs CMake >= 3.16 and a C++17 compiler. Nothing else.
+Needs CMake >= 3.16 and a C++17 compiler. Nothing else for the CPU backend. The Metal backend is built on
+macOS (`-DJMT_METAL=OFF` to leave it out); it uses only Metal.framework and compiles its shaders at run time.
 
 ```sh
 cmake -S . -B build/release -DCMAKE_BUILD_TYPE=Release
@@ -32,7 +35,7 @@ jkp extract b.jpg --model raco --no-covariance --no-ranker --out b.jkpt
 build/release/jmt match a.jpg b.jpg --kpts-a a.jkpt --kpts-b b.jkpt --out matches.jmtt
 ```
 
-Options: `--weights FILE`, `--size N` (network input, default 512), `--layers N` (0..9, default 9),
+Options: `--backend cpu|metal|metal:fp16`, `--runs N` (report the fastest), `--weights FILE`, `--size N` (network input, default 512), `--layers N` (0..9, default 9),
 `--filter T`, `--max-px D`, `--min-covisibility S`, `--early-stop D`, `--threads N`, `--dump-features`.
 
 ## C API
@@ -42,6 +45,7 @@ Options: `--weights FILE`, `--size N` (network input, default 512), `--layers N`
 
 jmt_config config;
 jmt_config_default(&config);                 /* CPU, 512 px */
+if (jmt_backend_available(JMT_BACKEND_METAL)) config.backend = JMT_BACKEND_METAL;
 config.weights_path = "weights/flexglue.jmtw";
 jmt_ctx* ctx = jmt_create(&config);
 
@@ -65,6 +69,7 @@ returns them.
 
 ```sh
 python tools/compare.py a.jpg b.jpg --a upstream --b "cmd:build/release/jmt match"
+python tools/compare.py a.jpg b.jpg --a upstream --b "cmd:build/release/jmt match --backend metal"
 python tools/dump_golden.py a.jpg b.jpg      # then: cmake -S . -B build/release && ctest --test-dir build/release
 ```
 
