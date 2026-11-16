@@ -31,6 +31,9 @@ python tools/covis.py SCENE_DIR... --single IMAGE...                        # ch
 | `dump_golden.py` | golden test vectors from the reference pass |
 | `presets.py` | accuracy and time against input size, layer count and precision, on synthetic pairs with exact ground truth |
 | `covis.py` | evaluates the covisibility levels of the plan on folders of images |
+| `bench.sh` | wall time and GPU time per kernel of the `jmt` CLI on the Berlin pair: `tools/bench.sh metal:fp16` |
+| `remote.sh` | runs the `jmt` CLI on another machine over SSH, so `compare.py` can check a backend this machine lacks: `--b "cmd:tools/remote.sh user@host DIR build/release/jmt match --backend cuda"` |
+| `bench_onnx.py` | times upstream's ONNX models under ONNX Runtime (`pip install onnxruntime`; models from release v0.1 in `third_party/onnx/`) |
 
 Keypoints: just-keypoints returns `(0,0)` at the centre of the top-left pixel, FlexGlue expects it at that
 pixel's corner. `common.keypoints` adds 0.5; everything in these tools is in FlexGlue's convention.

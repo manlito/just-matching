@@ -149,7 +149,10 @@ reference for recall, before any C++ is written for them.
   | 384, 9 | 452 ms | 377 ms | 172 ms / - | 2.5 s |
 
   Describe: 87 ms per image in FP32, 67 ms in FP16 (PyTorch MPS: 44 ms; CPU: 590 ms).
-- [ ] **M4 — Runs on NVIDIA** (CUDA; order of M3/M4 depends on the machine in use)
+- [x] **M4 — Runs on NVIDIA** (CUDA; order of M3/M4 depends on the machine in use)
+  Done: `src/backend/cuda/cuda_ops.cu`, FP32 and FP16 (`--backend cuda`, `cuda:fp16`). FP32 gives the
+  original's matches on the 6 pairs x 2 settings (points within 1.9e-4 px). Per pair at 512 px / 9 layers
+  on an RTX 2070 Max-Q: 726 ms in FP32, 349 ms in FP16 (tensor cores). See Notes from M4.
 - [ ] **M5 — Fast**
   GEMM and attention kernels tuned per backend, pairs batched, zero allocations per pair. Benchmark table
   against PyTorch and the upstream ONNX models.
@@ -317,6 +320,138 @@ in the same scene. "Covisible" here means "same scene", so this tests scene sepa
   another cell. `tools/compare.py`, which looks at confident queries and matches, is the FP16 check.
 - The CLI accepts options before, between or after the two images, so `compare.py` can pass
   `"cmd:build/release/jmt match --backend metal"`.
+
+### Against the upstream ONNX models (`tools/bench_onnx.py`)
+
+ONNX Runtime 1.32 on the same M5 Pro, upstream's release v0.1 models (512 px, 9 layers), Berlin pair with
+2048 RaCo keypoints per image, best of 3 runs after a warm-up:
+
+| Runtime | Describe, per image | Match, per pair |
+|---|---|---|
+| ONNX Runtime, CPU provider, FP32 matcher | 163 ms | 2452 ms |
+| ONNX Runtime, CPU provider, FP16 matcher | 163 ms | 3025 ms |
+| ONNX Runtime, CoreML provider, FP32 matcher | 201 ms | 5130 ms |
+| ONNX Runtime, CoreML provider, FP16 matcher | 201 ms | 3090 ms |
+| jmt CPU | 590 ms | 7500 ms |
+| jmt Metal FP32 | 70 ms | 794 ms |
+| jmt Metal FP16 | 55 ms | 557 ms |
+| PyTorch MPS FP32 / FP16 | 44 ms | 395 / 158 ms |
+
+- ONNX Runtime has no useful GPU path on the Mac: CoreML takes 194 of the matcher's 2107 nodes (23
+  partitions) and the rest runs on the CPU, which is slower than the CPU provider alone. Its CUDA provider
+  can only be measured on the NVIDIA machine (M4).
+- jmt on Metal is 3.1x faster than the best ONNX Runtime result (4.4x in FP16); jmt on the CPU is 3x
+  slower than ONNX Runtime on the CPU, as expected from a reference backend.
+- The ONNX matcher returns 90 matches on this pair where the PyTorch model (and jmt) returns 70, with the
+  same covisibility score. Not investigated; its documentation describes `max_distance_px` as scaled by
+  the long image side, where the PyTorch code scales each axis by the squashed size, which would accept
+  more matches on a non-square image.
+
+## Notes from M4 (CUDA)
+
+Machine: laptop, RTX 2070 Max-Q (8 GB, power-capped near 78 W), CUDA 13.4, 12 CPU threads.
+
+- `src/backend/cuda/cuda_ops.cu`, one file; dependencies: the CUDA toolkit only (no cuBLAS, no cuDNN).
+  The `Ops` interface did not change. Kernels are templates on the storage type (float or half); pool,
+  profiler (`JMT_CUDA_PROFILE=1`) and build option (`JMT_CUDA`) follow just-keypoints.
+- **Agreement** (`tools/compare.py` driving the laptop through `tools/remote.sh`, against upstream on the
+  CPU; 6 pairs, at 512 px / 9 layers and 384 px / 5 layers). FP32: identical matches on all 12 runs, points
+  within 1.9e-4 px, confidences within 1.3e-5. FP16: 97.0 to 100 % of the matches per pair (the same on 9
+  of the 12 runs; 1, 1 and 2 matches differ on the others), median point difference 0.03 px or less,
+  confidences within 0.12, as on Metal. Early stop gives the same result as Metal (LaMAR
+  pair, `--min-covisibility 0.5 --early-stop 0.3`: stops after 3 layers, score 0.0541). Golden tests pass;
+  the FP16 one needed its allowance for unconfident queries at 256 px raised from 15 % to 25 % (CUDA
+  moves 18 % of them, Metal 11 %).
+- **One matrix-product kernel** (`k_gemm`) serves the linear layers, the convolutions, both products of
+  attention and the read-out logits. A block of 16 x 16 threads computes a 128 x 128 tile of the output
+  (8 x 8 values per thread, in registers) from tiles of both operands in shared memory; operands are
+  addressed with strides, so keys, values and search tokens are used in place.
+- **Attention in two passes instead of three.** The logits pass also records each row's maximum (folded
+  within a warp, then one atomic update per row and block); the value pass takes the exponentials while it
+  loads its tiles and collects the row sums on the way. This removed the separate softmax pass over the
+  512 MB buffer (257 ms per pair).
+- What moved the time, per pair at 512 px / 9 layers, FP32:
+
+  | Step | Match |
+  |---|---|
+  | First working version (three attention passes) | 1470 ms |
+  | Softmax folded into the value pass | 1267 ms |
+  | Tile shape scan (thread 4x4 ... 8x8, block 64 ... 512 threads) | no gain, 8x8 / 256 stays |
+  | Next tile fetched into registers while the current one is computed | 1171 ms |
+  | Row maxima folded within a warp before the atomic update | 956 ms |
+
+- **Timings** (2048 keypoints per image, best of 5), after the second pass below:
+
+  | Size, layers | CUDA FP32 | CUDA FP16 | Describe, per image (FP32 / FP16) |
+  |---|---|---|---|
+  | 512, 9 | 726 ms | 349 ms | 66 / 30 ms |
+  | 512, 5 | 434 ms | 219 ms | 67 / 31 ms |
+  | 384, 9 | 331 ms | 173 ms | 47 / 19 ms |
+
+  CPU backend on this laptop: 38.7 s per pair, 1.8 s describe. GPU memory in use: 1.5 GB in FP32, 0.8 GB
+  in FP16. FP16 kernel time per pair: attention 160 to 200 ms, other products 64, layer norm 40,
+  depthwise convolution 11, rest 20.
+- Not measured: PyTorch and ONNX Runtime on this GPU (neither is installed on the laptop).
+- Not on the device yet, as on Metal: preprocessing and the read-out's top-512 selection.
+
+### Second pass: why cuBLAS was faster, and what closed the gap
+
+Method: `k_gemm` and cuBLAS run side by side in one program on the same shapes (the GPU's clock moves with
+its power cap, so only interleaved numbers compare), the inner dimension varied to separate the fixed cost
+of a call from its slope, and the compiled kernel disassembled (`cuobjdump -sass`) and its resources read
+(`-Xptxas -v`). Rates in T (10^12) multiply-adds per second, n 4096, k 1024, m 1024 unless noted.
+
+FP32 (cuBLAS: 3.5 T, fixed cost 80 us per call):
+
+| Step | k_gemm | Fixed cost |
+|---|---|---|
+| Start | 1.75 T | 320 us |
+| Index arithmetic and bounds checks out of the loop | 1.77 T | 320 us |
+| Warp of 8 x 4 threads and bank-ordered shared tiles; full tiles stored 4 values at a time | 2.37 T | 95 us |
+| Two copies of the tiles, one barrier per step | 2.33 T (no gain, kept) | |
+| 16 columns per step instead of 8 | 1.96 T (worse: 168 registers, one block per SM) | |
+
+- **Shared-memory bank conflicts** were the main loss in the loop. With 16 x 16 threads per block a warp
+  held 16 threads along the outputs, whose 128-bit reads of the w tile fell 4 deep on the same banks.
+  A warp of 8 (outputs) x 4 (rows) threads, with each tile stored so that those reads are consecutive,
+  removes them.
+- **The fixed cost** was 64 guarded scalar stores per thread; it decides the short products (k = 64:
+  the attention logits).
+- What did not matter: threads per block and blocks per SM (the first scan), the second barrier.
+- Still open against cuBLAS in FP32 (about 70 % of it): not investigated further.
+
+FP16:
+
+- **Tensor cores are usable from hand-written kernels**: `nvcuda::wmma` in the toolkit's `mma.h` compiles
+  to the HMMA instructions (16 x 16 x 16 products, half operands, float or half accumulation). No library.
+  The earlier note that they are reachable only through NVIDIA's libraries was wrong.
+- cuBLAS on the tensor cores: 22 T with half accumulation (`CUBLAS_COMPUTE_16F`, what the first
+  measurement used), 13.6 T with float accumulation. `k_gemm_tc` accumulates in float, so 13.6 T is the
+  number to compare with. Half accumulation was not adopted: sums of up to 4096 products in half.
+
+| Step | k_gemm_tc | Fixed cost (m 4096) |
+|---|---|---|
+| First version: tiles with rows of KC values, w stored by column | 5.7 T | 500 us |
+| One or two blocks per SM, float or half accumulators | no change | |
+| Rows of KC + 8 values in both tiles, w stored by output | 8.5 T (KC 32), 9.7 T (KC 16) | |
+| Accumulators read out conflict-free (a thread takes one column of 8 rows) | 10.2 T | 360 us |
+
+- Bank conflicts again, worse: with rows of 32 halves the fragment loads of a warp hit two banks.
+- **Attention logits as half without losing the softmax**: a logit is stored relative to the largest of
+  its group (its row, 32 consecutive sources), and the group maxima (float) go to a small side table.
+  Logits near the top of their group, the ones with weight, are small numbers; the coarse ones have
+  weight e^-8 or less. The buffer drops from 512 to 256 MB.
+- Linear layers in FP16 mode keep their weights as stored, (out, in): the tensor-core kernel wants the
+  columns contiguous.
+- Agreement after this pass (same 6 pairs x 2 settings): FP32 identical matches on all 12 runs (points
+  within 1.9e-4 px); FP16 98.5 to 100 % of the matches per pair (identical on 10 of the 12 runs),
+  confidences within 0.12. Golden tests pass in both modes; early stop unchanged.
+- Result per pair, 512 px / 9 layers: FP32 956 -> 726 ms, FP16 942 -> 349 ms; describe 84 -> 66 ms and
+  80 -> 30 ms.
+- Open: attention is still 160 to 200 ms of the FP16 pair (logits 3 ms per call, bound by the read-out of
+  16 M values per head through shared memory); layer norm is now 12 % of the kernel time. The same
+  bank-conflict review has not been done for the Metal kernels, where threadgroup memory is not used for
+  the products.
 
 ## Notes from M5 (Metal, in progress)
 

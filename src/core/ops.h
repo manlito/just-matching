@@ -73,5 +73,7 @@ class Ops {
 std::unique_ptr<Ops> make_cpu_ops(int num_threads);
 // Only in builds with the Metal backend. device: index, 0 = first. fp16: store tensors and weights as half.
 std::unique_ptr<Ops> make_metal_ops(int device, bool fp16);
+// Only in builds with the CUDA backend. Same arguments.
+std::unique_ptr<Ops> make_cuda_ops(int device, bool fp16);
 
 }  // namespace jmt

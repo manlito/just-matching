@@ -3,15 +3,18 @@
 Image matching (FlexGlue) and covisibility with minimal dependencies, the companion of
 [just-keypoints](../just-keypoints). No PyTorch, no ONNX Runtime at run time. Plan and status: [PLAN.md](PLAN.md).
 
-Status: the CPU reference backend and the Metal backend work and match the original FlexGlue. Metal is not
-as fast as PyTorch yet: about 0.8 s per pair at full settings on an M5 Pro (0.56 s in FP16), against 7.5 s on
-the CPU and 0.4 s (0.16 s in FP16) for PyTorch on the same GPU.
-CUDA and WebGPU backends and the covisibility functions are planned.
+Status: the CPU reference backend and the Metal and CUDA backends work and match the original FlexGlue. Metal
+is not as fast as PyTorch yet: about 0.8 s per pair at full settings on an M5 Pro (0.56 s in FP16), against
+7.5 s on the CPU and 0.4 s (0.16 s in FP16) for PyTorch on the same GPU. CUDA takes 0.73 s per pair on a
+laptop RTX 2070 Max-Q, and 0.35 s in FP16, where its kernels use the tensor cores.
+The WebGPU backend and the covisibility functions are planned.
 
 ## Build
 
 Needs CMake >= 3.16 and a C++17 compiler. Nothing else for the CPU backend. The Metal backend is built on
 macOS (`-DJMT_METAL=OFF` to leave it out); it uses only Metal.framework and compiles its shaders at run time.
+The CUDA backend is built when a CUDA compiler is found (`-DJMT_CUDA=OFF` to leave it out); it needs only
+the CUDA toolkit (nvcc and its runtime library), no cuBLAS or cuDNN.
 
 ```sh
 cmake -S . -B build/release -DCMAKE_BUILD_TYPE=Release
@@ -35,7 +38,7 @@ jkp extract b.jpg --model raco --no-covariance --no-ranker --out b.jkpt
 build/release/jmt match a.jpg b.jpg --kpts-a a.jkpt --kpts-b b.jkpt --out matches.jmtt
 ```
 
-Options: `--backend cpu|metal|metal:fp16`, `--runs N` (report the fastest), `--weights FILE`, `--size N` (network input, default 512), `--layers N` (0..9, default 9),
+Options: `--backend cpu|metal|metal:fp16|cuda|cuda:fp16`, `--runs N` (report the fastest), `--weights FILE`, `--size N` (network input, default 512), `--layers N` (0..9, default 9),
 `--filter T`, `--max-px D`, `--min-covisibility S`, `--early-stop D`, `--threads N`, `--dump-features`.
 
 ## C API
