@@ -4,10 +4,15 @@
 //   const matcher = await jmt.create({ weightsUrl: 'flexglue-fp16.jmtw', precision: 'fp16' });
 //   const a = await matcher.describe(imageA), b = await matcher.describe(imageB);
 //   const m = await matcher.match(a, xyA, b, xyB);   // xy: Float32Array [n][2] from just-keypoints
+//   const s = await matcher.shortlist([a, b, c, ...], { k: 5 });  // the pairs worth matching, best first
 //
 // Keypoints are pixels of the original image, (0, 0) = centre of the top-left pixel. Results are copies:
 // matches Int32Array [n][2] (index in a, index in b), scores [n], aInB [nA][2] and bInA [nB][2] (the point
 // predicted in the other image for every keypoint), confA [nA], confB [nB], covisibility, stopLayer.
+// Covisibility: covisibility(a, b, level) scores one pair at level 1 (cosine of the mean feature vectors) or 2
+// (a 16 x 16 grid through the layer-0 head and back); level1([features]) is the level-1 matrix of n images
+// (Float32Array [n][n]); shortlist([features], options) returns { n, pairs: Int32Array [n][2] (first <
+// second), scores } best first. Level 3 is match() with minCovisibility and earlyStopDecay.
 // The module waits for the GPU through JSPI (Chrome, Edge).
 import createJmt from './jmt_wasm.js';
 
@@ -143,6 +148,49 @@ class Matcher {
       confB: f32(M._jmtw_conf_b(h), nB),
       covisibility: M._jmtw_covisibility(h),
       stopLayer: M._jmtw_stop_layer(h),
+    };
+  }
+
+  // Score of a pair at level 1 or 2 (see the top of this file).
+  async covisibility(a, b, level = 1) {
+    if (!this.handle) throw new Error('matcher destroyed');
+    const s = await this.M._jmtw_covisibility_level(this.handle, a.ptr, b.ptr, level);
+    if (Number.isNaN(s)) throw new Error(this.M.UTF8ToString(this.M._jmtw_error()));
+    return s;
+  }
+
+  // Module memory holding the features pointers of `images`.
+  pointers(images) {
+    const p = this.scratch('images', images.length * 4);
+    for (const [i, f] of images.entries()) {
+      if (!f.ptr) throw new Error('features destroyed');
+      this.M.HEAPU32[p / 4 + i] = f.ptr;
+    }
+    return p;
+  }
+
+  // Level 1 of every pair: Float32Array [n][n], 1 on the diagonal.
+  async level1(images) {
+    const M = this.M, n = images.length;
+    if (!this.handle) throw new Error('matcher destroyed');
+    const p = this.pointers(images), out = this.scratch('level1', n * n * 4);
+    if ((await M._jmtw_level1_matrix(this.handle, p, n, out)) !== 0) throw new Error(M.UTF8ToString(M._jmtw_error()));
+    return new Float32Array(M.HEAPF32.buffer, out, n * n).slice();
+  }
+
+  // options: k (10) partners per image by level 1, neighbours (0) in the order given, rerank (false: score
+  // the kept pairs with level 2 and sort by it), minScore (0, with rerank).
+  async shortlist(images, options = {}) {
+    const M = this.M;
+    if (!this.handle) throw new Error('matcher destroyed');
+    const p = this.pointers(images);
+    const n = await M._jmtw_shortlist(this.handle, p, images.length, options.k ?? 10, options.neighbours ?? 0,
+                                      options.rerank ? 1 : 0, options.minScore ?? 0);
+    if (n < 0) throw new Error(M.UTF8ToString(M._jmtw_error()));
+    return {
+      n,
+      pairs: new Int32Array(M.HEAP32.buffer, M._jmtw_pairs_idx(this.handle), 2 * n).slice(),
+      scores: new Float32Array(M.HEAPF32.buffer, M._jmtw_pairs_score(this.handle), n).slice(),
     };
   }
 

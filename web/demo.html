@@ -1,0 +1,230 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>just-matching demo</title>
+<meta name="description" content="Pick images, see which pairs are worth matching, and FlexGlue's matches between them, computed in the browser on WebGPU.">
+<link rel="modulepreload" href="jmt.js">
+<link rel="modulepreload" href="jmt_wasm.js">
+<style>
+  :root {
+    --bg: #f7f7f5; --panel: #ffffff; --fg: #1d1d1f; --muted: #66666b; --faint: #8e8e93; --line: #e3e3e0;
+    --accent: #256abf; --accent-fg: #ffffff; --ok: #1a7f37; --warn: #9a6700; --bad: #c62828;
+    --match: #2a78d6; --kp: rgba(255, 255, 255, 0.85); --kp-ring: rgba(0, 0, 0, 0.55);
+    --cell-gap: #ffffff; --kept: #1d1d1f; --empty: #ecebe8;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #121214; --panel: #1c1c1f; --fg: #f2f2f7; --muted: #a1a1a6; --faint: #7c7c82; --line: #333336;
+      --accent: #5598e7; --accent-fg: #0d1520; --ok: #4ac26b; --warn: #d29922; --bad: #ff6b6b;
+      --match: #6da7ec; --kp: rgba(255, 255, 255, 0.8); --kp-ring: rgba(0, 0, 0, 0.6);
+      --cell-gap: #1c1c1f; --kept: #f2f2f7; --empty: #2a2a2d;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #121214; --panel: #1c1c1f; --fg: #f2f2f7; --muted: #a1a1a6; --faint: #7c7c82; --line: #333336;
+    --accent: #5598e7; --accent-fg: #0d1520; --ok: #4ac26b; --warn: #d29922; --bad: #ff6b6b;
+    --match: #6da7ec; --kp: rgba(255, 255, 255, 0.8); --kp-ring: rgba(0, 0, 0, 0.6);
+    --cell-gap: #1c1c1f; --kept: #f2f2f7; --empty: #2a2a2d;
+  }
+  * { box-sizing: border-box; }
+  body { background: var(--bg); color: var(--fg); font: 14px/1.45 system-ui, -apple-system, sans-serif; margin: 0; }
+  main { max-width: 1320px; margin: 0 auto; padding: 24px 16px 48px; }
+  h1 { font-size: 22px; margin: 0 0 6px; }
+  h2 { font-size: 15px; margin: 0 0 10px; }
+  p { margin: 4px 0 10px; }
+  .lede { color: var(--muted); max-width: 86ch; margin-bottom: 18px; }
+  code { font: 12.5px ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .layout { display: grid; grid-template-columns: 320px minmax(0, 1fr); gap: 16px; align-items: start; }
+  @media (max-width: 900px) { .layout { grid-template-columns: minmax(0, 1fr); } }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; margin-bottom: 16px; }
+  .field { margin: 0 0 12px; }
+  .field > .label, .field > label.label { display: block; color: var(--muted); font-size: 12.5px; margin-bottom: 4px; }
+  .hint { color: var(--faint); font-size: 12.5px; margin: 4px 0 0; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  button, select, input[type=number] {
+    font: inherit; color: var(--fg); background: var(--panel); border: 1px solid var(--line); border-radius: 7px; padding: 5px 10px;
+  }
+  input[type=number] { width: 72px; }
+  select { max-width: 100%; }
+  #timings td.l { white-space: normal; }
+  button { cursor: pointer; }
+  button:hover:not(:disabled) { border-color: var(--faint); }
+  button:disabled { opacity: 0.5; cursor: default; }
+  button.primary { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); font-weight: 600; padding: 7px 16px; }
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 7px; overflow: hidden; }
+  .seg label { padding: 4px 10px; cursor: pointer; border-right: 1px solid var(--line); user-select: none; }
+  .seg label:last-child { border-right: 0; }
+  .seg input { position: absolute; opacity: 0; pointer-events: none; }
+  .seg label:has(input:checked) { background: var(--accent); color: var(--accent-fg); }
+  .seg label:has(input:disabled) { opacity: 0.45; cursor: default; }
+  .seg label:has(input:focus-visible) { outline: 2px solid var(--accent); outline-offset: -2px; }
+  .check { display: flex; gap: 6px; align-items: center; }
+  .thumbs { display: grid; grid-template-columns: repeat(auto-fill, minmax(64px, 1fr)); gap: 6px; margin: 10px 0 4px; }
+  .thumb { position: relative; aspect-ratio: 4 / 3; border-radius: 6px; overflow: hidden; background: var(--empty); }
+  .thumb canvas { width: 100%; height: 100%; display: block; object-fit: cover; }
+  .thumb span { position: absolute; left: 3px; bottom: 3px; font-size: 11px; line-height: 1; padding: 2px 4px; border-radius: 4px;
+                background: rgba(0, 0, 0, 0.6); color: #fff; font-variant-numeric: tabular-nums; }
+  .drop { border: 1.5px dashed var(--line); border-radius: 8px; padding: 10px; text-align: center; color: var(--faint); font-size: 12.5px; }
+  .drop.over { border-color: var(--accent); color: var(--accent); }
+  .banner { border-radius: 8px; padding: 10px 12px; margin: 0 0 16px; border: 1px solid var(--warn); color: var(--fg); }
+  #status { font-weight: 600; min-height: 1.45em; }
+  #status.bad { color: var(--bad); }
+  progress { width: 100%; height: 6px; accent-color: var(--accent); }
+  table { border-collapse: collapse; font-variant-numeric: tabular-nums; width: 100%; }
+  th, td { padding: 4px 8px; border-bottom: 1px solid var(--line); text-align: right; white-space: nowrap; }
+  th:first-child, td:first-child, th.l, td.l { text-align: left; }
+  th { color: var(--muted); font-weight: 500; font-size: 12.5px; }
+  tbody tr { cursor: pointer; }
+  tbody tr:hover { background: color-mix(in srgb, var(--accent) 8%, transparent); }
+  tbody tr.sel { background: color-mix(in srgb, var(--accent) 16%, transparent); }
+  .tag { font-size: 12px; padding: 1px 6px; border-radius: 10px; border: 1px solid var(--line); color: var(--muted); }
+  .tag.pass { color: var(--ok); border-color: var(--ok); }
+  .tag.stop { color: var(--bad); border-color: var(--bad); }
+  .scroll { overflow-x: auto; }
+  .covis { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 16px; align-items: start; }
+  @media (max-width: 1100px) { .covis { grid-template-columns: minmax(0, 1fr); } }
+  #matrix { display: block; max-width: 100%; height: auto; }
+  #matrix .cell { cursor: pointer; }
+  #matrix text { fill: var(--muted); font-size: 10px; font-family: system-ui, sans-serif; }
+  .legend { display: flex; gap: 14px; align-items: center; flex-wrap: wrap; color: var(--muted); font-size: 12px; margin-top: 8px; }
+  .legend .ramp { width: 120px; height: 10px; border-radius: 3px; }
+  .legend .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--kept); display: inline-block; vertical-align: 0; }
+  .tip { position: fixed; z-index: 10; pointer-events: none; background: var(--panel); color: var(--fg); border: 1px solid var(--line);
+         border-radius: 7px; padding: 6px 9px; font-size: 12.5px; box-shadow: 0 4px 14px rgba(0, 0, 0, 0.18); max-width: 320px; }
+  .tip b { font-weight: 600; }
+  .tip .m { color: var(--muted); }
+  #view { width: 100%; display: block; border-radius: 6px; background: var(--empty); }
+  .stats { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 10px; margin: 0 0 12px; }
+  .stat .v { font-size: 18px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .stat .k { color: var(--muted); font-size: 12px; }
+  footer { color: var(--faint); font-size: 12px; margin-top: 24px; max-width: 100ch; }
+  footer a { color: inherit; }
+</style>
+</head>
+<body>
+<main>
+  <h1>just-matching demo</h1>
+  <p class="lede">FlexGlue in this page on your GPU, through WebGPU. Each image is described once; the covisibility
+  levels then pick the pairs worth matching (level 1: the images' mean feature vectors, level 2: a coarse grid through
+  the first matching head), and FlexGlue matches those pairs, stopping early on pairs it judges to show different
+  places (level 3). Keypoints come from just-keypoints (RaCo, best 2048 per image). Nothing is uploaded.</p>
+
+  <div class="banner" id="banner" hidden></div>
+
+  <div class="layout">
+    <div>
+      <section class="panel" aria-labelledby="h-images">
+        <h2 id="h-images">Images</h2>
+        <div class="row">
+          <button type="button" id="samples">Sample set</button>
+          <button type="button" id="open">Add images…</button>
+          <button type="button" id="clear">Clear</button>
+        </div>
+        <input type="file" id="file" accept="image/*" multiple hidden>
+        <div class="thumbs" id="thumbs"></div>
+        <div class="drop" id="drop">Or drop images here. Order matters for "neighbours".</div>
+      </section>
+
+      <section class="panel" aria-labelledby="h-settings">
+        <h2 id="h-settings">Settings</h2>
+        <div class="field">
+          <span class="label">Precision</span>
+          <div class="seg" role="radiogroup" aria-label="Precision">
+            <label><input type="radio" name="precision" value="fp16" checked>FP16</label>
+            <label><input type="radio" name="precision" value="fp32">FP32</label>
+          </div>
+          <p class="hint" id="precision-hint">FP16 weights are 284 MB, FP32 567 MB; fetched once per page.</p>
+        </div>
+        <div class="field">
+          <span class="label">Network input and depth</span>
+          <div class="row">
+            <select id="size" aria-label="Input size"><option value="512" selected>512 px</option><option value="384">384 px</option></select>
+            <select id="layers" aria-label="Layers"><option value="9" selected>9 layers</option><option value="5">5 layers</option></select>
+          </div>
+        </div>
+        <div class="field">
+          <span class="label">Shortlist</span>
+          <div class="row">
+            <label class="check">k <input type="number" id="k" min="1" max="50" value="3"></label>
+            <label class="check">neighbours <input type="number" id="neighbours" min="0" max="10" value="1"></label>
+          </div>
+          <label class="check" style="margin-top:6px"><input type="checkbox" id="rerank" checked> Re-rank with level 2</label>
+          <p class="hint">Every image keeps its k best partners by level 1; a pair is kept when either image keeps it.
+          Neighbours also keep the next images in the order given (the sample set is in capture order).</p>
+        </div>
+        <div class="field">
+          <label class="label" for="early">Early stop (level 3)</label>
+          <select id="early">
+            <option value="0.5" selected>Minimum covisibility 0.8, decay 0.5</option>
+            <option value="0.2">Minimum covisibility 0.8, decay 0.2 (stops earlier)</option>
+            <option value="off">Off: every pair runs all layers</option>
+          </select>
+          <p class="hint">After each layer from 2 on, a pair whose covisibility is below 0.8 &times; (1 &minus; decay)<sup>9 &minus; layer</sup>
+          stops and gets no matches.</p>
+        </div>
+        <button type="button" class="primary" id="run">Run</button>
+      </section>
+
+      <section class="panel" aria-labelledby="h-time">
+        <h2 id="h-time">Timings</h2>
+        <table id="timings"><tbody><tr><td class="l">Not run yet.</td></tr></tbody></table>
+        <p class="hint">Medians; the first image and the first pair also compile the kernels. Weights and module
+        loading are counted once.</p>
+      </section>
+    </div>
+
+    <div>
+      <section class="panel">
+        <div id="status" role="status">Loading…</div>
+        <progress id="progress" max="1" value="0" hidden></progress>
+        <p class="hint" id="adapter"></p>
+      </section>
+
+      <section class="panel" aria-labelledby="h-covis">
+        <h2 id="h-covis">Shortlist</h2>
+        <div class="covis">
+          <div>
+            <svg id="matrix" role="img" aria-label="Level-1 covisibility of every pair of images; shortlisted pairs marked with a dot"></svg>
+            <div class="legend" id="legend" hidden>
+              <span>level 1</span><span id="lmin"></span><span class="ramp" id="ramp"></span><span id="lmax"></span>
+              <span><span class="dot"></span> shortlisted</span>
+            </div>
+            <p class="hint">Click any cell to match that pair, kept or not.</p>
+          </div>
+          <div class="scroll">
+            <table id="pairs">
+              <thead><tr><th>#</th><th class="l">pair</th><th>level 1</th><th id="th-l2">level 2</th><th>level 3</th>
+                <th>layers</th><th>matches</th><th>ms</th><th class="l">verdict</th></tr></thead>
+              <tbody><tr><td colspan="9" class="l">Run to see the pairs worth matching.</td></tr></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel" aria-labelledby="h-pair">
+        <h2 id="h-pair">Pair</h2>
+        <div class="stats" id="pair-stats"></div>
+        <canvas id="view" width="800" height="300" aria-label="The two images with lines between matched keypoints"></canvas>
+        <div class="row" style="margin-top:8px">
+          <label class="check">Lines <select id="lines"><option value="100" selected>100</option><option value="300">300</option>
+            <option value="all">all</option></select></label>
+          <label class="check"><input type="checkbox" id="show-kp"> Show all keypoints</label>
+          <span class="hint" style="margin:0">Every match is a dot; lines join an even sample of them.</span>
+        </div>
+      </section>
+    </div>
+  </div>
+
+  <footer>Sample images: four frames of the TUM RGB-D benchmark (Sturm et al., IROS 2012; CC BY 4.0) and four of
+  the KITTI odometry benchmark (Geiger et al., CVPR 2012; CC BY-NC-SA 3.0), both from the ALIKED repository's
+  samples, and from the FlexGlue repository two views of one place in Berlin and two LaMAR images of different
+  places that look alike. FlexGlue: matcher weights MIT; DINOv3
+  backbone under the DINOv3 License.</footer>
+</main>
+<div class="tip" id="tip" hidden></div>
+<script type="module" src="demo.js"></script>
+</body>
+</html>

@@ -10,7 +10,9 @@ against 376 and 157 ms for PyTorch on the same GPU, and on CUDA. M6 is done: the
 original natively (Dawn) and in Chrome (WebAssembly): per pair at full settings on the M5 Pro, 478 ms in
 FP32 and 313 ms in FP16 natively, 500 and 335 ms in Chrome. C2 is done: `jmt_covisibility` (levels 1 and 2)
 and `jmt_shortlist` on every backend. C3 is done: level 3 with early stop stops where the original does on
-every backend. Numbers marked "estimate" are computed from the layer sizes, not measured.
+every backend. M7 is half done and C4 is done: the browser demo (`web/demo.html`) shows the shortlist and the
+matches of a set of images, with the timings of each step; the documentation site is not written yet. Numbers
+marked "estimate" are computed from the layer sizes, not measured.
 
 ## What FlexGlue is (reviewed at release v0.1, 2026-10-26)
 
@@ -244,6 +246,14 @@ reference for recall, before any C++ is written for them.
   - Module: 302 KB of wasm and 100 KB of JS; weights fetched separately.
   - Not checked: Safari and Firefox (JSPI), Dawn on Vulkan or Direct3D 12, a GPU other than the M5 Pro.
 - [ ] **M7 — Demo and docs**: pick images, see the shortlist, matches and timings; just-keypoints supplies the keypoints.
+  Demo done (`web/demo.html` + `demo.js`, built into `build/wasm/web` with 12 sample images and just-keypoints'
+  module): images from the sample set, a file picker or a drop; FP16 / FP32, 512 / 384 px, 9 / 5 layers;
+  shortlist k, neighbours and level-2 re-ranking; early stop off, 0.8 / 0.5 or 0.8 / 0.2. It shows the level-1
+  matrix with the kept pairs marked, the kept pairs with levels 1, 2 and 3, layers run, matches and time, and
+  the matches of any pair (one that was not kept is matched on click). The shortlist is now in the
+  WebAssembly module (`covisibility`, `level1`, `shortlist` in `jmt.js`), and the test page checks it against
+  the native CPU backend. Open: the documentation site and its deployment (as just-keypoints'), and a stated
+  licence for the Berlin and LaMAR samples before anything is published. See "Notes from M7 and C4".
 - [ ] **M8 — v1.0**: CMake package, npm package, weights fetch script.
 
 ### Covisibility track (parallel, like the RaCo track in just-keypoints)
@@ -268,7 +278,8 @@ reference for recall, before any C++ is written for them.
   early stop too, and the browser test page runs early stop in Chrome (24 runs, the native stop layer on
   every pair). A pair stopped after layer 2 costs about a quarter of a full one (24-29 %); the check
   after each layer costs 1 to 3.4 % on pairs that pass. See "Notes from C3".
-- [ ] **C4** — shortlist view in the demo.
+- [x] **C4** — shortlist view in the demo. Done with the M7 demo: the level-1 matrix of all pairs (kept pairs
+  marked, hover for levels 1 to 3, click to match), and the kept pairs, best first, with FlexGlue's verdict.
 
 ## Risks
 
@@ -835,7 +846,7 @@ The first pass first; the second pass, at the end, replaced its products and att
   lands outside a close-up, so level 2 under-rates scale changes and does not reject look-alikes. That is
   why `min_score` is off by default; level 3 decides. Whether level 2 re-ranks partial overlap inside one
   capture well is C1's question.
-- **Not done:** a faster CPU level 2 (10 times Metal; where its time goes is not measured), the shortlist in the WebAssembly module, saving the kept per-image vectors with
+- **Not done:** a faster CPU level 2 (10 times Metal; where its time goes is not measured), saving the kept per-image vectors with
   the features.
 
 ## Notes from C3 (level 3, early stop)
@@ -894,3 +905,40 @@ The first pass first; the second pass, at the end, replaced its products and att
   one that passes 477 / 316 ms (berlin1_h1 - _h2; the first pair of each run also compiles the kernels).
 - **Not done:** a capture where the shortlist and early stop are measured together on real overlap (C1's
   capture).
+
+## Notes from M7 and C4 (browser demo)
+
+- **The shortlist in WebAssembly.** `jmtw_covisibility_level`, `jmtw_level1_matrix` and `jmtw_shortlist`
+  (JSPI exports: levels 1 and 2 read back from the GPU) behind `covisibility`, `level1` and `shortlist` in
+  `jmt.js`. The test page compares them with the native CPU backend on the 10 images of the test pairs at
+  512 px (45 pairs): level 1 within 6.2e-7 in FP32 and 8.4e-5 in FP16; level 2 the same scores in FP32 and
+  within 5 of 512 grid points in FP16 (bar 8); with k = 2 the same 13 pairs kept in both precisions. The
+  whole page (48 match runs and the shortlist) passes in Chrome on the M5 Pro. Level 1 of all 45 pairs takes
+  320-430 ms there with a new matcher: the first use computes each image's mean vector and compiles its
+  kernel; in the demo, after describe, 77 ms for 66 pairs.
+- **Keypoints** come from just-keypoints' module, built with Emscripten from that repository and copied
+  next to the page (`JMT_JKP_WEB_DIR`): RaCo, best 2048, no ranker or covariance, as `tools/common.py`. Both
+  modules open their own WebGPU device; that works.
+- **Timings**, the 12 samples in Chrome on the M5 Pro, FP16, 512 px, 9 layers, k = 3, neighbours 1, level 2,
+  early stop 0.8 / 0.5 (medians): keypoints 20 ms and describe 35 ms per image; level 1 for 66 pairs 77 ms;
+  shortlist with level 2 for 26 pairs 160 ms; match 328 ms per pair that runs all layers, 223 ms per pair
+  stopped early. The whole run (26 pairs) is 9.6-10.6 s; the 284 MB of weights load in about 0.1 s from the
+  local server.
+- **What the samples show** (each checked against the native CPU or Metal backend, which agree):
+  - Level 1 (mean feature vector) ranks by look more than by place: all 66 scores lie in 0.76-0.999, and
+    for berlin-1 it ranks berlin-2 7th of 11, behind the 4 KITTI frames and the 2 LaMAR images (0.79 against
+    0.80-0.85). With k = 3 the Berlin pair is not kept; with neighbours 1 (the samples are in capture order,
+    the plan's proposed default) it is. This is C1's open question, the pooling, seen on a small set.
+  - Level 2 gives the Berlin pair 0.107 (a large change of scale; C2's note) while FlexGlue gives 0.993 and
+    70 matches.
+  - FlexGlue's score is not always right: kitti-1 - lamar-1 scores 0.990 after 9 layers with 16 matches
+    (native CPU: 0.9905, 17 matches), kitti-2 - lamar-1 0.974 with 14. A pair passes with a handful of
+    matches; a minimum number of matches would reject these.
+  - With decay 0.5 only 2 of the 11 rejected pairs stop early (the LaMAR look-alikes after 4 layers): the
+    bar 0.8 x 0.5^(9 - k) is low until layer 8, and different places score 0.4-0.77. Decay 0.2 stops more.
+- **Drawing.** All matches as dots and lines for an even sample of them (100 by default): a TUM pair has
+  1300 matches, and lines for all of them cover both images. Images wider than 1.5 : 1 (KITTI) are stacked.
+  Images larger than 1600 px on their longest side are scaled down before keypoints and matching.
+- **Not done:** the documentation site and its deployment; sample licences (Berlin, LaMAR); Safari and
+  Firefox (JSPI); the camera; a minimum-matches rule in the verdict; saving features, so that a set is
+  described once across visits.
