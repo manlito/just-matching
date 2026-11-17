@@ -34,7 +34,7 @@ python tools/compare_covis.py IMAGE... --backend metal                      # jm
 | `compare.py` | compares two implementations (`upstream`, `folded`, or `cmd:<program>` for the `jmt` CLI) on image pairs; `--save DIR` writes both match lists as text for `diff` (see [docs/reproducing.md](../docs/reproducing.md)) |
 | `dump_golden.py` | golden test vectors from the reference pass |
 | `fetch_lightglue.sh` | the original LightGlue at its pinned commit and its two checkpoints for ALIKED descriptors (Apache-2.0), checked by sha256 |
-| `dump_golden_lightglue.py` | golden test vectors from the original LightGlue on just-keypoints' ALIKED or RaCo-ALIKED features: tokens per layer, assignment, matches, and an adaptive run; `dump_golden_lightglue.sh` runs it on the 6 test pairs |
+| `dump_golden_lightglue.py` | golden test vectors from the original LightGlue on just-keypoints' ALIKED or RaCo-ALIKED features: tokens per layer, assignment, matches, the same in float64 (the exact answer the tests measure against), and an adaptive run; `dump_golden_lightglue.sh` runs it on the 6 test pairs |
 | `presets.py` | accuracy and time against input size, layer count and precision, on synthetic pairs with exact ground truth |
 | `covis.py` | evaluates the covisibility levels of the plan on folders of images |
 | `compare_covis.py` | levels 1 and 2 of `jmt shortlist` against `covis.py`'s reference, every pair of the images given |

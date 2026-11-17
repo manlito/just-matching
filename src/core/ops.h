@@ -62,6 +62,21 @@ class Ops {
   // Scaled dot-product attention per head. q: (P, heads * d); k, v: (S, heads * d) -> (P, heads * d).
   virtual TensorPtr attention(const TensorPtr& q, const TensorPtr& k, const TensorPtr& v, int heads) = 0;
 
+  // ---- LightGlue. The defaults read the inputs back and compute on the host, so every backend gives the
+  // right result; a backend overrides them to stay on the device.
+
+  // Rotary encoding as above, with cos and sin as tensors (1 x n x pairs) made for one image's keypoints.
+  // Unlike the vector form, nothing may be cached by address: the tables change with every image.
+  virtual TensorPtr rotary_keypoints(const TensorPtr& x, const TensorPtr& cos, const TensorPtr& sin, int heads);
+  // LightGlue's match assignment. a: 1 x M x d, b: 1 x N x d (the final projections of the two images'
+  // tokens); za: 1 x M x 1, zb: 1 x N x 1 (matchability logits). With s = a b^T / sqrt(d):
+  //   score(i, j) = log_softmax over j of s + log_softmax over i of s + logsigmoid(za_i) + logsigmoid(zb_j).
+  // For every row the column with the largest score and that score (best0, max0: M values), and for every
+  // column the row (best1, max1: N values). Ties go to the lower index. M and N may be 0.
+  virtual void assignment(const TensorPtr& a, const TensorPtr& b, const TensorPtr& za, const TensorPtr& zb,
+                          std::vector<int>* best0, std::vector<float>* max0, std::vector<int>* best1,
+                          std::vector<float>* max1);
+
   // Bilinear samples of x at n points (x, y) in [-1, 1] (-1 and 1 are the outer edges of the map; outside
   // points take the nearest border value) -> 1 x n x c.
   virtual TensorPtr sample(const TensorPtr& x, const float* pts, int n) = 0;

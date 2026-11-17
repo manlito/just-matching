@@ -12,8 +12,10 @@ upstream ALIKED's. LightGlue runs on the CPU in FP32.
 One file per pair, in the weights container format (jmtfile.py). Two runs:
   - fixed depth (adaptivity off): the inputs, the encoding, the tokens after the input projection and after
     every layer, the log assignment of the last layer, matchability, and matches and scores;
+  - the same in float64 (`pair.fp64.*`, stored as float32): tokens, best scores per row and column, and
+    matchability, the exact answer the float32 implementations are measured against;
   - adaptive (upstream defaults, depth 0.95 / width 0.99): stop layer, the points kept, matches and scores.
-Files are not committed.
+Indices are stored as float32, which the C++ reader loads. Files are not committed.
 """
 import argparse
 import importlib.util
@@ -64,9 +66,10 @@ def features(path, model, n):
     return t["keypoints"].copy(), t["descriptors"].copy(), (int(meta["width"]), int(meta["height"]))
 
 
-def run(net, xy, desc, size, stages=None):
-    data = {f"image{i}": {"keypoints": torch.from_numpy(xy[i])[None], "descriptors": torch.from_numpy(desc[i])[None],
-                          "image_size": torch.tensor([size[i]], dtype=torch.float32)} for i in range(2)}
+def run(net, xy, desc, size, stages=None, dtype=torch.float32):
+    data = {f"image{i}": {"keypoints": torch.from_numpy(xy[i])[None].to(dtype),
+                          "descriptors": torch.from_numpy(desc[i])[None].to(dtype),
+                          "image_size": torch.tensor([size[i]], dtype=dtype)} for i in range(2)}
     hooks = []
     if stages is not None:
         def keep(name):
@@ -106,29 +109,46 @@ def main():
     out = run(fixed, xy, desc, size, st)
     for i in range(2):
         tensors[f"pair.input_proj{i}"] = st[f"input_proj{i}"][0].numpy()
-        tensors[f"pair.encoding{i}"] = st[f"encoding{i}"][:, 0].numpy()  # (2, N, 64): cos, sin
+        tensors[f"pair.encoding{i}"] = st[f"encoding{i}"][:, 0].numpy()  # (2, 1, N, 64): cos, sin
     for k in range(fixed.conf.n_layers):
         d0, d1 = st[f"layer{k}"]
         tensors[f"pair.layer{k}.desc0"], tensors[f"pair.layer{k}.desc1"] = d0[0].numpy(), d1[0].numpy()
     last = fixed.conf.n_layers - 1
-    tensors["pair.log_assignment"] = st[f"assignment{last}"][0].numpy()  # (N0+1, N1+1)
+    tensors["pair.log_assignment"] = st[f"assignment{last}"][0][0].numpy()  # (N0+1, N1+1): the hook gets (scores, sim)
     d0, d1 = st[f"layer{last}"]
     head = fixed.log_assignment[last]
     with torch.no_grad():
         tensors["pair.matchability0"] = head.get_matchability(d0)[0].numpy()
         tensors["pair.matchability1"] = head.get_matchability(d1)[0].numpy()
-    tensors["out.matches0"] = out["matches0"][0].int().numpy()
-    tensors["out.matches1"] = out["matches1"][0].int().numpy()
+    tensors["out.matches0"] = out["matches0"][0].float().numpy()
+    tensors["out.matches1"] = out["matches1"][0].float().numpy()
     tensors["out.matching_scores0"] = out["matching_scores0"][0].numpy()
     tensors["out.matching_scores1"] = out["matching_scores1"][0].numpy()
 
+    # The same in float64: the exact answer both float32 implementations are measured against. PyTorch's own
+    # float32 tokens drift from it by up to 4e-4 (values up to 14) by layer 5.
+    exact = load_model(args.model, depth_confidence=-1, width_confidence=-1).double()
+    st64 = {}
+    run(exact, xy, desc, size, st64, torch.float64)
+    for i in range(2):
+        tensors[f"pair.fp64.input_proj{i}"] = st64[f"input_proj{i}"][0].float().numpy()
+    for k in range(exact.conf.n_layers):
+        d0, d1 = st64[f"layer{k}"]
+        tensors[f"pair.fp64.layer{k}.desc0"], tensors[f"pair.fp64.layer{k}.desc1"] = d0[0].float().numpy(), d1[0].float().numpy()
+    la = st64[f"assignment{last}"][0][0][:-1, :-1]
+    tensors["pair.fp64.max0"], tensors["pair.fp64.max1"] = la.max(1).values.float().numpy(), la.max(0).values.float().numpy()
+    d0, d1 = st64[f"layer{last}"]
+    with torch.no_grad():
+        tensors["pair.fp64.matchability0"] = exact.log_assignment[last].get_matchability(d0)[0].float().numpy()
+        tensors["pair.fp64.matchability1"] = exact.log_assignment[last].get_matchability(d1)[0].float().numpy()
+
     adaptive = load_model(args.model)
     out_a = run(adaptive, xy, desc, size)
-    tensors["adaptive.matches0"] = out_a["matches0"][0].int().numpy()
+    tensors["adaptive.matches0"] = out_a["matches0"][0].float().numpy()
     tensors["adaptive.matching_scores0"] = out_a["matching_scores0"][0].numpy()
-    tensors["adaptive.stop"] = np.int32([int(out_a["stop"])])
-    tensors["adaptive.prune0"] = out_a["prune0"][0].int().numpy()  # layer at which each point was dropped
-    tensors["adaptive.prune1"] = out_a["prune1"][0].int().numpy()
+    tensors["adaptive.stop"] = np.float32([int(out_a["stop"])])
+    tensors["adaptive.prune0"] = out_a["prune0"][0].float().numpy()  # layer at which each point was dropped
+    tensors["adaptive.prune1"] = out_a["prune1"][0].float().numpy()
 
     name = "-".join(os.path.splitext(os.path.basename(p))[0] for p in (args.a, args.b))
     path = args.out or os.path.join(common.ROOT, "build", "golden", f"lightglue-{args.model}", f"{name}.jmtt")

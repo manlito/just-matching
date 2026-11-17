@@ -121,7 +121,9 @@ add_library(jmt
   src/core/api.cpp
   src/core/weights.cpp
   src/core/checkpoint.cpp
+  src/core/ops.cpp
   src/models/flexglue/flexglue.cpp
+  src/models/lightglue/lightglue.cpp
   src/backend/cpu/cpu_ops.cpp
   "${embed_cpp}")
 target_include_directories(jmt PUBLIC include PRIVATE src)
@@ -241,6 +243,9 @@ if(JMT_BUILD_TESTS)
   add_executable(batch_test tests/batch_test.cpp)
   target_include_directories(batch_test PRIVATE src)
   target_link_libraries(batch_test PRIVATE jmt)
+  add_executable(lightglue_golden_test tests/lightglue_golden_test.cpp)
+  target_include_directories(lightglue_golden_test PRIVATE src)
+  target_link_libraries(lightglue_golden_test PRIVATE jmt)
   add_executable(shortlist_test tests/shortlist_test.cpp)
   target_include_directories(shortlist_test PRIVATE src)
   target_link_libraries(shortlist_test PRIVATE jmt)
@@ -278,6 +283,30 @@ if(JMT_BUILD_TESTS)
       add_test(NAME ops_${backend_name} COMMAND ops_test ${backend})
     endif()
   endforeach()
+  # LightGlue: tools/fetch_lightglue.sh, python tools/export_weights.py --model <model>, then
+  # tools/dump_golden_lightglue.sh. CPU only until the GPU backends have LightGlue's operations (M9 step 5).
+  foreach(model lightglue-aliked lightglue-raco-aliked)
+    set(jmtw "${CMAKE_CURRENT_SOURCE_DIR}/weights/${model}.jmtw")
+    file(GLOB lg_golden "${CMAKE_CURRENT_SOURCE_DIR}/build/golden/${model}/*.jmtt")
+    if(EXISTS "${jmtw}")
+      foreach(golden IN LISTS lg_golden)
+        get_filename_component(name "${golden}" NAME_WLE)
+        add_test(NAME ${model}_cpu_${name} COMMAND lightglue_golden_test "${jmtw}" "${golden}" cpu)
+      endforeach()
+    endif()
+  endforeach()
+  # The C API end to end through the CLI, with the built-in weights: the original's 237 matches on the Berlin
+  # pair (keypoints cached by tools/dump_golden_lightglue.py).
+  set(berlin_kpts "${CMAKE_CURRENT_SOURCE_DIR}/build/keypoints/berlin1.jpg.aliked.2048.jkpt"
+                  "${CMAKE_CURRENT_SOURCE_DIR}/build/keypoints/berlin2.jpg.aliked.2048.jkpt")
+  list(GET berlin_kpts 0 berlin_a)
+  list(GET berlin_kpts 1 berlin_b)
+  if(TARGET jmt_cli AND JMT_EMBED_WEIGHTS AND "lightglue-aliked" IN_LIST JMT_EMBED_MODELS AND EXISTS "${berlin_a}"
+     AND EXISTS "${berlin_b}")
+    add_test(NAME lightglue_cli_builtin
+             COMMAND jmt_cli match --model lightglue-aliked --weights builtin --kpts-a "${berlin_a}" --kpts-b "${berlin_b}")
+    set_tests_properties(lightglue_cli_builtin PROPERTIES PASS_REGULAR_EXPRESSION "^237 matches from 2048 and 2048")
+  endif()
   # Golden files and the weights file are generated locally:
   #   python tools/export_weights.py && python tools/dump_golden.py A B
   file(GLOB golden_files "${CMAKE_CURRENT_SOURCE_DIR}/build/golden/*.jmtt")

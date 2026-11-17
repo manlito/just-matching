@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cmath>
 #include <deque>
 #include <exception>
 #include <memory>
@@ -11,18 +12,21 @@
 #include "core/weights.h"
 #include "jmt/jmt.h"
 #include "models/flexglue/flexglue.h"
+#include "models/lightglue/lightglue.h"
 
 // What the arrays of one jmt_matches point into. Kept by the context and reused, so matching allocates
 // nothing once the arrays have reached their size.
 struct jmt_result {
   jmt::MatchResult result;
+  jmt::LightGlue::Result lightglue;
   std::vector<int32_t> idx;
   std::vector<float> score, a_in_b, b_in_a, xy_a, xy_b;
 };
 
 struct jmt_ctx {
   jmt::Weights weights;
-  std::unique_ptr<jmt::FlexGlue> model;
+  std::unique_ptr<jmt::FlexGlue> model;         // one of the two
+  std::unique_ptr<jmt::LightGlue> lightglue;
   std::unique_ptr<jmt::Ops> ops;
   int input_size = 512;
   std::deque<jmt_result> results;  // one per pair of the last call; a deque keeps the addresses stable
@@ -54,12 +58,45 @@ jmt::MatchOptions to_options(const jmt_match_options* options) {
 // Pairs in flight on the device ahead of the one the host is finishing.
 const int kPipeline = 4;
 
+void need_flexglue(jmt_ctx* ctx, const char* what) {
+  if (!ctx->model) throw std::runtime_error(std::string(what) + " needs FlexGlue; this context runs LightGlue");
+}
+
+const char* const kLightGlueModels[] = {"lightglue-aliked", "lightglue-raco-aliked"};
+
+bool is_lightglue_model(const std::string& m) {
+  return std::find(std::begin(kLightGlueModels), std::end(kLightGlueModels), m) != std::end(kLightGlueModels);
+}
+
+// LightGlue's results in the jmt_matches layout: positions are the matched keypoints', NaN when unmatched.
+void lightglue_matches(const jmt_pair& p, jmt_result& r, jmt_matches* m) {
+  const jmt::LightGlue::Result& lg = r.lightglue;
+  r.idx.clear(), r.score.clear();
+  r.a_in_b.assign(static_cast<size_t>(p.n_a) * 2, NAN), r.b_in_a.assign(static_cast<size_t>(p.n_b) * 2, NAN);
+  for (int i = 0; i < p.n_a; ++i) {
+    const int j = lg.matches0[i];
+    if (j < 0) continue;
+    r.idx.push_back(i), r.idx.push_back(j);
+    r.score.push_back(lg.scores0[i]);
+    r.a_in_b[2 * i] = p.xy_b[2 * j], r.a_in_b[2 * i + 1] = p.xy_b[2 * j + 1];
+    r.b_in_a[2 * j] = p.xy_a[2 * i], r.b_in_a[2 * j + 1] = p.xy_a[2 * i + 1];
+  }
+  m->n = static_cast<int>(r.score.size());
+  m->idx = r.idx.data(), m->score = r.score.data();
+  m->n_a = p.n_a, m->n_b = p.n_b;
+  m->a_in_b = r.a_in_b.data(), m->b_in_a = r.b_in_a.data();
+  m->conf_a = lg.matchability0.data(), m->conf_b = lg.matchability1.data();
+  m->covisibility = -1.0f, m->stop_layer = lg.stop_layer;
+}
+
 const std::vector<float>& global_of(jmt_ctx* ctx, const jmt_features* f) {
+  need_flexglue(ctx, "covisibility");
   if (f->global.empty()) f->global = ctx->model->global_vector(f->tensor);
   return f->global;
 }
 
 jmt::FlexGlue::Image0 image0_of(jmt_ctx* ctx, const jmt_features* f) {
+  need_flexglue(ctx, "covisibility");
   if (!f->search0) f->search0 = ctx->model->search0(*ctx->ops, f->tensor);
   return {f->tensor, f->search0};
 }
@@ -87,7 +124,10 @@ std::vector<float> to_rgb01(const jmt_image& image) {
   return rgb;
 }
 
-FlexGlue& model_of(jmt_ctx* ctx) { return *ctx->model; }
+FlexGlue& model_of(jmt_ctx* ctx) {
+  need_flexglue(ctx, "this");
+  return *ctx->model;
+}
 Ops& ops_of(jmt_ctx* ctx) { return *ctx->ops; }
 
 }  // namespace jmt
@@ -126,13 +166,28 @@ jmt_ctx* jmt_create(const jmt_config* config) {
   try {
     if (!config) throw std::runtime_error("config is null");
     auto ctx = std::make_unique<jmt_ctx>();
-    if (config->weights_data && config->weights_size)
+    const std::string model = config->model ? config->model : "";
+    if (!model.empty() && model != "flexglue" && !is_lightglue_model(model))
+      throw std::runtime_error("unknown model '" + model + "' (flexglue, lightglue-aliked, lightglue-raco-aliked)");
+    const void* blob = nullptr;
+    size_t blob_size = 0;
+    if (config->weights_data && config->weights_size) {
       ctx->weights = jmt::Weights::from_memory(config->weights_data, config->weights_size);
-    else if (config->weights_path)
+    } else if (config->weights_path) {
       ctx->weights = jmt::Weights::from_file(config->weights_path);
-    else
+    } else if (is_lightglue_model(model) && jmt::embedded_weights(model, &blob, &blob_size)) {
+      ctx->weights = jmt::Weights::from_memory(blob, blob_size);
+    } else if (is_lightglue_model(model)) {
+      throw std::runtime_error("no weights given, and " + model + " is not built into this library "
+                               "(JMT_EMBED_WEIGHTS): set weights_path to " + model + ".jmtw or the released .pth");
+    } else {
       throw std::runtime_error("no weights given (weights_path or weights_data)");
-    ctx->model = std::make_unique<jmt::FlexGlue>(ctx->weights);
+    }
+    const std::string family = ctx->weights.meta("model");
+    if (!model.empty() && family != (model == "flexglue" ? "flexglue" : "lightglue"))
+      throw std::runtime_error("the weights are " + family + "'s, not " + model + "'s");
+    if (family == "lightglue") ctx->lightglue = std::make_unique<jmt::LightGlue>(ctx->weights);
+    else ctx->model = std::make_unique<jmt::FlexGlue>(ctx->weights);
     if (!jmt_backend_available(config->backend)) throw std::runtime_error("backend not available in this build");
     const bool fp16 = config->precision == JMT_PRECISION_FP16;
     if (fp16 && config->backend == JMT_BACKEND_CPU) throw std::runtime_error("the cpu backend runs in fp32 only");
@@ -158,12 +213,32 @@ jmt_ctx* jmt_create(const jmt_config* config) {
 jmt_features* jmt_describe(jmt_ctx* ctx, const jmt_image* image) {
   try {
     if (!ctx || !image) throw std::runtime_error("null argument");
+    if (!ctx->model) throw std::runtime_error("LightGlue matches keypoints: use jmt_describe_keypoints");
     if (!image->data || image->width <= 0 || image->height <= 0) throw std::runtime_error("empty image");
     const int ch = image->format == JMT_FORMAT_GRAY8 ? 1 : image->format == JMT_FORMAT_RGB8 ? 3 : 4;
     const int stride = image->stride ? image->stride : image->width * ch;
     auto f = std::make_unique<jmt_features>();
     f->tensor = ctx->model->describe_u8(*ctx->ops, image->data, image->height, image->width, stride, ch, ctx->input_size);
     f->width = image->width, f->height = image->height;
+    return f.release();
+  } catch (const std::exception& e) {
+    g_error = e.what();
+    return nullptr;
+  }
+}
+
+jmt_features* jmt_describe_keypoints(jmt_ctx* ctx, int width, int height, const float* xy, const float* desc, int n,
+                                     int dim) {
+  try {
+    if (!ctx || n < 0 || (n && (!xy || !desc))) throw std::runtime_error("bad argument");
+    if (!ctx->lightglue) throw std::runtime_error("FlexGlue describes images: use jmt_describe");
+    if (width <= 0 || height <= 0) throw std::runtime_error("image size must be positive");
+    if (dim != ctx->lightglue->input_dim())
+      throw std::runtime_error("descriptors must have " + std::to_string(ctx->lightglue->input_dim()) + " values");
+    auto f = std::make_unique<jmt_features>();
+    f->keypoints = std::make_shared<jmt::LightGlue::Image>(
+        ctx->lightglue->prepare(*ctx->ops, xy, desc, n, static_cast<float>(width), static_cast<float>(height)));
+    f->width = width, f->height = height;
     return f.release();
   } catch (const std::exception& e) {
     g_error = e.what();
@@ -180,8 +255,23 @@ int jmt_match_batch(jmt_ctx* ctx, const jmt_pair* pairs, int n_pairs, const jmt_
       const jmt_pair& p = pairs[i];
       if (!p.a || !p.b || p.n_a < 0 || p.n_b < 0 || (p.n_a && !p.xy_a) || (p.n_b && !p.xy_b)) throw std::runtime_error("bad argument");
     }
-    const jmt::MatchOptions o = to_options(options);
     if (static_cast<int>(ctx->results.size()) < n_pairs) ctx->results.resize(n_pairs);
+    if (ctx->lightglue) {
+      jmt::LightGlue::Options lo;
+      if (options) lo.n_layers = options->n_layers, lo.filter_threshold = options->filter_threshold;
+      for (int i = 0; i < n_pairs; ++i) {
+        const jmt_pair& p = pairs[i];
+        if (!p.a->keypoints || !p.b->keypoints) throw std::runtime_error("features not made by jmt_describe_keypoints");
+        if (p.n_a != p.a->keypoints->n || p.n_b != p.b->keypoints->n)
+          throw std::runtime_error("keypoints differ from those given to jmt_describe_keypoints");
+        ctx->lightglue->match(*ctx->ops, *p.a->keypoints, *p.b->keypoints, lo, &ctx->results[i].lightglue);
+        lightglue_matches(p, ctx->results[i], matches + i);
+      }
+      return 0;
+    }
+    for (int i = 0; i < n_pairs; ++i)
+      if (!pairs[i].a->tensor || !pairs[i].b->tensor) throw std::runtime_error("features not made by jmt_describe");
+    const jmt::MatchOptions o = to_options(options);
     std::deque<std::shared_ptr<jmt::FlexGlue::Pair>> queued;
     for (int next = 0, done = 0; done < n_pairs; ++done) {
       // Keep the device busy: queue the pairs ahead before waiting for this one.
@@ -234,6 +324,7 @@ int jmt_match(jmt_ctx* ctx, const jmt_features* a, const float* xy_a, int n_a, c
 int jmt_covisibility(jmt_ctx* ctx, const jmt_features* a, const jmt_features* b, int level, float* score) {
   try {
     if (!ctx || !a || !b || !score) throw std::runtime_error("null argument");
+    need_flexglue(ctx, "jmt_covisibility");
     if (level == 1) {
       *score = dot(global_of(ctx, a), global_of(ctx, b));
     } else if (level == 2) {
@@ -257,6 +348,7 @@ int jmt_shortlist(jmt_ctx* ctx, const jmt_features* const* images, int n, const 
                   jmt_pair_list* out) {
   try {
     if (!ctx || !out || n < 0 || (n && !images)) throw std::runtime_error("bad argument");
+    need_flexglue(ctx, "jmt_shortlist");
     for (int i = 0; i < n; ++i)
       if (!images[i]) throw std::runtime_error("bad argument");
     jmt_shortlist_options o;
