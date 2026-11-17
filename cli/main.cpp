@@ -35,7 +35,7 @@ void usage() {
                "usage: jmt match A B --kpts-a A.jkpt --kpts-b B.jkpt [--out OUT.jmtt] [options]\n"
                "  --backend B            cpu (default), metal, metal:fp16, cuda, cuda:fp16,\n"
                "                         webgpu, webgpu:fp16\n"
-               "  --weights FILE         weights file (default weights/flexglue.jmtw)\n"
+               "  --weights FILE         flexglue.pth as released, or a .jmtw file (default weights/flexglue.jmtw)\n"
                "  --size N               network input side, multiple of 32 (default 512)\n"
                "  --layers N             transformer layers, 0..9 (default 9)\n"
                "  --filter T             minimum match score (default 0.1)\n"

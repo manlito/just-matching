@@ -42,8 +42,73 @@ export function rgba(image) {
   return g.getImageData(0, 0, w, h);
 }
 
-// options: weightsUrl or weights (ArrayBuffer / Uint8Array of a .jmtw file, float32 or float16); backend
-// 'webgpu' (default) or 'cpu'; precision 'fp32' (default) or 'fp16' (needs shader-f16); inputSize (512).
+// The bytes of a weights file, from its URL or from the URL of a parts manifest (a .json file): hosts such as
+// Cloudflare Pages cap files at 25 MiB, so the site serves each .jmtw as parts listed by
+//   { "format": "jmtw-parts", "size": total bytes, "parts": [{ "url": relative to the manifest, "size": bytes }] }
+// onProgress(loaded, total) is called as bytes arrive (total is 0 when the server does not say).
+export async function fetchWeights(url, { onProgress } = {}) {
+  const report = onProgress ?? (() => {});
+  if (!/\.json(\?|#|$)/.test(url)) {
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(`cannot load ${url}: ${r.status}`);
+    const total = Number(r.headers.get('content-length')) || 0;
+    if (!r.body || !total) {
+      const out = new Uint8Array(await r.arrayBuffer());
+      report(out.length, out.length);
+      return out;
+    }
+    const out = new Uint8Array(total);
+    let got = 0;
+    for (const reader = r.body.getReader(); ;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (got + value.length > total) throw new Error(`${url}: more bytes than its content-length`);
+      out.set(value, got);
+      got += value.length;
+      report(got, total);
+    }
+    if (got !== total) throw new Error(`${url}: ${got} of ${total} bytes`);
+    return out;
+  }
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`cannot load ${url}: ${r.status}`);
+  const manifest = await r.json();
+  if (manifest.format !== 'jmtw-parts' || !Array.isArray(manifest.parts)) throw new Error(`${url}: not a parts manifest`);
+  const total = manifest.size;
+  if (manifest.parts.reduce((s, p) => s + p.size, 0) !== total) throw new Error(`${url}: part sizes do not add up`);
+  const base = new URL(url, location.href);
+  const out = new Uint8Array(total);
+  const offsets = [];
+  manifest.parts.reduce((o, p) => (offsets.push(o), o + p.size), 0);
+  let got = 0, next = 0;
+  // A few parts at a time, each written to its place as it arrives.
+  const worker = async () => {
+    while (next < manifest.parts.length) {
+      const i = next++;
+      const part = manifest.parts[i], partUrl = new URL(part.url, base).href;
+      const pr = await fetch(partUrl);
+      if (!pr.ok) throw new Error(`cannot load ${partUrl}: ${pr.status}`);
+      let at = offsets[i];
+      const end = at + part.size;
+      for (const reader = pr.body.getReader(); ;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (at + value.length > end) throw new Error(`${partUrl}: larger than ${part.size} bytes`);
+        out.set(value, at);
+        at += value.length;
+        got += value.length;
+        report(got, total);
+      }
+      if (at !== end) throw new Error(`${partUrl}: ${at - offsets[i]} of ${part.size} bytes`);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(4, manifest.parts.length) }, worker));
+  return out;
+}
+
+// options: weightsUrl (a .jmtw file or a parts manifest, see fetchWeights) or weights (ArrayBuffer /
+// Uint8Array of a .jmtw file, float32 or float16); backend 'webgpu' (default) or 'cpu'; precision 'fp32'
+// (default) or 'fp16' (needs shader-f16); inputSize (512).
 export async function create(options = {}) {
   const M = await module();
   const backend = options.backend ?? 'webgpu';
@@ -54,9 +119,7 @@ export async function create(options = {}) {
   let weights = options.weights;
   if (!weights) {
     if (!options.weightsUrl) throw new Error('give weightsUrl or weights');
-    const response = await fetch(options.weightsUrl);
-    if (!response.ok) throw new Error(`cannot load ${options.weightsUrl}: ${response.status}`);
-    weights = await response.arrayBuffer();
+    weights = await fetchWeights(options.weightsUrl);
   }
   const bytes = weights instanceof Uint8Array ? weights : new Uint8Array(weights);
   const wp = M._malloc(bytes.length);

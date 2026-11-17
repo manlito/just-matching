@@ -2,13 +2,22 @@
 // early stop (level 3) on the pairs it keeps. Keypoints come from just-keypoints' module (jkp/), the matcher
 // from jmt.js. Both run on WebGPU in this page.
 //
-// URL parameters: run=1 runs once the sample set is loaded; weights=URL / weights16=URL for the FP32 / FP16
-// .jmtw files; jkp=DIR for just-keypoints' module and raco.jkpw (default jkp/).
-import * as jmt from './jmt.js';
-
+// Where things are: next to the page by default (the build's web/ folder); the documentation site sets other
+// places in <script type="application/json" id="demo-config">: lib (jmt.js and its module), jkp, samples.
+// FlexGlue's weights are never served by the page: the visitor loads flexglue.pth (or a .jmtw file) from their
+// own disk, and the page keeps it in the browser's private file system for the next visit. URL parameters:
+// run=1 runs once the sample set is loaded (and weights are at hand); weights=URL fetches the weights instead
+// (a .pth or .jmtw file, or a parts manifest), for local testing; jkp=DIR for just-keypoints' module and
+// raco.jkpw.
 const params = new URLSearchParams(location.search);
-const JKP_DIR = (params.get('jkp') ?? 'jkp/').replace(/\/?$/, '/');
-const WEIGHTS = { fp32: params.get('weights') ?? 'flexglue.jmtw', fp16: params.get('weights16') ?? 'flexglue-fp16.jmtw' };
+const CONFIG = JSON.parse(document.getElementById('demo-config')?.textContent || '{}');
+const dir = d => d.replace(/\/?$/, '/');
+const LIB = dir(CONFIG.lib ?? './');
+const JKP_DIR = dir(params.get('jkp') ?? CONFIG.jkp ?? 'jkp/');
+const SAMPLES_DIR = dir(CONFIG.samples ?? 'samples/');
+const WEIGHTS_URL = params.get('weights');
+const STORED = 'flexglue-weights';   // the visitor's weights file, in the origin private file system
+const jmt = await import(new URL(`${LIB}jmt.js`, location.href).href);
 const SAMPLES = ['tum-1', 'tum-2', 'tum-3', 'tum-4', 'kitti-1', 'kitti-2', 'kitti-3', 'kitti-4',
                  'berlin-1', 'berlin-2', 'lamar-1', 'lamar-2'];
 const MAX_SIDE = 1600;   // larger images are scaled down before keypoints and matching
@@ -26,6 +35,7 @@ const state = {
   images: [],          // { name, bitmap, data, kp, tKp, feat, tDescribe }
   extractor: null,
   matcher: null, matcherKey: '',
+  weights: null,       // { name, size, blob or url, stored }: the visitor's FlexGlue weights
   timings: null,
   level1: null,        // Float32Array [n][n]
   shortlist: null,     // { n, pairs, scores, rerank }
@@ -135,8 +145,8 @@ async function loadSamples() {
   clearImages();
   setStatus('Loading the sample images…');
   const entries = await Promise.all(SAMPLES.map(async name => {
-    const r = await fetch(`samples/${name}.jpg`);
-    if (!r.ok) throw new Error(`samples/${name}.jpg: ${r.status}`);
+    const r = await fetch(`${SAMPLES_DIR}${name}.jpg`);
+    if (!r.ok) throw new Error(`${SAMPLES_DIR}${name}.jpg: ${r.status}`);
     return { name, blob: await r.blob() };
   }));
   await addImages(entries);
@@ -166,50 +176,136 @@ function renderThumbs() {
 // ---- modules
 
 async function fetchWithProgress(url, label) {
-  const r = await fetch(url);
-  if (!r.ok) throw new Error(`cannot load ${url}: ${r.status}`);
-  const total = Number(r.headers.get('content-length')) || 0;
-  if (!r.body || !total) return new Uint8Array(await r.arrayBuffer());
-  const out = new Uint8Array(total);
-  const reader = r.body.getReader();
-  let got = 0;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    out.set(value, got);
-    got += value.length;
-    setStatus(`${label}: ${(got / 1e6).toFixed(0)} of ${(total / 1e6).toFixed(0)} MB…`);
-    setProgress(got, total);
-  }
-  return got === total ? out : out.subarray(0, got);
+  return jmt.fetchWeights(url, {
+    onProgress(got, total) {
+      setStatus(total ? `${label}: ${(got / 1e6).toFixed(0)} of ${(total / 1e6).toFixed(0)} MB…` : `${label}…`);
+      if (total) setProgress(got, total);
+    },
+  });
 }
 
 async function ensureExtractor(t) {
   if (state.extractor) return;
   setStatus('Loading just-keypoints (RaCo)…');
   const t0 = performance.now();
-  const jkp = await import(`./${JKP_DIR}jkp.js`);
+  const jkp = await import(new URL(`${JKP_DIR}jkp.js`, location.href).href);
   state.extractor = await jkp.create({ weightsUrl: `${JKP_DIR}raco.jkpw`, topK: KEYPOINTS, skipRanker: true, skipCovariance: true });
   t.loadKeypoints = performance.now() - t0;
 }
 
-async function ensureMatcher(precision, size, t) {
-  const key = `${precision}/${size}`;
-  if (state.matcher && state.matcherKey === key) return;
+// ---- FlexGlue's weights, from the visitor
+
+// A .pth checkpoint is a zip archive; a .jmtw file starts with JKPW.
+async function weightsKind(blob) {
+  const head = new Uint8Array(await blob.slice(0, 4).arrayBuffer());
+  if (head[0] === 0x50 && head[1] === 0x4b && head[2] === 3 && head[3] === 4) return 'pth';
+  if (String.fromCharCode(...head) === 'JKPW') return 'jmtw';
+  return null;
+}
+
+async function storedDir() {
+  try {
+    return await navigator.storage.getDirectory();
+  } catch {
+    return null;   // no private file system here (private window, blocked storage): the file is used once
+  }
+}
+
+function showWeights(note) {
+  const w = state.weights, el = $('weights-status');
+  $('weights-forget').hidden = !w?.stored;
+  $('weights-panel').classList.toggle('need', !w);
+  el.classList.toggle('ok', !!w);
+  el.textContent = w ? `${w.name}, ${(w.size / 1e6).toFixed(0)} MB${w.stored ? ', kept in this browser' : ''}.${note ? ' ' + note : ''}`
+                     : note || 'Not loaded. You can also drop the file on this page.';
+}
+
+async function useWeightsFile(file) {
+  if (state.busy) return;
+  const kind = await weightsKind(file);
+  if (!kind) {
+    showWeights(`${file.name} is not a FlexGlue weights file (flexglue.pth or .jmtw).`);
+    return;
+  }
+  dropMatcher();
+  state.weights = { name: file.name, size: file.size, blob: file, stored: false };
+  showWeights('Keeping a copy in this browser…');
+  const dir = await storedDir();
+  try {
+    if (!dir) throw new Error('no storage');
+    const handle = await dir.getFileHandle(STORED, { create: true });
+    const out = await handle.createWritable();
+    await out.write(file);
+    await out.close();
+    localStorage.setItem(STORED, JSON.stringify({ name: file.name, size: file.size }));
+    state.weights.stored = true;
+    showWeights();
+  } catch {
+    showWeights('Not kept: load it again on your next visit.');
+  }
+  setStatus(state.images.length >= 2 ? `${state.images.length} images. Press Run.` : 'Add at least two images.');
+}
+
+async function restoreWeights() {
+  if (WEIGHTS_URL) {
+    state.weights = { name: WEIGHTS_URL.split('/').pop(), size: 0, url: WEIGHTS_URL, stored: false };
+    showWeights('Fetched from the URL given.');
+    return;
+  }
+  const dir = await storedDir();
+  if (!dir) return showWeights();
+  try {
+    const file = await (await dir.getFileHandle(STORED)).getFile();
+    const meta = JSON.parse(localStorage.getItem(STORED) || '{}');
+    if (!(await weightsKind(file))) throw new Error('not weights');
+    state.weights = { name: meta.name || 'flexglue.pth', size: file.size, blob: file, stored: true };
+  } catch {
+    state.weights = null;
+  }
+  showWeights();
+}
+
+async function forgetWeights() {
+  if (state.busy) return;
+  dropMatcher();
+  state.weights = null;
+  try {
+    await (await storedDir())?.removeEntry(STORED);
+  } catch { /* nothing stored */ }
+  try {
+    localStorage.removeItem(STORED);
+  } catch { /* storage blocked */ }
+  showWeights('Forgotten.');
+}
+
+function dropMatcher() {
   for (const im of state.images) {
     im.feat?.destroy();
     im.feat = null;
   }
   state.matcher?.destroy();
   state.matcher = null;
+  state.matcherKey = '';
+}
+
+async function ensureMatcher(precision, size, t) {
+  const key = `${precision}/${size}`;
+  if (state.matcher && state.matcherKey === key) return;
+  dropMatcher();
+  const w = state.weights;
   let t0 = performance.now();
-  const weights = await fetchWithProgress(WEIGHTS[precision], `FlexGlue weights (${precision.toUpperCase()})`);
+  setStatus(`Reading ${w.name}…`);
+  const weights = w.url ? await fetchWithProgress(w.url, `FlexGlue weights`) : new Uint8Array(await w.blob.arrayBuffer());
   t.loadWeights = performance.now() - t0;
   t.weightsMB = weights.length / 1e6;
   setProgress(null);
   setStatus('Creating the matcher…');
   t0 = performance.now();
-  state.matcher = await jmt.create({ weights, precision, inputSize: size });
+  try {
+    state.matcher = await jmt.create({ weights, precision, inputSize: size });
+  } catch (e) {
+    throw new Error(`${w.name}: ${e.message}`);
+  }
   t.create = performance.now() - t0;
   state.matcherKey = key;
 }
@@ -249,6 +345,11 @@ async function run() {
   const n = state.images.length;
   if (n < 2) {
     setStatus('Add at least two images.', true);
+    return null;
+  }
+  if (!state.weights) {
+    showWeights();
+    setStatus("Load FlexGlue's weights first (left).", true);
     return null;
   }
   state.busy = true;
@@ -405,8 +506,8 @@ function renderTimings() {
   if (!t) return;
   const rows = [
     ['just-keypoints module and RaCo weights', t.loadKeypoints],
-    [`FlexGlue weights (${fmtMs(t.weightsMB)} MB)`, t.loadWeights],
-    ['Matcher created', t.create],
+    [`FlexGlue weights read (${fmtMs(t.weightsMB)} MB)`, t.loadWeights],
+    ['Matcher created (weights converted and uploaded to the GPU)', t.create],
     ['Keypoints, per image', t.keypoints],
     ['Features (describe), per image', t.describe],
     [`Level 1, all ${t.n * (t.n - 1) / 2} pairs`, t.level1],
@@ -624,8 +725,16 @@ async function init() {
     const f16 = document.querySelector('input[name=precision][value=fp16]');
     f16.disabled = true;
     document.querySelector('input[name=precision][value=fp32]').checked = true;
-    $('precision-hint').textContent = 'This GPU has no shader-f16: FP32 only (567 MB of weights).';
+    $('precision-hint').textContent = 'This GPU has no shader-f16: FP32 only.';
   }
+
+  $('weights-open').addEventListener('click', () => !state.busy && $('weights-file').click());
+  $('weights-file').addEventListener('change', async e => {
+    if (e.target.files[0]) await useWeightsFile(e.target.files[0]);
+    e.target.value = '';
+  });
+  $('weights-forget').addEventListener('click', forgetWeights);
+  await restoreWeights();
 
   $('samples').addEventListener('click', () => !state.busy && loadSamples());
   $('clear').addEventListener('click', () => !state.busy && clearImages());
@@ -646,7 +755,11 @@ async function init() {
       e.preventDefault();
       drop.classList.remove('over');
       if (state.busy) return;
-      const files = [...e.dataTransfer.files].filter(f => f.type.startsWith('image/'));
+      const dropped = [...e.dataTransfer.files];
+      const weights = dropped.find(f => /\.(pth|jmtw)$/i.test(f.name));
+      if (weights) await useWeightsFile(weights);
+      const files = dropped.filter(f => f.type.startsWith('image/'));
+      if (!files.length) return;
       await addImages(files.map(f => ({ name: f.name.replace(/\.[^.]+$/, ''), blob: f })));
       setStatus(`${state.images.length} images. Press Run.`);
     });
@@ -659,7 +772,8 @@ async function init() {
   wireMatrix();
   renderPair();
   await loadSamples();
-  if (params.get('run') === '1') await run();
+  if (!state.weights) setStatus("Load FlexGlue's weights to run (left).");
+  if (params.get('run') === '1' && state.weights) await run();
 }
 
 const ready = init().catch(e => setStatus('Error: ' + e.message, true));

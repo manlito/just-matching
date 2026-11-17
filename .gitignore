@@ -6,3 +6,5 @@ __pycache__/
 venv/
 .DS_Store
 /weights/*.jmtw
+/docs/_build/
+/docs/.venv/

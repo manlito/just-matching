@@ -1,5 +1,6 @@
 #include "core/weights.h"
 
+#include "core/checkpoint.h"
 #include "core/half.h"
 
 #include <cstdio>
@@ -48,7 +49,22 @@ size_t align_up(size_t n) { return (n + kAlign - 1) / kAlign * kAlign; }
 
 }  // namespace
 
+Weights Weights::from_tensors(std::map<std::string, std::string> meta, std::vector<OwnedTensor> tensors) {
+  Weights w;
+  w.meta_ = std::move(meta);
+  for (OwnedTensor& t : tensors) {
+    Param p;
+    p.shape = t.shape;
+    if (p.size() != t.data.size()) throw std::runtime_error("weights: bad shape of '" + t.name + "'");
+    w.widened_.push_back(std::move(t.data));
+    p.data = w.widened_.back().data();
+    w.tensors_[t.name] = p;
+  }
+  return w;
+}
+
 Weights Weights::from_memory(const void* data, size_t size) {
+  if (is_torch_checkpoint(data, size)) return flexglue_from_checkpoint(data, size);
   Weights w;
   w.storage_.resize((size + 3) / 4);
   std::memcpy(w.storage_.data(), data, size);
@@ -121,6 +137,12 @@ const std::string& Weights::meta(const std::string& key) const {
   auto it = meta_.find(key);
   if (it == meta_.end()) throw std::runtime_error("weights: missing metadata '" + key + "'");
   return it->second;
+}
+
+std::vector<std::string> Weights::names() const {
+  std::vector<std::string> out;
+  for (const auto& kv : tensors_) out.push_back(kv.first);
+  return out;
 }
 
 int Weights::meta_int(const std::string& key) const { return std::stoi(meta(key)); }

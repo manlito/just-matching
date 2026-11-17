@@ -10,9 +10,12 @@ against 376 and 157 ms for PyTorch on the same GPU, and on CUDA. M6 is done: the
 original natively (Dawn) and in Chrome (WebAssembly): per pair at full settings on the M5 Pro, 478 ms in
 FP32 and 313 ms in FP16 natively, 500 and 335 ms in Chrome. C2 is done: `jmt_covisibility` (levels 1 and 2)
 and `jmt_shortlist` on every backend. C3 is done: level 3 with early stop stops where the original does on
-every backend. M7 is half done and C4 is done: the browser demo (`web/demo.html`) shows the shortlist and the
-matches of a set of images, with the timings of each step; the documentation site is not written yet. Numbers
-marked "estimate" are computed from the layer sizes, not measured.
+every backend. C4 is done and M7 nearly: the browser demo (`web/demo.html`) shows the shortlist and the
+matches of a set of images, with the timings of each step, and the documentation site (`docs/`) is written and
+builds; it is not deployed. FlexGlue's weights are never distributed: the backbone is under Meta's DINOv3 License,
+so each user fetches `flexglue.pth` from FlexGlue's release, and the library reads it as it is. LightGlue (on
+ALIKED descriptors, no DINO) comes later as the self-contained matcher (M9). Numbers marked "estimate" are
+computed from the layer sizes, not measured.
 
 ## What FlexGlue is (reviewed at release v0.1, 2026-10-26)
 
@@ -70,7 +73,7 @@ convolution kernels; here it is one very good GEMM and one attention kernel per 
 | Coordinates | Public API uses the just-keypoints convention ((0,0) = centre of the top-left pixel). FlexGlue's corner convention (+0.5) is applied inside. |
 | Two-step API | `describe` per image, `match` per pair, so features are computed once and reused over all pairs. |
 | Precision | FP32 reference mode matching upstream; FP16 is the fast mode and, unlike in just-keypoints, the expected default on GPU (upstream itself runs the transformer in FP16). |
-| Weights | Same flat container as `.jkpw`. Not embedded and not committed (275-550 MB): fetched by script, loaded from path, memory or URL. |
+| Weights | Never embedded, committed, hosted or bundled: the DINOv3 License would bind every user, so each user fetches FlexGlue's `flexglue.pth` from its authors. The library reads that checkpoint directly (no PyTorch), or the `.jmtw` container (same flat format as `.jkpw`) that `tools/export_weights.py` makes from it. |
 | Speed presets | Number of layers and input size are run-time options. From M1: 512 px with 5-9 layers; 384 px is the smallest useful size; 256 px is not offered. |
 | Backends | `cpu` (reference), `metal`, `cuda`, `webgpu`, same pluggable structure as just-keypoints. |
 | Code sharing | Start by copying the just-keypoints core (weights loader, buffer pool, backend glue, CMake embedding, test harness). Extract a shared library only if both repos keep changing the same code. |
@@ -252,9 +255,16 @@ reference for recall, before any C++ is written for them.
   matrix with the kept pairs marked, the kept pairs with levels 1, 2 and 3, layers run, matches and time, and
   the matches of any pair (one that was not kept is matched on click). The shortlist is now in the
   WebAssembly module (`covisibility`, `level1`, `shortlist` in `jmt.js`), and the test page checks it against
-  the native CPU backend. Open: the documentation site and its deployment (as just-keypoints'), and a stated
-  licence for the Berlin and LaMAR samples before anything is published. See "Notes from M7 and C4".
-- [ ] **M8 — v1.0**: CMake package, npm package, weights fetch script.
+  the native CPU backend. Documentation site done (`docs/`, Sphinx and just-keypoints' theme; 10 pages; the
+  demo as `demo/`; `.github/workflows/docs.yml`, by hand, deploys to Cloudflare Pages). The demo takes the
+  weights from the user: a Load weights button or a drop of `flexglue.pth` (or a `.jmtw`), kept in the origin
+  private file system until Forget. Open: deploying (secrets `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID`, and a
+  Pages project), and a stated licence for the Berlin and LaMAR samples before
+  anything is published. See "Notes from M7: documentation site and the weights".
+- [ ] **M8 — v1.0**: CMake package, npm package.
+- [ ] **M9 — LightGlue**: ALIKED descriptors from just-keypoints matched by LightGlue, so the library runs with
+  weights it can ship; FlexGlue stays the option for doppelganger rejection, with the user's own weights.
+  First check the licence of LightGlue's ALIKED weights and that nothing in them comes from DINO.
 
 ### Covisibility track (parallel, like the RaCo track in just-keypoints)
 
@@ -291,7 +301,8 @@ reference for recall, before any C++ is written for them.
   kernels used the same matrix hardware as the vendor library. Open on CUDA: 70 % of cuBLAS in FP32.
 - **The fast Metal path depends on Metal 4** (macOS 26) and, for its FP16 speed, on the matrix hardware of
   the M5 GPU. On older chips it has not been measured.
-- **Browser.** A 284 MB download (FP16 weights file) and about 1 GB of GPU memory. Attention needs no
+- **Browser.** The user loads the 567 MB checkpoint (kept in the browser after the first time); about 1.2 GB of
+  memory while it is converted, and about 1 GB of GPU memory. Attention needs no
   4096 x 4096 buffer (single pass). Speed is set by WGSL's lack of matrix instructions: 1.5x Metal FP32
   and 3.0x Metal FP16 on the M5 Pro. Dawn's experimental subgroup matrices would reach the matrix hardware
   but are not in stable browsers.
@@ -942,3 +953,37 @@ The first pass first; the second pass, at the end, replaced its products and att
 - **Not done:** the documentation site and its deployment; sample licences (Berlin, LaMAR); Safari and
   Firefox (JSPI); the camera; a minimum-matches rule in the verdict; saving features, so that a set is
   described once across visits.
+
+## Notes from M7: documentation site and the weights
+
+- **The weights cannot ship.** The backbone (`extractor.backbone.*`, 87.6 M of the 141.7 M values) is under the
+  DINOv3 License: anyone who uses the weights is bound by it (trade controls, military and ITAR uses, a copy with
+  every copy passed on), and Meta gates its own downloads. Hosting the weights for the demo was ruled out; so is
+  bundling them. COLMAP does the same: its FlexGlue preset downloads the ONNX models from FlexGlue's release at
+  run time (`src/colmap/feature/resources.h`), in an optional ONNX build, so its users take on the licence
+  themselves.
+- **The checkpoint read directly** (`src/core/checkpoint.cpp`): the zip archive of torch.save (stored entries,
+  zip64 read), a small unpickler for the opcodes of a state dict (`OrderedDict`, `_rebuild_tensor_v2`,
+  persistent storage ids; float32, float16, bfloat16 storages, any strides), then the export's changes. 870
+  tensors bit for bit equal to `weights/flexglue.jmtw` (`checkpoint_test`, in ctest when both files are there);
+  the 0-d readout temperatures become shape (1,) as in the file. 383 ms for 567 MB on the M5 Pro; `jmt match
+  --weights flexglue.pth` writes the same output file as with the `.jmtw`.
+- **In the demo**, the visitor picks or drops `flexglue.pth`; the page checks its first bytes (zip or JKPW),
+  writes it to the origin private file system and keeps a note in localStorage, and reads it back on the next
+  visit (Forget deletes both). Chrome on the M5 Pro: matcher created from the checkpoint, conversion included, in
+  0.8 s; the sample run then gives what the `.jmtw` gave (26 of 66 pairs shortlisted, 11 rejected, 2 stopped
+  early) in FP16 and in FP32. `?weights=URL` fetches instead, for testing. `jmt.fetchWeights` also reads a
+  manifest of parts, for anyone who hosts their own copy behind a 25 MiB file limit (Cloudflare Pages).
+- **just-keypoints' module** comes from its site (`tools/fetch_jkp_web.sh`, four files pinned by sha256; on
+  2026-11-16 byte-identical to a build of just-keypoints' main), so the workflow needs no token for the private
+  repository. A new deployment there fails the check until the hashes are updated.
+- **The site** is 5 MB: pages, the two modules and the sample images. Rule: no PLAN.md, milestones or links to
+  the private repository on any page.
+- **Without DINO, what was looked at** (2026-11-16): nobody has published FlexGlue on another backbone; the
+  paper uses only DINOv3's ConvNeXt-B, frozen, and its training code is not released (README to-do:
+  glue-factory). Training took 4 H200 GPU-days (50 epochs x 150k pairs, 8 datasets). The matcher's ONNX file is
+  MIT and holds no backbone weights but needs the backbone's 256 x 64 x 64 features. The backbone is a standard
+  ConvNeXt-B (depths 3, 3, 27, 3), so a ConvNeXt v1 (MIT) trained to feed the frozen matcher would drop into the
+  engine unchanged; the paper's ablation shows doppelganger rejection comes mostly from matching data with
+  flipped and non-overlapping negatives (AUROC 97.0 / 95.3 / 88.5 on DG / ViSym / LaMAR without labelled pairs,
+  98.4 / 95.9 / 88.8 with). Not pursued for now.

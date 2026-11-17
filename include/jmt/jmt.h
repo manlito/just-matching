@@ -23,7 +23,9 @@ typedef enum { JMT_PRECISION_FP32 = 0, JMT_PRECISION_FP16 = 1 } jmt_precision;
 
 typedef struct {
   jmt_backend backend;
-  /* Weights source, first that is set wins: memory blob, file path. Weights are never built in. */
+  /* Weights source, first that is set wins: memory blob, file path. Either FlexGlue's checkpoint as released
+     (flexglue.pth, read without PyTorch) or a .jmtw file. Weights are never built in or distributed: the
+     backbone is under Meta's DINOv3 License. */
   const void* weights_data;
   size_t weights_size;
   const char* weights_path;
