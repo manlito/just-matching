@@ -1,0 +1,82 @@
+{#- The site's page layout. Extends Sphinx's basic layout, which keeps the <head> (styles, scripts, search
+    index) and the search and index pages working; this file replaces the visible page: top bar, navigation,
+    content, the page's own contents, footer. The demo page gets the same top bar from conf.py (site_header). -#}
+{%- extends "basic/layout.html" %}
+
+{%- set jk_section = "Reference" if pagename in ("api", "weights-format", "references", "licences") else "Guide" %}
+
+{%- block htmltitle %}
+<title>{% if title and pagename != root_doc %}{{ title|striptags|e }} · {% endif %}{{ project }}</title>
+{%- endblock %}
+
+{%- block extrahead %}
+<meta name="color-scheme" content="light dark">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@400;500&amp;display=swap">
+<style>:root { --accent: {{ theme_accent }}; } @media (prefers-color-scheme: dark) { :root { --accent: {{ theme_accent_dark }}; } }</style>
+{{ super() }}
+{%- endblock %}
+
+{%- block scripts %}
+{{ super() }}
+<script src="{{ pathto('_static/site.js', 1) }}" defer></script>
+{%- endblock %}
+
+{%- block relbar1 %}{% endblock %}
+{%- block relbar2 %}{% endblock %}
+
+{%- block header %}
+<a class="jk-skip" href="#content">Skip to content</a>
+<header class="jk-top">
+  <div class="jk-top-in">
+    <a class="jk-brand" href="{{ pathto(root_doc) }}">
+      <svg width="22" height="22" viewBox="0 0 22 22" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="1.5" y="4" width="7.5" height="14" rx="1.5"></rect><rect x="13" y="4" width="7.5" height="14" rx="1.5"></rect><path d="M5.2 8.5L16.8 13.5M5.2 13.5L16.8 8.5"></path></svg>
+      <span>{{ project }}</span>
+    </a>
+    <span class="jk-grow"></span>
+    <form class="jk-search" action="{{ pathto('search') }}" method="get" role="search">
+      <label for="jk-q" class="jk-sr">Search the documentation</label>
+      <input id="jk-q" type="search" name="q" placeholder="Search" autocomplete="off" spellcheck="false">
+    </form>
+    <a class="jk-toplink" href="{{ pathto('demo/index.html', 1) }}">Live demo</a>
+  </div>
+</header>
+{%- endblock %}
+
+{%- block content %}
+<div class="jk-wrap">
+  <nav class="jk-nav" aria-label="Documentation">
+    {{ toctree(maxdepth=1, collapse=False, titles_only=True, includehidden=True) }}
+  </nav>
+  <main class="jk-main" id="content">
+    {%- if pagename != root_doc and title %}
+    <div class="jk-crumbs">{{ jk_section }} / {{ title|striptags|e }}</div>
+    {%- endif %}
+    <div class="body" role="main">
+      {% block body %}{% endblock %}
+    </div>
+    {%- if prev or next %}
+    <nav class="jk-pager" aria-label="Previous and next page">
+      {%- if prev %}<a href="{{ prev.link|e }}" rel="prev">← {{ prev.title }}</a>{% else %}<span></span>{% endif %}
+      {%- if next %}<a href="{{ next.link|e }}" rel="next">{{ next.title }} →</a>{% endif %}
+    </nav>
+    {%- endif %}
+  </main>
+  {%- if display_toc and pagename != root_doc %}
+  <aside class="jk-toc" aria-label="On this page">
+    <div class="jk-toc-title">On this page</div>
+    {{ toc }}
+  </aside>
+  {%- endif %}
+</div>
+{%- endblock %}
+
+{%- block footer %}
+<footer class="jk-foot">
+  <div class="jk-foot-in">
+    <span>{{ project }} · matcher weights from FlexGlue (MIT), backbone weights from DINOv3 (DINOv3 License)</span>
+    <a href="{{ pathto('references') }}">References and acknowledgements</a>
+  </div>
+</footer>
+{%- endblock %}

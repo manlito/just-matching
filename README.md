@@ -35,11 +35,14 @@ cmake -S . -B build/release -DCMAKE_BUILD_TYPE=Release
 cmake --build build/release
 ```
 
-The weights are not in the repository (567 MB; the backbone is under the DINOv3 License). Produce them once,
-see [tools/README.md](tools/README.md):
+The weights are not in the repository and are never distributed with it: the backbone is under Meta's DINOv3
+License, which every user accepts by fetching FlexGlue's checkpoint from its authors. The library reads that file,
+`flexglue.pth` (567 MB), directly, without PyTorch (`src/core/checkpoint.cpp`; `checkpoint_test` checks it gives
+the tensors of the exported file bit for bit):
 
 ```sh
-tools/fetch_upstream.sh && python tools/export_weights.py     # -> weights/flexglue.jmtw
+tools/fetch_upstream.sh                      # -> third_party/flexglue.pth, checked by sha256
+python tools/export_weights.py               # optional: -> weights/flexglue.jmtw, the default of the tools and tests
 ```
 
 ### In the browser
@@ -52,8 +55,8 @@ cmake --build build/wasm      # -> build/wasm/web: jmt_wasm.js / .wasm, jmt.js, 
 ```
 
 `web/jmt.js` wraps the module (`create`, `describe`, `match`, and for covisibility `covisibility`, `level1`,
-`shortlist`); it needs JSPI (Chrome, Edge). The weights are served next to it and may be the FP16 file (284 MB
-instead of 567; widened to float32 on load). The test page compares the module with the native CPU backend on
+`shortlist`); it needs JSPI (Chrome, Edge). `create` takes the bytes of `flexglue.pth` or of a `.jmtw` file (the FP16
+one is 284 MB, widened to float32 on load), or a URL. The test page compares the module with the native CPU backend on
 the 6 test pairs, without and with early stop (`?settings=2,3` runs only the latter), then the shortlist of
 their 10 images (`?shortlist=0` skips it):
 
@@ -67,8 +70,11 @@ The demo (`demo.html`) takes a set of images (12 samples in `web/samples`, or yo
 matrix and the shortlist, matches the kept pairs with early stop, and draws the matches of any pair with the
 timings of each step. Its keypoints come from just-keypoints' WebAssembly module (RaCo, best 2048): build
 just-keypoints with Emscripten too and point `JMT_JKP_WEB_DIR` at its `build/wasm/web` (the default is
-`../just-keypoints/build/wasm/web`); the build copies `jkp.js`, its module and `raco.jkpw` into `web/jkp`. It
-loads `flexglue-fp16.jmtw` (and `flexglue.jmtw` for FP32) from next to the page; `?run=1` runs on load.
+`../just-keypoints/build/wasm/web`); the build copies `jkp.js`, its module and `raco.jkpw` into `web/jkp`. The
+page never fetches FlexGlue's weights on its own: the user loads `flexglue.pth` with its button or a drop, and it
+keeps the file in the origin private file system (Forget deletes it). For testing, `?weights=URL` fetches them
+instead; `?run=1` runs on load when weights are at hand. The documentation site serves this page; see
+[docs/README.md](docs/README.md).
 
 ## Command line
 
@@ -158,5 +164,6 @@ python tools/dump_golden.py a.jpg b.jpg      # then: cmake -S . -B build/release
 ## Licenses
 
 Code in this repository: to be decided. FlexGlue's code and matcher weights are MIT (`weights/LICENSE-FLEXGLUE`);
-its backbone weights are under the DINOv3 License (`weights/LICENSE-DINOv3.md`). No weights are committed.
+its backbone weights are under the DINOv3 License (`weights/LICENSE-DINOv3.md`). No weights are committed, served
+or bundled: users fetch `flexglue.pth` themselves.
 `cli/stb_image.h` is public domain / MIT and is used only by the CLI.

@@ -90,6 +90,7 @@ endif()
 add_library(jmt
   src/core/api.cpp
   src/core/weights.cpp
+  src/core/checkpoint.cpp
   src/models/flexglue/flexglue.cpp
   src/backend/cpu/cpu_ops.cpp)
 target_include_directories(jmt PUBLIC include PRIVATE src)
@@ -211,6 +212,14 @@ if(JMT_BUILD_TESTS)
   add_executable(ops_test tests/ops_test.cpp)
   target_include_directories(ops_test PRIVATE src)
   target_link_libraries(ops_test PRIVATE jmt)
+  # flexglue.pth read by the library against the file tools/export_weights.py made from it.
+  add_executable(checkpoint_test tests/checkpoint_test.cpp)
+  target_include_directories(checkpoint_test PRIVATE src)
+  target_link_libraries(checkpoint_test PRIVATE jmt)
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/flexglue.pth" AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/weights/flexglue.jmtw")
+    add_test(NAME checkpoint COMMAND checkpoint_test "${CMAKE_CURRENT_SOURCE_DIR}/third_party/flexglue.pth"
+                                                     "${CMAKE_CURRENT_SOURCE_DIR}/weights/flexglue.jmtw")
+  endif()
   add_executable(ops_bench tests/ops_bench.cpp)  # timings of single operations, not a test
   target_include_directories(ops_bench PRIVATE src)
   target_link_libraries(ops_bench PRIVATE jmt)

@@ -21,15 +21,26 @@ struct Param {
   }
 };
 
+// A float32 tensor with its own storage, for Weights::from_tensors.
+struct OwnedTensor {
+  std::string name;
+  std::vector<int> shape;
+  std::vector<float> data;
+};
+
 class Weights {
  public:
-  // Both throw std::runtime_error on malformed input. The blob is copied.
+  // Both throw std::runtime_error on malformed input. The blob is copied. Besides the container, both read
+  // FlexGlue's PyTorch checkpoint (flexglue.pth, see checkpoint.h).
   static Weights from_memory(const void* data, size_t size);
   static Weights from_file(const std::string& path);
+  // Takes the tensors over.
+  static Weights from_tensors(std::map<std::string, std::string> meta, std::vector<OwnedTensor> tensors);
 
   const Param& get(const std::string& name) const;       // throws if missing
   const Param* find(const std::string& name) const;      // nullptr if missing
   const std::string& meta(const std::string& key) const; // throws if missing
+  std::vector<std::string> names() const;                 // every tensor, sorted
   int meta_int(const std::string& key) const;
 
  private:
