@@ -266,6 +266,14 @@ reference for recall, before any C++ is written for them.
 - [ ] **M9 — LightGlue**: ALIKED descriptors from just-keypoints matched by LightGlue, so the library runs with
   weights it can ship; FlexGlue stays the option for doppelganger rejection, with the user's own weights.
   First check the licence of LightGlue's ALIKED weights and that nothing in them comes from DINO.
+  Licence checked (2026-11-16): cvg/LightGlue says its code and pre-trained weights are Apache-2.0; ALIKED
+  is BSD-3-Clause. LightGlue reads only keypoints and descriptors, so no DINO is involved. There are two
+  checkpoints for 128-dim ALIKED descriptors, both
+  in release `v0.1_arxiv`: `aliked_lightglue.pth` (ALIKED keypoints, 47.6 MB) and `raco_aliked_lightglue.pth`
+  (RaCo keypoints described by ALIKED, added 2026-02-17, sha256 `a804c3fe...6312`). just-keypoints already
+  gives both inputs: `aliked-n16`, or `raco` with `descriptor = aliked-n16`, the normalization of
+  cvg/LightGlue's ALIKED. Both state dicts hold only the matcher, 11.88 M values in FP32. Step 1 is done:
+  the reference and golden files on the 6 pairs, for both models. See "M9 plan" and "Notes from M9".
 
 ### Covisibility track (parallel, like the RaCo track in just-keypoints)
 
@@ -988,3 +996,123 @@ The first pass first; the second pass, at the end, replaced its products and att
   engine unchanged; the paper's ablation shows doppelganger rejection comes mostly from matching data with
   flipped and non-overlapping negatives (AUROC 97.0 / 95.3 / 88.5 on DG / ViSym / LaMAR without labelled pairs,
   98.4 / 95.9 / 88.8 with). Not pursued for now.
+
+## M9 plan (LightGlue)
+
+Source: https://github.com/cvg/LightGlue, pinned at `eb42fee` (2026-02-18, "Add raco-aliked weights"). Weights
+from release `v0.1_arxiv`, Apache-2.0 like the code, so they can be built into the library (with a NOTICE).
+
+### What LightGlue is, next to FlexGlue
+
+The transformer is FlexGlue's with fewer parts: FlexGlue took its blocks from LightGlue and added the q, k
+and message norms. Everything else LightGlue needs is already in `Ops`.
+
+- **Input:** keypoints and their 128-dim ALIKED descriptors, nothing from the image. The tokens are the
+  keypoints, so the two images can have different counts (FlexGlue always has 2 x 4096 grid tokens).
+  Keypoints are normalized by the image size (centre, then divided by half the longer side), so the
+  features must keep the width and height.
+- **Graph:** linear 128 -> 256. Learnable Fourier encoding (linear 2 -> 32, then cos and sin) used as rotary
+  encoding in self-attention. 9 layers of self-attention then cross-attention, width 256, 4 heads of 64.
+  FFN on `[x, message]`: 512 -> 512, LayerNorm, GELU, -> 256, plus the residual. No other norms.
+- **Head:** `final_proj` 256 -> 256, similarity scaled by 256^-0.5, log-softmax over rows plus over columns,
+  plus log-sigmoid of each point's matchability (linear 256 -> 1). A match is a mutual argmax with
+  exp(score) > 0.1. There is no predicted position for unmatched points and no covisibility score.
+- **Adaptive depth:** after every layer but the last, a linear 256 -> 1 (sigmoid) gives each point a
+  confidence. The pass stops when more than 95 % of the points are above
+  0.8 + 0.1 exp(-4 k / 9).
+- **Adaptive width:** points that are confident and unmatchable (matchability < 0.01) are dropped before
+  the next layer, so the token count changes during the pass. Upstream turns this off below 1024 keypoints
+  on CUDA.
+- **Size and cost:** about 11.8 M values (47 MB FP32, 24 MB FP16). Per pair at 2048 + 2048 keypoints,
+  about 13 G multiply-adds per layer and 115 G for all 9, with no backbone (estimate). FlexGlue needs
+  1000 G for its transformer.
+
+### API (proposed)
+
+- `jmt_config.model`: `"flexglue"` (default, as now), `"lightglue-aliked"` or `"lightglue-raco-aliked"`.
+  The LightGlue models use their built-in weights when no weights are given.
+- `jmt_features* jmt_describe_keypoints(ctx, width, height, xy, desc, n, dim)` makes an image's features
+  from just-keypoints' output. `jmt_match` then takes the same `xy` (the count must match), so
+  `jmt_match_batch` and the shortlist keep their signatures.
+- `jmt_matches` for LightGlue: `idx` and `score` as now. `a_in_b` / `b_in_a` hold the partner's position
+  for matched points and NaN otherwise. `conf_*` is matchability. `covisibility` is -1 (none).
+  `stop_layer` is the number of layers run.
+- `jmt_match_options`: `depth_confidence` (default 0.95, <= 0 off) and `width_confidence` (default 0.99,
+  <= 0 off) as upstream. `min_covisibility` and `early_stop_decay` do not apply.
+- Covisibility levels 1 and 2 need FlexGlue's dense features. For LightGlue, level 1 could be the mean
+  descriptor (C1's pooling question). Not part of M9.
+
+### Steps
+
+1. **Reference.** Done. `tools/fetch_lightglue.sh` clones cvg/LightGlue at `eb42fee` into
+   `third_party/LightGlue` and fetches both checkpoints by sha256 into `third_party/lightglue-weights/`.
+   `tools/dump_golden_lightglue.sh` writes the golden files for the 6 pairs of M2 and both models. See
+   "Notes from M9".
+2. **Weights.** Read the `.pth` with `checkpoint.cpp` (the same torch zip) and write `.jmtw`. Build them
+   into the library like just-keypoints does (`JMT_EMBED_WEIGHTS`), in FP32 and FP16.
+3. **CPU graph** (`src/models/lightglue/`) at fixed depth. It should match the original to 1e-5 like M2.
+   New code: the double softmax with matchability, and the mutual argmax on the host.
+4. **Adaptivity on CPU:** depth first, then width (compact the tokens and keep the index map).
+5. **GPU backends:** Metal, CUDA, WebGPU in FP32 and FP16. The double softmax gets a kernel; attention
+   already takes unequal lengths. Width pruning on GPU waits until the speed numbers ask for it.
+6. **Demo and docs:** a model choice in the demo. LightGlue needs no weights from the visitor, so it
+   becomes the default there, with ALIKED keypoints (see "RaCo-ALIKED on the Berlin pair"). The docs get a page on choosing between them: FlexGlue for doppelgangers,
+   LightGlue for speed and shippable weights.
+
+## Notes from M9 (LightGlue)
+
+### Reference (step 1)
+
+- **Checkpoints.** Both are matcher-only state dicts with 253 tensors and 11 884 625 values, all FP32. The
+  names already follow `transformers.N.{self,cross}_attn`, so the upstream renaming does nothing.
+  `raco_aliked_lightglue.pth` also stores the `confidence_thresholds` buffer, which equals
+  0.8 + 0.1 exp(-4 k / 9) to float precision. sha256 of `aliked_lightglue.pth`: `d975e965...2503`. It is
+  not published upstream; this hash is the file as downloaded on 2026-11-16.
+- **No new packages.** `lightglue/lightglue.py` is loaded as a lone file. The package's `__init__` imports
+  the extractors, which need kornia; the matcher itself needs only torch. The model is built with
+  `features=None, input_dim=128, flash=False` and loaded with a strict check: nothing missing but the
+  buffer, nothing unexpected.
+- **Inputs.** Keypoints and descriptors come from the jkp CLI at top-k 2048 (cached in `build/keypoints`
+  as `<image>.aliked.2048.jkpt` and `<image>.raco-aliked.2048.jkpt`). `image_size` is the original image's
+  (W, H). The coordinates are just-keypoints' as they are: upstream ALIKED uses the same convention, (0,0)
+  at the centre of the top-left pixel. Upstream resizes images to 1024 px on the longer side before ALIKED.
+  The test images are 960 to 1100 px, so their descriptors come from nearly the same scale.
+- **Golden files** (`build/golden/lightglue-<model>/<A>-<B>.jmtt`, 63 MB each, not committed): inputs, the
+  encoding, the tokens after the input projection and after every layer, the last log assignment and
+  matchability, and the matches at fixed depth. A second run with upstream's defaults (depth 0.95,
+  width 0.99) gives the stop layer, the pruned points and the matches.
+
+  | Pair | ALIKED fixed / adaptive (stop) | RaCo-ALIKED fixed / adaptive (stop) |
+  |---|---|---|
+  | berlin1-berlin2 | 237 / 219 (7) | 2 / 18 (1) |
+  | lamar 1446-1450 | 348 / 348 (7) | 334 / 332 (9) |
+  | berlin1-lamar 1446 (different places) | 18 / 39 (4) | 0 / 16 (2) |
+  | berlin1 h1-h2 (homography) | 1367 / 1373 (2) | 1206 / 1245 (4) |
+  | lamar 1446 h1-h2 (homography) | 1449 / 1442 (2) | 1512 / 1490 (4) |
+  | berlin2 h1 - lamar 1450 h2 (different places) | 38 / 29 (4) | 1 / 13 (3) |
+
+- **RaCo-ALIKED on the Berlin pair (checked).** RaCo-ALIKED finds 2 matches on the Berlin pair; ALIKED
+  finds 237, and 185 of those are inliers to a fundamental matrix (MAGSAC, 1 px). This is not a bug in our
+  inputs: RaCo-ALIKED does as well as ALIKED on LaMAR (257 inliers against 296). The cause has three parts:
+  - **The checkpoint.** Swapping keypoints and checkpoints (matches / inliers, 2048 keypoints):
+
+    | Keypoints | ALIKED checkpoint | RaCo-ALIKED checkpoint |
+    |---|---|---|
+    | ALIKED | 237 / 185 | 8 / 7 |
+    | RaCo | 47 / 20 | 2 / 0 |
+
+    Lowering the threshold to 0.01 adds matches but not inliers (31 at most for the RaCo checkpoint).
+  - **The keypoints.** RaCo puts 67 % of berlin1's keypoints in the bottom third, on snowy hedges that
+    berlin2 does not show. The cathedral, the only shared part, gets 130 points (ALIKED: 264). At 4096
+    RaCo keypoints it gets 331, and the ALIKED checkpoint then finds 83 inliers.
+  - **Scale alone is not enough to break it.** A LaMAR image and berlin2 were matched against copies
+    shrunk by a known factor; correct means within 3 px of the exact position. The RaCo checkpoint on RaCo
+    keypoints stays close to ALIKED down to 0.35x: 1071 against 1072 correct on LaMAR, 772 against 998
+    on berlin2. It falls behind at 0.25x: 570 against 711, and 76 against 545. The Berlin pair is about
+    3x in scale, plus partial overlap, snow and a different light, and that is more than the RaCo
+    checkpoint holds.
+  - **Also:** the RaCo checkpoint is stricter on different places, with 0 matches where ALIKED gives 18
+    and 38. Most of ALIKED's matches there are outliers (9 inliers of 18).
+  - **Consequence:** ALIKED (its keypoints and its checkpoint) is the more robust pair and becomes
+    LightGlue's default, in the library and the demo. RaCo-ALIKED stays an option. FlexGlue in the demo
+    keeps RaCo keypoints.

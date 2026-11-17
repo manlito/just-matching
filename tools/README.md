@@ -6,6 +6,7 @@ They are never a runtime dependency of the library.
 ```sh
 uv venv --python 3.12 .venv && uv pip install --python .venv/bin/python -r tools/requirements.txt
 tools/fetch_upstream.sh                 # original at its pinned commit -> third_party/FlexGlue, flexglue.pth (567 MB)
+tools/fetch_lightglue.sh                # LightGlue at its pinned commit -> third_party/LightGlue, two ALIKED checkpoints (2 x 48 MB)
 cmake -S ../just-keypoints -B ../just-keypoints/build/release -DCMAKE_BUILD_TYPE=Release \
       -DJKP_EMBED_MODELS="aliked-n16;raco" && cmake --build ../just-keypoints/build/release   # keypoints
 A=third_party/FlexGlue/assets
@@ -15,6 +16,7 @@ python tools/compare.py $A/berlin1.jpg $A/berlin2.jpg                       # or
 python tools/compare.py $A/berlin1.jpg $A/berlin2.jpg --layers 3 --size 256
 python tools/compare.py $A/berlin1.jpg $A/berlin2.jpg --a upstream:cpu --b upstream:mps,fp16
 python tools/dump_golden.py $A/berlin1.jpg $A/berlin2.jpg                   # -> build/golden/*.jmtt (not committed)
+tools/dump_golden_lightglue.sh                                              # -> build/golden/lightglue-*/ (6 pairs, both models)
 python tools/compare.py $A/berlin1.jpg $A/berlin2.jpg --b "cmd:build/release/jmt match"   # original vs the C++ library
 python tools/presets.py $A/berlin*.jpg $A/lamar*.jpg --neg $A/lamar_cab_1446.jpg $A/lamar_cab_1450.jpg
 python tools/covis.py SCENE_DIR... --single IMAGE...                        # cheap covisibility scores vs FlexGlue's
@@ -30,6 +32,8 @@ python tools/compare_covis.py IMAGE... --backend metal                      # jm
 | `common.py` | image loading, keypoints from the `jkp` CLI (`$JKP` overrides its path), implementation selection |
 | `compare.py` | compares two implementations (`upstream`, `folded`, or `cmd:<program>` for the `jmt` CLI) on image pairs; `--save DIR` writes both match lists as text for `diff` (see [docs/reproducing.md](../docs/reproducing.md)) |
 | `dump_golden.py` | golden test vectors from the reference pass |
+| `fetch_lightglue.sh` | the original LightGlue at its pinned commit and its two checkpoints for ALIKED descriptors (Apache-2.0), checked by sha256 |
+| `dump_golden_lightglue.py` | golden test vectors from the original LightGlue on just-keypoints' ALIKED or RaCo-ALIKED features: tokens per layer, assignment, matches, and an adaptive run; `dump_golden_lightglue.sh` runs it on the 6 test pairs |
 | `presets.py` | accuracy and time against input size, layer count and precision, on synthetic pairs with exact ground truth |
 | `covis.py` | evaluates the covisibility levels of the plan on folders of images |
 | `compare_covis.py` | levels 1 and 2 of `jmt shortlist` against `covis.py`'s reference, every pair of the images given |
