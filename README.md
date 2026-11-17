@@ -48,19 +48,27 @@ With Emscripten and emdawnwebgpu from the same Dawn release (`tools/fetch_webgpu
 
 ```sh
 emcmake cmake -S . -B build/wasm -DCMAKE_BUILD_TYPE=Release -DJMT_BUILD_CLI=OFF -DJMT_BUILD_TESTS=OFF
-cmake --build build/wasm      # -> build/wasm/web: jmt_wasm.js / .wasm, jmt.js, test.html
+cmake --build build/wasm      # -> build/wasm/web: jmt_wasm.js / .wasm, jmt.js, test.html, demo.html
 ```
 
-`web/jmt.js` wraps the module (`create`, `describe`, `match`); it needs JSPI (Chrome, Edge). The weights are
-served next to it and may be the FP16 file (284 MB instead of 567; widened to float32 on load). The test page
-compares the module with the native CPU backend on the 6 test pairs, without and with early stop
-(`?settings=2,3` runs only the latter):
+`web/jmt.js` wraps the module (`create`, `describe`, `match`, and for covisibility `covisibility`, `level1`,
+`shortlist`); it needs JSPI (Chrome, Edge). The weights are served next to it and may be the FP16 file (284 MB
+instead of 567; widened to float32 on load). The test page compares the module with the native CPU backend on
+the 6 test pairs, without and with early stop (`?settings=2,3` runs only the latter), then the shortlist of
+their 10 images (`?shortlist=0` skips it):
 
 ```sh
 python tools/web_testdata.py --out build/wasm/web/testdata
 ln -s $PWD/weights/flexglue.jmtw build/wasm/web/
 python -m http.server 8765 --directory build/wasm/web      # then open /test.html
 ```
+
+The demo (`demo.html`) takes a set of images (12 samples in `web/samples`, or your own), shows the level-1
+matrix and the shortlist, matches the kept pairs with early stop, and draws the matches of any pair with the
+timings of each step. Its keypoints come from just-keypoints' WebAssembly module (RaCo, best 2048): build
+just-keypoints with Emscripten too and point `JMT_JKP_WEB_DIR` at its `build/wasm/web` (the default is
+`../just-keypoints/build/wasm/web`); the build copies `jkp.js`, its module and `raco.jkpw` into `web/jkp`. It
+loads `flexglue-fp16.jmtw` (and `flexglue.jmtw` for FP32) from next to the page; `?run=1` runs on load.
 
 ## Command line
 

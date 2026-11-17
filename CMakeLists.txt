@@ -153,14 +153,15 @@ if(EMSCRIPTEN AND JMT_BUILD_WASM)
   target_link_libraries(jmt_wasm PRIVATE jmt)
   set_target_properties(jmt_wasm PROPERTIES SUFFIX ".js" RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/web")
   set(jmtw_exports jmtw_backend_available jmtw_create jmtw_describe jmtw_features_free jmtw_finish jmtw_match jmtw_idx
-      jmtw_score jmtw_a_in_b jmtw_b_in_a jmtw_conf_a jmtw_conf_b jmtw_covisibility jmtw_stop_layer jmtw_error jmtw_destroy)
+      jmtw_score jmtw_a_in_b jmtw_b_in_a jmtw_conf_a jmtw_conf_b jmtw_covisibility jmtw_stop_layer jmtw_covisibility_level
+      jmtw_level1_matrix jmtw_shortlist jmtw_pairs_idx jmtw_pairs_score jmtw_error jmtw_destroy)
   list(TRANSFORM jmtw_exports PREPEND "_" OUTPUT_VARIABLE jmtw_exported)
   string(REPLACE ";" "," jmtw_exported "_malloc,_free,${jmtw_exported}")
   target_link_options(jmt_wasm PRIVATE
     -sJSPI
-    "-sJSPI_EXPORTS=jmtw_create,jmtw_describe,jmtw_finish,jmtw_match"
+    "-sJSPI_EXPORTS=jmtw_create,jmtw_describe,jmtw_finish,jmtw_match,jmtw_covisibility_level,jmtw_level1_matrix,jmtw_shortlist"
     "-sEXPORTED_FUNCTIONS=${jmtw_exported}"
-    "-sEXPORTED_RUNTIME_METHODS=HEAPU8,HEAP32,HEAPF32,UTF8ToString"
+    "-sEXPORTED_RUNTIME_METHODS=HEAPU8,HEAP32,HEAPU32,HEAPF32,UTF8ToString"
     -sMODULARIZE
     -sEXPORT_ES6
     -sEXPORT_NAME=createJmt
@@ -168,10 +169,24 @@ if(EMSCRIPTEN AND JMT_BUILD_WASM)
     -sALLOW_MEMORY_GROWTH
     -sMAXIMUM_MEMORY=4GB
     -sSTACK_SIZE=1MB)
-  foreach(f jmt.js test.html)
+  foreach(f jmt.js test.html demo.html demo.js)
     add_custom_command(TARGET jmt_wasm POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
                        "${CMAKE_CURRENT_SOURCE_DIR}/web/${f}" "${CMAKE_CURRENT_BINARY_DIR}/web/${f}")
   endforeach()
+  add_custom_command(TARGET jmt_wasm POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_directory
+                     "${CMAKE_CURRENT_SOURCE_DIR}/web/samples" "${CMAKE_CURRENT_BINARY_DIR}/web/samples")
+  # The demo takes its keypoints from just-keypoints' module: point JMT_JKP_WEB_DIR at the <build>/web of
+  # just-keypoints' Emscripten build (jkp.js, jkp_wasm.js, jkp_wasm.wasm, raco.jkpw), copied to web/jkp.
+  set(JMT_JKP_WEB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../just-keypoints/build/wasm/web" CACHE PATH
+      "just-keypoints' built WebAssembly module, for the demo")
+  if(EXISTS "${JMT_JKP_WEB_DIR}/jkp_wasm.wasm")
+    foreach(f jkp.js jkp_wasm.js jkp_wasm.wasm raco.jkpw)
+      add_custom_command(TARGET jmt_wasm POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                         "${JMT_JKP_WEB_DIR}/${f}" "${CMAKE_CURRENT_BINARY_DIR}/web/jkp/${f}")
+    endforeach()
+  else()
+    message(STATUS "just-keypoints' module not found in JMT_JKP_WEB_DIR (${JMT_JKP_WEB_DIR}): the demo will lack keypoints")
+  endif()
 endif()
 
 if(JMT_BUILD_CLI)

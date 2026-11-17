@@ -1,6 +1,8 @@
 """Test data for the browser test page (web/test.html): the 6 test pairs of tools/compare_all.sh as raw RGBA,
 their keypoints, and the native CPU backend's results on them at 512 px / 9 layers and 384 px / 5 layers, without
-and with early stop (min_covisibility 0.8; decay 0.2 at 512 px, 0 at 384 px: pairs stop after layer 2, 4 or 8).
+and with early stop (min_covisibility 0.8; decay 0.2 at 512 px, 0 at 384 px: pairs stop after layer 2, 4 or 8),
+and the native shortlist of the 10 images at 512 px: the level-1 matrix, the level-2 score of every pair
+(`jmt shortlist --k 9 --rerank`) and the pairs kept with k = 2.
 
     python tools/web_testdata.py --out build/wasm/web/testdata [--jmt build/release/jmt]
 
@@ -29,6 +31,7 @@ S = os.path.join(common.ROOT, "build", "synth")
 PAIRS = [(f"{A}/berlin1.jpg", f"{A}/berlin2.jpg"), (f"{A}/lamar_cab_1446.jpg", f"{A}/lamar_cab_1450.jpg"),
          (f"{A}/berlin1.jpg", f"{A}/lamar_cab_1446.jpg"), (f"{S}/berlin1_h1.png", f"{S}/berlin1_h2.png"),
          (f"{S}/lamar_cab_1446_h1.png", f"{S}/lamar_cab_1446_h2.png"), (f"{S}/berlin2_h1.png", f"{S}/lamar_cab_1450_h2.png")]
+SHORTLIST_K = 2
 # size, layers, min_covisibility, early_stop_decay (< 0: off)
 SETTINGS = [(512, 9, 0.0, -1.0), (384, 5, 0.0, -1.0), (512, 9, 0.8, 0.2), (384, 5, 0.8, 0.0)]
 
@@ -81,8 +84,20 @@ def main():
             stop = f", early stop {decay}: {int(t['stop_layer'][0])} layers" if decay >= 0 else ""
             print(f"{names[0]} - {names[1]}, {size} px, {layers} layers{stop}: {len(t['scores'])} matches", flush=True)
         pairs.append({"a": names[0], "b": names[1], "refs": refs})
+    names = list(images)
+    shortlist = {"images": names, "size": 512, "k": SHORTLIST_K}
+    for key, extra in (("all", ["--k", str(len(names) - 1), "--rerank"]), ("kept", ["--k", str(SHORTLIST_K)])):
+        out = os.path.join(tmp, "shortlist.jmtt")
+        cmd = [args.jmt, "shortlist", *[os.path.join(tmp, n + ".png") for n in names], "--backend", args.backend,
+               "--size", "512", "--out", out, *extra]
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL)
+        _, t = jmtfile.read(out)
+        shortlist[key] = {"pairs": [int(v) for v in t["pairs"].ravel()], "scores": rounded(t["scores"])}
+        shortlist["level1"] = rounded(t["level1"])
+    print(f"shortlist: {len(shortlist['kept']['scores'])} of {len(shortlist['all']['scores'])} pairs kept with k = {SHORTLIST_K}")
     with open(os.path.join(args.out, "manifest.json"), "w") as f:
-        json.dump({"reference": f"native {args.backend} backend", "images": images, "pairs": pairs}, f)
+        json.dump({"reference": f"native {args.backend} backend", "images": images, "pairs": pairs,
+                   "shortlist": shortlist}, f)
     print(f"wrote {args.out}/manifest.json")
 
 

@@ -38,7 +38,7 @@ python tools/compare_covis.py IMAGE... --backend metal                      # jm
 | `bench.sh` | wall time and GPU time per kernel of the `jmt` CLI on the Berlin pair: `tools/bench.sh metal:fp16` (WebGPU: wall time per kernel, a round trip each) |
 | `remote.sh` | runs the `jmt` CLI on another machine over SSH, so `compare.py` can check a backend this machine lacks: `--b "cmd:tools/remote.sh user@host DIR build/release/jmt match --backend cuda"` |
 | `fetch_webgpu.sh` | unpacks the pinned Dawn release (native) and emdawnwebgpu (browser) under `third_party/webgpu` |
-| `web_testdata.py` | the browser test page's data: the 6 test pairs as raw RGBA, their keypoints and the native CPU backend's results |
+| `web_testdata.py` | the browser test page's data: the 6 test pairs as raw RGBA, their keypoints and the native CPU backend's results, and the native shortlist of their 10 images |
 | `bench_onnx.py` | times upstream's ONNX models under ONNX Runtime (`pip install onnxruntime`, or `onnxruntime-gpu` for `--providers cuda`; models from release v0.1 in `third_party/onnx/`) |
 
 Keypoints: just-keypoints returns `(0,0)` at the centre of the top-left pixel, FlexGlue expects it at that

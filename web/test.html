@@ -29,7 +29,9 @@ test pairs at 512 px / 9 layers and 384 px / 5 layers, then again with early sto
 decay 0.2 and 0), and compares each result with the native CPU backend on the same pixels and keypoints
 (testdata/). FP32 must give the same matches, predicted points of confident queries within 0.01 px and
 covisibility within 1e-4; in FP16 at most 3 matches, or 10 % of them, may differ (present on one side only).
-With early stop, both precisions must also stop after the same layer.</p>
+With early stop, both precisions must also stop after the same layer. Then the shortlist of the 10 images at
+512 px against the native one: the level-1 matrix within 1e-4 (1e-3 in FP16), the level-2 score of every pair
+within 4 of 512 grid points (8 in FP16), and in FP32 the same pairs kept with k = 2.</p>
 <p id="status">Loading…</p>
 <p id="adapter"></p>
 <div class="wrap" id="tables"></div>
@@ -145,6 +147,59 @@ async function run() {
           `<td>${ms(r.tMatch)}</td><td class="${r.ok ? 'ok' : 'bad'}">${r.ok ? 'ok' : 'FAIL'}</td></tr>`).join('');
       tables.append(title, table);
     }
+  }
+  if (manifest.shortlist && params.get('shortlist') !== '0') {
+    const ref = manifest.shortlist, n = ref.images.length;
+    const key = (p, i) => `${p[2 * i]},${p[2 * i + 1]}`;
+    const refAll = new Map(ref.all.scores.map((s, i) => [key(ref.all.pairs, i), s]));
+    const refKept = new Set(ref.kept.scores.map((_, i) => key(ref.kept.pairs, i)));
+    const rows = [];
+    for (const precision of precisions) {
+      status.textContent = `WebGPU ${precision}: shortlist of ${n} images…`;
+      const matcher = await jmt.create({ weights, precision, inputSize: ref.size });
+      const features = [];
+      for (const name of ref.images) features.push(await matcher.describe(images[name]));
+      let t = performance.now();
+      const level1 = await matcher.level1(features);
+      const tLevel1 = performance.now() - t;
+      let d1 = 0;
+      for (let i = 0; i < n * n; i++) d1 = Math.max(d1, Math.abs(level1[i] - ref.level1[i]));
+      t = performance.now();
+      const all = await matcher.shortlist(features, { k: n - 1, rerank: true });
+      const tRerank = performance.now() - t;
+      let d2 = 0, missing = 0;
+      for (let i = 0; i < all.n; i++) {
+        const r = refAll.get(key(all.pairs, i));
+        if (r === undefined) missing++;
+        else d2 = Math.max(d2, Math.abs(all.scores[i] - r));
+      }
+      missing += refAll.size - all.n;
+      const kept = await matcher.shortlist(features, { k: ref.k });
+      let sharedKept = 0;
+      for (let i = 0; i < kept.n; i++) sharedKept += refKept.has(key(kept.pairs, i));
+      const sameKept = kept.n === refKept.size && sharedKept === kept.n;
+      // also through covisibility(): one pair at each level against the matrix and the reranked scores
+      const one1 = await matcher.covisibility(features[0], features[1], 1), one2 = await matcher.covisibility(features[0], features[1], 2);
+      const dOne = Math.max(Math.abs(one1 - level1[1]), Math.abs(one2 - refAll.get('0,1')));
+      for (const f of features) f.destroy();
+      matcher.destroy();
+      const fp16 = precision === 'fp16';
+      const ok = d1 <= (fp16 ? 1e-3 : 1e-4) && d2 <= (fp16 ? 8 : 4) / 512 && !missing && dOne <= (fp16 ? 8 : 4) / 512 &&
+                 (fp16 || sameKept);
+      summary.ok &&= ok;
+      rows.push({ precision, ok, d1, d2, d2Points: d2 * 512, missing, kept: kept.n, keptRef: refKept.size, sharedKept, tLevel1,
+                  tRerank: tRerank / all.n });
+    }
+    summary.shortlist = rows;
+    const title = document.createElement('h2');
+    title.textContent = `Shortlist, ${n} images at ${ref.size} px (${n * (n - 1) / 2} pairs; k = ${ref.k})`;
+    const table = document.createElement('table');
+    table.innerHTML = '<tr><th>precision</th><th>level 1</th><th>level 2 (points of 512)</th><th>pairs missing</th>' +
+      `<th>kept with k = ${ref.k} / native</th><th>shared</th><th>level 1, all pairs (ms)</th><th>level 2 (ms per pair)</th><th></th></tr>` +
+      rows.map(r => `<tr><td>${r.precision}</td><td>${fmt(r.d1)}</td><td>${r.d2Points.toFixed(0)}</td><td>${r.missing}</td>` +
+        `<td>${r.kept} / ${r.keptRef}</td><td>${r.sharedKept}</td><td>${r.tLevel1.toFixed(1)}</td><td>${r.tRerank.toFixed(1)}</td>` +
+        `<td class="${r.ok ? 'ok' : 'bad'}">${r.ok ? 'ok' : 'FAIL'}</td></tr>`).join('');
+    tables.append(title, table);
   }
   status.textContent = summary.ok ? 'All runs agree with the native results.' : 'Some runs differ from the native results.';
   status.className = summary.ok ? 'ok' : 'bad';
