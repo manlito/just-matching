@@ -176,10 +176,15 @@ if(EMSCRIPTEN AND JMT_BUILD_WASM)
   endforeach()
   add_custom_command(TARGET jmt_wasm POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_directory
                      "${CMAKE_CURRENT_SOURCE_DIR}/web/samples" "${CMAKE_CURRENT_BINARY_DIR}/web/samples")
-  # The demo takes its keypoints from just-keypoints' module: point JMT_JKP_WEB_DIR at the <build>/web of
-  # just-keypoints' Emscripten build (jkp.js, jkp_wasm.js, jkp_wasm.wasm, raco.jkpw), copied to web/jkp.
-  set(JMT_JKP_WEB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../just-keypoints/build/wasm/web" CACHE PATH
-      "just-keypoints' built WebAssembly module, for the demo")
+  # The demo takes its keypoints from just-keypoints' module (jkp.js, jkp_wasm.js, jkp_wasm.wasm, raco.jkpw),
+  # copied to web/jkp: by default the one tools/fetch_jkp_web.sh puts in third_party/jkp-web, else the <build>/web
+  # of a just-keypoints checkout next to this one; or point JMT_JKP_WEB_DIR at another.
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/jkp-web/jkp_wasm.wasm")
+    set(jmt_jkp_default "${CMAKE_CURRENT_SOURCE_DIR}/third_party/jkp-web")
+  else()
+    set(jmt_jkp_default "${CMAKE_CURRENT_SOURCE_DIR}/../just-keypoints/build/wasm/web")
+  endif()
+  set(JMT_JKP_WEB_DIR "${jmt_jkp_default}" CACHE PATH "just-keypoints' built WebAssembly module, for the demo")
   if(EXISTS "${JMT_JKP_WEB_DIR}/jkp_wasm.wasm")
     foreach(f jkp.js jkp_wasm.js jkp_wasm.wasm raco.jkpw)
       add_custom_command(TARGET jmt_wasm POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different

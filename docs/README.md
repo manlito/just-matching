@@ -18,8 +18,8 @@ not part of the site.
 uv venv --python 3.12 docs/.venv && uv pip install --python docs/.venv/bin/python -r docs/requirements.txt
 ```
 
-With a browser build in `build/wasm` that has just-keypoints' module (README.md, "In the browser"; build
-just-keypoints with Emscripten and point `JMT_JKP_WEB_DIR` at its `build/wasm/web`):
+With a browser build in `build/wasm` that has just-keypoints' module (README.md, "In the browser";
+`tools/fetch_jkp_web.sh` downloads the module before the build):
 
 ```bash
 docs/.venv/bin/sphinx-build -W --keep-going -b html docs docs/_build/html
@@ -40,8 +40,9 @@ gh workflow run docs                    # build the modules and the site
 gh workflow run docs -f deploy=true     # the same, then publish to Cloudflare Pages
 ```
 
-It builds just-keypoints' module from that repository, which is private: the repository secret
-`JKP_REPO_TOKEN` is a token that can read it (a fine-grained token with "Contents: read" on just-keypoints).
+It takes just-keypoints' module from just-keypoints' site (`tools/fetch_jkp_web.sh`, pinned by sha256), so it
+needs no access to that repository. When just-keypoints deploys a new module, the hashes stop matching and the
+build fails until they are updated (see the script).
 
 Deploying needs the repository secrets `CLOUDFLARE_API_TOKEN` (permission "Cloudflare Pages: Edit") and
 `CLOUDFLARE_ACCOUNT_ID`, and a Pages project made for direct upload, named by the repository variable

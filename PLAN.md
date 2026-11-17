@@ -258,9 +258,9 @@ reference for recall, before any C++ is written for them.
   the native CPU backend. Documentation site done (`docs/`, Sphinx and just-keypoints' theme; 10 pages; the
   demo as `demo/`; `.github/workflows/docs.yml`, by hand, deploys to Cloudflare Pages). The demo takes the
   weights from the user: a Load weights button or a drop of `flexglue.pth` (or a `.jmtw`), kept in the origin
-  private file system until Forget. Open: deploying (secrets `JKP_REPO_TOKEN`, `CLOUDFLARE_*` and a Pages
-  project), and a stated licence for the Berlin and LaMAR samples before anything is published. See "Notes from
-  M7: documentation site and the weights".
+  private file system until Forget. Open: deploying (secrets `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID`, and a
+  Pages project), and a stated licence for the Berlin and LaMAR samples before
+  anything is published. See "Notes from M7: documentation site and the weights".
 - [ ] **M8 — v1.0**: CMake package, npm package.
 - [ ] **M9 — LightGlue**: ALIKED descriptors from just-keypoints matched by LightGlue, so the library runs with
   weights it can ship; FlexGlue stays the option for doppelganger rejection, with the user's own weights.
@@ -974,6 +974,9 @@ The first pass first; the second pass, at the end, replaced its products and att
   0.8 s; the sample run then gives what the `.jmtw` gave (26 of 66 pairs shortlisted, 11 rejected, 2 stopped
   early) in FP16 and in FP32. `?weights=URL` fetches instead, for testing. `jmt.fetchWeights` also reads a
   manifest of parts, for anyone who hosts their own copy behind a 25 MiB file limit (Cloudflare Pages).
+- **just-keypoints' module** comes from its site (`tools/fetch_jkp_web.sh`, four files pinned by sha256; on
+  2026-11-16 byte-identical to a build of just-keypoints' main), so the workflow needs no token for the private
+  repository. A new deployment there fails the check until the hashes are updated.
 - **The site** is 5 MB: pages, the two modules and the sample images. Rule: no PLAN.md, milestones or links to
   the private repository on any page.
 - **Without DINO, what was looked at** (2026-11-16): nobody has published FlexGlue on another backbone; the

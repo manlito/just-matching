@@ -68,9 +68,10 @@ python -m http.server 8765 --directory build/wasm/web      # then open /test.htm
 
 The demo (`demo.html`) takes a set of images (12 samples in `web/samples`, or your own), shows the level-1
 matrix and the shortlist, matches the kept pairs with early stop, and draws the matches of any pair with the
-timings of each step. Its keypoints come from just-keypoints' WebAssembly module (RaCo, best 2048): build
-just-keypoints with Emscripten too and point `JMT_JKP_WEB_DIR` at its `build/wasm/web` (the default is
-`../just-keypoints/build/wasm/web`); the build copies `jkp.js`, its module and `raco.jkpw` into `web/jkp`. The
+timings of each step. Its keypoints come from just-keypoints' WebAssembly module (RaCo, best 2048):
+`tools/fetch_jkp_web.sh` downloads it from just-keypoints' site, pinned by sha256, into `third_party/jkp-web`, or
+point `JMT_JKP_WEB_DIR` at the `build/wasm/web` of your own just-keypoints build; the build copies `jkp.js`, its
+module and `raco.jkpw` into `web/jkp`. The
 page never fetches FlexGlue's weights on its own: the user loads `flexglue.pth` with its button or a drop, and it
 keeps the file in the origin private file system (Forget deletes it). For testing, `?weights=URL` fetches them
 instead; `?run=1` runs on load when weights are at hand. The documentation site serves this page; see
