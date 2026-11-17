@@ -147,6 +147,9 @@ void jmt_match_options_default(jmt_match_options* o) {
   o->max_distance_px = d.max_distance_px;
   o->min_covisibility = d.min_covisibility;
   o->early_stop_decay = d.early_stop_decay;
+  const jmt::LightGlue::Options l;
+  o->depth_confidence = l.depth_confidence;
+  o->width_confidence = l.width_confidence;
 }
 
 int jmt_backend_available(jmt_backend backend) {
@@ -258,7 +261,10 @@ int jmt_match_batch(jmt_ctx* ctx, const jmt_pair* pairs, int n_pairs, const jmt_
     if (static_cast<int>(ctx->results.size()) < n_pairs) ctx->results.resize(n_pairs);
     if (ctx->lightglue) {
       jmt::LightGlue::Options lo;
-      if (options) lo.n_layers = options->n_layers, lo.filter_threshold = options->filter_threshold;
+      if (options) {
+        lo.n_layers = options->n_layers, lo.filter_threshold = options->filter_threshold;
+        lo.depth_confidence = options->depth_confidence, lo.width_confidence = options->width_confidence;
+      }
       for (int i = 0; i < n_pairs; ++i) {
         const jmt_pair& p = pairs[i];
         if (!p.a->keypoints || !p.b->keypoints) throw std::runtime_error("features not made by jmt_describe_keypoints");

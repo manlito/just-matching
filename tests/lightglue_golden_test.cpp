@@ -72,7 +72,8 @@ std::vector<float> read(const jmt::TensorPtr& t) {
 }
 
 // Matches: passes when the matched sets agree but for a few pairs whose score sits at the threshold or
-// whose two best partners are nearly tied (allowed: 1 % of the golden matches, at least 2).
+// whose two best partners are nearly tied (allowed: 1 % of the golden matches, at least 2). Scores are
+// probabilities; they pass within 2e-4 (the tokens differ from the original's by about 1e-4 of their size).
 void check_matches(const std::string& name, const std::vector<int>& got, const std::vector<float>& got_scores,
                    const jmt::Param& ref, const jmt::Param& ref_scores, double score_tol) {
   size_t n_ref = 0, n_got = 0, same = 0;
@@ -154,6 +155,7 @@ int main(int argc, char** argv) {
     jmt::LightGlue::Options options;
     options.n_layers = golden.meta_int("layers");
     options.filter_threshold = std::stof(golden.meta("filter_threshold"));
+    options.depth_confidence = options.width_confidence = -1;  // fixed depth, every keypoint
     jmt::LightGlue::Result out;
     model.match(*ops, im[0], im[1], options, &out, [&](const std::string& name, const jmt::TensorPtr& t) {
       const std::vector<float> orig = name == "max0" ? max0_ref : name == "max1" ? max1_ref : values(golden.get("pair." + name));
@@ -164,9 +166,35 @@ int main(int argc, char** argv) {
     check_exact("pair.matchability1", out.matchability1, values(golden.get("pair.matchability1")),
                 values(golden.get("pair.fp64.matchability1")), loose);
     check_matches("out.matches0", out.matches0, out.scores0, golden.get("out.matches0"),
-                  golden.get("out.matching_scores0"), 1e-4 * loose);
+                  golden.get("out.matching_scores0"), 2e-4 * loose);
     check_matches("out.matches1", out.matches1, out.scores1, golden.get("out.matches1"),
-                  golden.get("out.matching_scores1"), 1e-4 * loose);
+                  golden.get("out.matching_scores1"), 2e-4 * loose);
+
+    // Adaptive depth and width with upstream's defaults: the same stop layer, the same points dropped after
+    // the same layers (but for a few whose confidence or matchability sits at a threshold), the same matches.
+    jmt::LightGlue::Options adaptive;
+    adaptive.filter_threshold = options.filter_threshold;
+    jmt::LightGlue::Result ad;
+    model.match(*ops, im[0], im[1], adaptive, &ad);
+    const int stop_ref = static_cast<int>(golden.get("adaptive.stop").data[0]);
+    const bool stop_ok = ad.stop_layer == stop_ref;
+    std::printf("%-22s %s  %d layers, golden %d\n", "adaptive.stop", stop_ok ? "ok  " : "FAIL", ad.stop_layer, stop_ref);
+    g_failed += !stop_ok;
+    for (int s = 0; s < 2; ++s) {
+      const std::vector<int>& got = s ? ad.layers1 : ad.layers0;
+      const jmt::Param& ref = golden.get(s ? "adaptive.prune1" : "adaptive.prune0");
+      size_t differ = 0, dropped = 0;
+      for (size_t k = 0; k < got.size(); ++k) {
+        differ += got[k] != static_cast<int>(ref.data[k]);
+        dropped += static_cast<int>(ref.data[k]) < stop_ref;
+      }
+      const bool ok = got.size() == ref.size() && differ <= std::max<size_t>(2, got.size() / 200);
+      std::printf("%-22s %s  %zu of %zu keypoints differ (golden drops %zu)\n", s ? "adaptive.prune1" : "adaptive.prune0",
+                  ok ? "ok  " : "FAIL", differ, got.size(), dropped);
+      g_failed += !ok;
+    }
+    check_matches("adaptive.matches0", ad.matches0, ad.scores0, golden.get("adaptive.matches0"),
+                  golden.get("adaptive.matching_scores0"), 2e-4 * loose);
   } catch (const std::exception& e) {
     std::fprintf(stderr, "error: %s\n", e.what());
     return 1;

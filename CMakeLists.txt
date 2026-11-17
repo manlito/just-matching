@@ -295,8 +295,8 @@ if(JMT_BUILD_TESTS)
       endforeach()
     endif()
   endforeach()
-  # The C API end to end through the CLI, with the built-in weights: the original's 237 matches on the Berlin
-  # pair (keypoints cached by tools/dump_golden_lightglue.py).
+  # The C API end to end through the CLI, with the built-in weights and upstream's adaptive defaults: the
+  # original's 219 matches after 7 layers on the Berlin pair (keypoints cached by tools/dump_golden_lightglue.py).
   set(berlin_kpts "${CMAKE_CURRENT_SOURCE_DIR}/build/keypoints/berlin1.jpg.aliked.2048.jkpt"
                   "${CMAKE_CURRENT_SOURCE_DIR}/build/keypoints/berlin2.jpg.aliked.2048.jkpt")
   list(GET berlin_kpts 0 berlin_a)
@@ -305,7 +305,7 @@ if(JMT_BUILD_TESTS)
      AND EXISTS "${berlin_b}")
     add_test(NAME lightglue_cli_builtin
              COMMAND jmt_cli match --model lightglue-aliked --weights builtin --kpts-a "${berlin_a}" --kpts-b "${berlin_b}")
-    set_tests_properties(lightglue_cli_builtin PROPERTIES PASS_REGULAR_EXPRESSION "^237 matches from 2048 and 2048")
+    set_tests_properties(lightglue_cli_builtin PROPERTIES PASS_REGULAR_EXPRESSION "^219 matches from 2048 and 2048 keypoints, 7 layers")
   endif()
   # Golden files and the weights file are generated locally:
   #   python tools/export_weights.py && python tools/dump_golden.py A B

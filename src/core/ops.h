@@ -68,6 +68,9 @@ class Ops {
   // Rotary encoding as above, with cos and sin as tensors (1 x n x pairs) made for one image's keypoints.
   // Unlike the vector form, nothing may be cached by address: the tables change with every image.
   virtual TensorPtr rotary_keypoints(const TensorPtr& x, const TensorPtr& cos, const TensorPtr& sin, int heads);
+  // The rows (tokens) of x at the given indices, in that order: 1 x rows.size() x c. LightGlue drops points
+  // between layers with it.
+  virtual TensorPtr gather_rows(const TensorPtr& x, const std::vector<int>& rows);
   // LightGlue's match assignment. a: 1 x M x d, b: 1 x N x d (the final projections of the two images'
   // tokens); za: 1 x M x 1, zb: 1 x N x 1 (matchability logits). With s = a b^T / sqrt(d):
   //   score(i, j) = log_softmax over j of s + log_softmax over i of s + logsigmoid(za_i) + logsigmoid(zb_j).

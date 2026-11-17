@@ -313,6 +313,16 @@ class CpuOps : public Ops {
     return out;
   }
 
+  TensorPtr gather_rows(const TensorPtr& xp, const std::vector<int>& rows) override {
+    const CpuTensor& x = cpu(xp);
+    auto out = make(1, static_cast<int>(rows.size()), x.c);
+    for (size_t r = 0; r < rows.size(); ++r) {
+      if (rows[r] < 0 || rows[r] >= x.n()) throw std::runtime_error("gather_rows: index out of range");
+      std::memcpy(out->row(static_cast<int>(r)), x.row(rows[r]), x.c * sizeof(float));
+    }
+    return out;
+  }
+
   void assignment(const TensorPtr& ap, const TensorPtr& bp, const TensorPtr& zap, const TensorPtr& zbp,
                   std::vector<int>* best0, std::vector<float>* max0, std::vector<int>* best1,
                   std::vector<float>* max1) override {

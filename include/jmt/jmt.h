@@ -66,9 +66,15 @@ typedef struct {
                              does; the pair then gets no matches and stop_layer = k. Lower stops earlier:
                              0.2 stopped 85 % of the pairs of different scenes and no pair that passes at
                              full depth (PLAN.md, Notes from C3). Needs min_covisibility > 0. Default -1 (off) */
+  /* LightGlue only, as upstream: */
+  float depth_confidence; /* after each layer but the last, stop when more than this share of the keypoints
+                             are confident. Default 0.95; <= 0: run every layer */
+  float width_confidence; /* drop confident keypoints whose matchability is at most 1 - this before the next
+                             layer (they stay unmatched). Default 0.99; <= 0: keep every keypoint */
 } jmt_match_options;
 
-/* LightGlue uses n_layers (1..9) and filter_threshold; the other fields are FlexGlue's.
+/* LightGlue uses n_layers (1..9), filter_threshold, depth_confidence and width_confidence; FlexGlue uses the
+   others.
    Keypoint coordinates, in and out, follow just-keypoints: pixels of the original image, x right / y down,
    (0,0) = centre of the top-left pixel. Arrays are owned by the context and stay valid until the next
    jmt_match, jmt_match_batch or jmt_destroy on it. */

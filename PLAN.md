@@ -272,10 +272,10 @@ reference for recall, before any C++ is written for them.
   in release `v0.1_arxiv`: `aliked_lightglue.pth` (ALIKED keypoints, 47.6 MB) and `raco_aliked_lightglue.pth`
   (RaCo keypoints described by ALIKED, added 2026-02-17, sha256 `a804c3fe...6312`). just-keypoints already
   gives both inputs: `aliked-n16`, or `raco` with `descriptor = aliked-n16`, the normalization of
-  cvg/LightGlue's ALIKED. Both state dicts hold only the matcher, 11.88 M values in FP32. Steps 1 to 3
+  cvg/LightGlue's ALIKED. Both state dicts hold only the matcher, 11.88 M values in FP32. Steps 1 to 4
   are done: the reference and golden files on the 6 pairs for both models; the weights read, exported and
   built in; the graph on the CPU, with the original's matches on all 12 golden files, and the C API and
-  `jmt match --model`. See "M9 plan" and "Notes from M9".
+  `jmt match --model`; adaptive depth and width, which stop and drop exactly where the original does. See "M9 plan" and "Notes from M9".
 
 ### Covisibility track (parallel, like the RaCo track in just-keypoints)
 
@@ -1029,7 +1029,7 @@ and message norms. Everything else LightGlue needs is already in `Ops`.
   about 13 G multiply-adds per layer and 115 G for all 9, with no backbone (estimate). FlexGlue needs
   1000 G for its transformer.
 
-### API (as built in step 3; the adaptivity options come with step 4)
+### API (as built in steps 3 and 4)
 
 - `jmt_config.model`: `"flexglue"`, `"lightglue-aliked"` or `"lightglue-raco-aliked"`, or NULL (default):
   the model of the weights given. A LightGlue model with no weights given uses the built-in ones and fails
@@ -1043,7 +1043,8 @@ and message norms. Everything else LightGlue needs is already in `Ops`.
   for matched points and NaN otherwise. `conf_*` is matchability. `covisibility` is -1 (none).
   `stop_layer` is the number of layers run.
 - `jmt_match_options`: `depth_confidence` (default 0.95, <= 0 off) and `width_confidence` (default 0.99,
-  <= 0 off) as upstream. `min_covisibility` and `early_stop_decay` do not apply.
+  <= 0 off) as upstream; FlexGlue ignores them. `max_distance_px`, `min_covisibility` and
+  `early_stop_decay` do not apply to LightGlue. CLI: `--depth-confidence`, `--width-confidence`.
 - Covisibility levels 1 and 2 need FlexGlue's dense features. For LightGlue, level 1 could be the mean
   descriptor (C1's pooling question). Not part of M9.
 
@@ -1058,7 +1059,8 @@ and message norms. Everything else LightGlue needs is already in `Ops`.
    the `.jmtw` files into it, FP32 only. See "Notes from M9", Weights.
 3. **CPU graph** (`src/models/lightglue/`) at fixed depth. Done: the original's matches on all 12 golden
    files. The 1e-5 bar of M2 does not hold for LightGlue, even for the original: see "Notes from M9", CPU graph.
-4. **Adaptivity on CPU:** depth first, then width (compact the tokens and keep the index map).
+4. **Adaptivity on CPU:** depth first, then width (compact the tokens and keep the index map). Done, on by
+   default as upstream: see "Notes from M9", Adaptive depth and width.
 5. **GPU backends:** Metal, CUDA, WebGPU in FP32 and FP16. The double softmax gets a kernel; attention
    already takes unequal lengths. Width pruning on GPU waits until the speed numbers ask for it.
 6. **Demo and docs:** a model choice in the demo. LightGlue needs no weights from the visitor, so it
@@ -1197,3 +1199,37 @@ and message norms. Everything else LightGlue needs is already in `Ops`.
   hand: 237 and 334 matches with the `.jmtw`, the built-in and the `.pth` weights.
 - **Not done:** the WebAssembly module builds (393 KB, up from the 302 KB `docs/install.md` gives) but has
   no `describe_keypoints` yet; the docs site describes FlexGlue only. Both are step 6.
+
+### Adaptive depth and width (step 4)
+
+- **As upstream's `_forward`.** After every layer but the last:
+  - **Depth:** each kept keypoint's confidence is sigmoid(`token_confidence.i`). The pass stops when
+    1 - (unconfident kept points) / (all keypoints of both images) > `depth_confidence`; dropped points count
+    as confident. The head of that layer then matches.
+  - **Width:** a keypoint is kept when its matchability (`log_assignment.i`) is above 1 - `width_confidence`,
+    or its confidence is at or below the layer's threshold, so unconfident points are never dropped.
+  - The kept tokens and their rotary tables are gathered (`Ops::gather_rows`, a new operation with a host
+    form; the CPU copies rows). The matches of the kept points map back to the original indices.
+  - The thresholds are upstream's float32 buffer, 0.8 + 0.1 exp(-4 i / 9), and the comparisons are done in
+    float32 as upstream's.
+  - Unlike CUDA, upstream drops points on the CPU at any count. So does the library on every backend:
+    there is no minimum.
+- **Exactly the original's decisions** on all 12 golden files (`adaptive.*`): the same stop layer (1 to 9
+  layers), the same layer for every one of the 2 x 2048 keypoints (up to 1683 dropped on one image), and the
+  same matches. Scores are within 1.1e-4; the score bar is now 2e-4 for both runs, because the tokens
+  differ from the original's by about 1e-4 of their size.
+- **CPU, M5 Pro, ALIKED, 2048 + 2048 keypoints, `jmt match --runs 3`:**
+
+  | Pair | Fixed depth | Adaptive (defaults) |
+  |---|---|---|
+  | berlin1-berlin2 | 972 ms, 237 matches | 416 ms, 219 matches, 7 layers |
+  | lamar 1446-1450 | 1018 ms, 348 matches | 614 ms, 348 matches, 7 layers |
+  | berlin1-lamar 1446 (different places) | 1283 ms, 18 matches | 457 ms, 39 matches, 4 layers |
+
+  As upstream, stopping early on different places gives more spurious matches (39 against 18). They are
+  outliers, as in the inlier check of step 1.
+- **Each layer reads back** two vectors per image (confidence, matchability) to decide, as FlexGlue's early
+  stop does. On a GPU that is a round trip per layer, and the gather goes through the host until a
+  backend has its own (step 5).
+- **The CLI test** (`lightglue_cli_builtin`) now expects upstream's default result: 219 matches after 7
+  layers on the Berlin pair.

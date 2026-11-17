@@ -50,6 +50,10 @@ void usage() {
                "  --max-px D             maximum transfer error in network-input pixels (default 3; 0 = off)\n"
                "  --min-covisibility S   reject pairs scoring below S (default 0 = off)\n"
                "  --early-stop D         stop early on non-covisible pairs, decay D in [0,1) (default off)\n"
+               "  --depth-confidence C   LightGlue: stop when more than C of the keypoints are confident\n"
+               "                         (default 0.95; 0 = every layer)\n"
+               "  --width-confidence C   LightGlue: drop confident keypoints with matchability <= 1 - C\n"
+               "                         (default 0.99; 0 = keep all)\n"
                "  --threads N            CPU threads (default all)\n"
                "  --dump-features        also write the dense features to OUT\n"
                "  --runs N               repeat N times and report the fastest run (default 1)\n"
@@ -262,6 +266,8 @@ int main(int argc, char** argv) {
       else if (a == "--max-px") options.max_distance_px = std::stof(value());
       else if (a == "--min-covisibility") options.min_covisibility = std::stof(value());
       else if (a == "--early-stop") options.early_stop_decay = std::stof(value());
+      else if (a == "--depth-confidence") options.depth_confidence = std::stof(value());
+      else if (a == "--width-confidence") options.width_confidence = std::stof(value());
       else if (a == "--threads") config.num_threads = std::stoi(value());
       else if (a == "--dump-features") dump_features = true;
       else if (a.rfind("--", 0) == 0) throw std::runtime_error("unknown option " + a);
