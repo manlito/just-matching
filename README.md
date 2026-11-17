@@ -72,8 +72,9 @@ timings of each step. Its keypoints come from just-keypoints' WebAssembly module
 `tools/fetch_jkp_web.sh` downloads it from just-keypoints' site, pinned by sha256, into `third_party/jkp-web`, or
 point `JMT_JKP_WEB_DIR` at the `build/wasm/web` of your own just-keypoints build; the build copies `jkp.js`, its
 module and `raco.jkpw` into `web/jkp`. The
-page never fetches FlexGlue's weights on its own: the user loads `flexglue.pth` with its button or a drop, and it
-keeps the file in the origin private file system (Forget deletes it). For testing, `?weights=URL` fetches them
+page never fetches FlexGlue's weights on its own: it links to FlexGlue's release, the user loads `flexglue.pth`
+with its button or a drop, and the file is kept in the origin private file system only when they tick "Keep in
+this browser" (unticking deletes it). For testing, `?weights=URL` fetches them
 instead; `?run=1` runs on load when weights are at hand. The documentation site serves this page; see
 [docs/README.md](docs/README.md).
 

@@ -8,7 +8,7 @@ Cloudflare's `_headers`.
 
 The site never serves FlexGlue's weights: the backbone is under Meta's DINOv3 License, and each user has to accept
 it by fetching `flexglue.pth` from FlexGlue's release themselves. The demo takes the file from a button or a drop,
-and keeps it in the browser's origin private file system.
+and keeps it in the browser's origin private file system only when the user ticks "Keep in this browser".
 
 Rule for every page: what visitors read carries no references to the project's notes (PLAN.md, milestones,
 commit hashes) and no links to the repository, which is private. `reproducing.md` is for the repository and is

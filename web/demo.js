@@ -4,8 +4,9 @@
 //
 // Where things are: next to the page by default (the build's web/ folder); the documentation site sets other
 // places in <script type="application/json" id="demo-config">: lib (jmt.js and its module), jkp, samples.
-// FlexGlue's weights are never served by the page: the visitor loads flexglue.pth (or a .jmtw file) from their
-// own disk, and the page keeps it in the browser's private file system for the next visit. URL parameters:
+// FlexGlue's weights are never served by the page: the visitor downloads flexglue.pth from FlexGlue's release and
+// loads it (or a .jmtw file) from their own disk; the page keeps it in the browser's private file system for the
+// next visit only when the visitor ticks "Keep in this browser". URL parameters:
 // run=1 runs once the sample set is loaded (and weights are at hand); weights=URL fetches the weights instead
 // (a .pth or .jmtw file, or a parts manifest), for local testing; jkp=DIR for just-keypoints' module and
 // raco.jkpw.
@@ -213,11 +214,40 @@ async function storedDir() {
 
 function showWeights(note) {
   const w = state.weights, el = $('weights-status');
-  $('weights-forget').hidden = !w?.stored;
+  $('weights-keep').checked = !!w?.stored;
+  $('weights-keep').disabled = !!w?.url;
   $('weights-panel').classList.toggle('need', !w);
   el.classList.toggle('ok', !!w);
-  el.textContent = w ? `${w.name}, ${(w.size / 1e6).toFixed(0)} MB${w.stored ? ', kept in this browser' : ''}.${note ? ' ' + note : ''}`
-                     : note || 'Not loaded. You can also drop the file on this page.';
+  el.textContent = w ? `Loaded: ${w.name}${w.size ? `, ${(w.size / 1e6).toFixed(0)} MB` : ''}${w.stored ? ', kept in this browser' : ''}.` +
+                       (note ? ' ' + note : '')
+                     : note || 'Not loaded.';
+}
+
+// Copies the loaded file into the private file system; false when this browser cannot keep it.
+async function storeWeights() {
+  const w = state.weights, dir = await storedDir();
+  try {
+    if (!dir || !w?.blob) throw new Error('no storage');
+    const handle = await dir.getFileHandle(STORED, { create: true });
+    const out = await handle.createWritable();
+    await out.write(w.blob);
+    await out.close();
+    localStorage.setItem(STORED, JSON.stringify({ name: w.name, size: w.size }));
+    w.stored = true;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function unstoreWeights() {
+  try {
+    await (await storedDir())?.removeEntry(STORED);
+  } catch { /* nothing stored */ }
+  try {
+    localStorage.removeItem(STORED);
+  } catch { /* storage blocked */ }
+  if (state.weights) state.weights.stored = false;
 }
 
 async function useWeightsFile(file) {
@@ -227,23 +257,30 @@ async function useWeightsFile(file) {
     showWeights(`${file.name} is not a FlexGlue weights file (flexglue.pth or .jmtw).`);
     return;
   }
+  const keep = $('weights-keep').checked;
   dropMatcher();
+  await unstoreWeights();   // a copy of an earlier file is stale now
   state.weights = { name: file.name, size: file.size, blob: file, stored: false };
-  showWeights('Keeping a copy in this browser…');
-  const dir = await storedDir();
-  try {
-    if (!dir) throw new Error('no storage');
-    const handle = await dir.getFileHandle(STORED, { create: true });
-    const out = await handle.createWritable();
-    await out.write(file);
-    await out.close();
-    localStorage.setItem(STORED, JSON.stringify({ name: file.name, size: file.size }));
-    state.weights.stored = true;
-    showWeights();
-  } catch {
-    showWeights('Not kept: load it again on your next visit.');
-  }
+  if (keep) {
+    showWeights('Keeping a copy in this browser…');
+    showWeights((await storeWeights()) ? '' : 'This browser cannot keep it: load it again next visit.');
+  } else showWeights();
   setStatus(state.images.length >= 2 ? `${state.images.length} images. Press Run.` : 'Add at least two images.');
+}
+
+// "Keep in this browser" ticked or unticked once a file is loaded.
+async function keepWeights(keep) {
+  if (!state.weights || state.weights.url) return;
+  if (state.busy) {
+    $('weights-keep').checked = !keep;
+    return;
+  }
+  if (!keep) {
+    await unstoreWeights();
+    return showWeights();
+  }
+  showWeights('Keeping a copy in this browser…');
+  showWeights((await storeWeights()) ? '' : 'This browser cannot keep it.');
 }
 
 async function restoreWeights() {
@@ -263,19 +300,6 @@ async function restoreWeights() {
     state.weights = null;
   }
   showWeights();
-}
-
-async function forgetWeights() {
-  if (state.busy) return;
-  dropMatcher();
-  state.weights = null;
-  try {
-    await (await storedDir())?.removeEntry(STORED);
-  } catch { /* nothing stored */ }
-  try {
-    localStorage.removeItem(STORED);
-  } catch { /* storage blocked */ }
-  showWeights('Forgotten.');
 }
 
 function dropMatcher() {
@@ -348,8 +372,7 @@ async function run() {
     return null;
   }
   if (!state.weights) {
-    showWeights();
-    setStatus("Load FlexGlue's weights first (left).", true);
+    askForWeights();
     return null;
   }
   state.busy = true;
@@ -381,11 +404,11 @@ async function run() {
     t.keypoints = median(state.images.map(im => im.tKp));
     t.describe = median(state.images.map(im => im.tDescribe));
     const feats = state.images.map(im => im.feat);
-    setStatus('Covisibility: level 1 of every pair…');
+    setStatus('Similarity of every pair…');
     let t0 = performance.now();
     state.level1 = await state.matcher.level1(feats);
     t.level1 = performance.now() - t0;
-    setStatus(s.rerank ? 'Shortlist, re-ranked with level 2…' : 'Shortlist…');
+    setStatus('Picking the pairs to match…');
     t0 = performance.now();
     state.shortlist = { ...(await state.matcher.shortlist(feats, { k: s.k, neighbours: s.neighbours, rerank: s.rerank })), rerank: s.rerank };
     t.shortlist = performance.now() - t0;
@@ -423,9 +446,8 @@ async function run() {
     }
     if (best || m) select(...(best ?? [state.shortlist.pairs[0], state.shortlist.pairs[1]]));
     const rejected = results.filter(r => r.checked && r.covisibility < MIN_COVISIBILITY).length;
-    setStatus(`${m} of ${n * (n - 1) / 2} pairs shortlisted` +
-              (s.early != null ? `; ${rejected} rejected by FlexGlue (${stopped.length} stopped early)` : '') +
-              `. ${(t.total / 1000).toFixed(1)} s in all.`);
+    setStatus(`Matched ${m} of ${n * (n - 1) / 2} pairs in ${(t.total / 1000).toFixed(1)} s` +
+              (s.early != null ? `: ${m - rejected} same place, ${rejected} different places.` : '.'));
     return { n, pairs: m, rejected, stopped: stopped.length, timings: t };
   } catch (e) {
     setProgress(null);
@@ -438,17 +460,29 @@ async function run() {
   }
 }
 
+// Run without weights: say so next to the button and point at the weights panel.
+function askForWeights() {
+  showWeights();
+  setStatus("FlexGlue's weights are needed first: download them, then load them.", true);
+  const panel = $('weights-panel');
+  panel.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  panel.classList.remove('flash');
+  void panel.offsetWidth;   // restart the animation
+  panel.classList.add('flash');
+  $('weights-open').focus({ preventScroll: true });
+}
+
 // A pair picked in the matrix or the table: shown, and matched first when it has no result yet.
 async function select(i, j) {
   if (i > j) [i, j] = [j, i];
   state.selected = [i, j];
   renderPairs();
   if (!state.results.has(pairKey(i, j)) && state.matcher && state.images[i]?.feat && state.images[j]?.feat) {
-    if (state.busy) return;
+    if (state.busy) return renderPair();
     state.busy = true;
     $('run').disabled = true;
     try {
-      setStatus(`Matching ${i + 1} – ${j + 1} (not shortlisted)…`);
+      setStatus(`Matching ${i + 1} – ${j + 1} (not picked)…`);
       await matchPair(i, j, JSON.parse(state.resultKey));
       setStatus(`Matched ${state.images[i].name} – ${state.images[j].name}.`);
       renderMatrix();
@@ -464,11 +498,14 @@ async function select(i, j) {
 
 // ---- rendering
 
+// FlexGlue's verdict on a pair: same place (matched), or different places (no matches; most stop early, which
+// only saves time).
 function verdict(r) {
   if (!r) return '';
-  if (!r.checked) return '<span class="tag">not checked</span>';
-  if (r.covisibility >= MIN_COVISIBILITY) return '<span class="tag pass">matched</span>';
-  return r.stopLayer < r.layers ? `<span class="tag stop">stopped after ${r.stopLayer}</span>` : '<span class="tag stop">rejected</span>';
+  if (!r.checked) return '<span class="tag" title="Early stop is off: FlexGlue keeps the matches of every pair">not checked</span>';
+  if (r.covisibility >= MIN_COVISIBILITY) return '<span class="tag pass" title="FlexGlue judges that the images show the same place">same place</span>';
+  const how = r.stopLayer < r.layers ? `stopped after ${r.stopLayer} of ${r.layers} layers, which saves time` : `after all ${r.layers} layers`;
+  return `<span class="tag" title="FlexGlue judges that the images show different places (${how}), so the pair gets no matches">different places</span>`;
 }
 
 function level2Of(i, j) {
@@ -510,8 +547,8 @@ function renderTimings() {
     ['Matcher created (weights converted and uploaded to the GPU)', t.create],
     ['Keypoints, per image', t.keypoints],
     ['Features (describe), per image', t.describe],
-    [`Level 1, all ${t.n * (t.n - 1) / 2} pairs`, t.level1],
-    [t.rerank ? `Shortlist with level 2 (${t.nShort} pairs)` : 'Shortlist', t.shortlist],
+    [`Similarity, all ${t.n * (t.n - 1) / 2} pairs`, t.level1],
+    [t.rerank ? `Picking pairs, with re-rank (${t.nShort} picked)` : `Picking pairs (${t.nShort})`, t.shortlist],
     [`Match, all layers (${t.nFull} pairs)`, t.matchFull],
     [`Match, stopped early (${t.nStop} pairs)`, t.matchStop],
     ['This run, in all', t.total],
@@ -521,14 +558,16 @@ function renderTimings() {
 
 function renderMatrix() {
   const svg = $('matrix'), n = state.images.length, L = state.level1;
-  $('legend').hidden = !L;
+  $('legend').hidden = $('matrix-hint').hidden = !L;
   if (!L || n < 2) {
     svg.setAttribute('viewBox', '0 0 10 10');
     svg.setAttribute('width', 0);
     svg.innerHTML = '';
     return;
   }
-  const cell = Math.max(10, Math.min(32, Math.floor(420 / n))), pad = 22, size = pad + n * cell;
+  // Each pair once: row i (images 1 to n - 1), column j > i (images 2 to n).
+  const cell = Math.max(10, Math.min(32, Math.floor(420 / (n - 1)))), pad = 22, size = pad + (n - 1) * cell;
+  const X = j => pad + (j - 1) * cell, Y = i => pad + i * cell;
   let lo = Infinity, hi = -Infinity;
   for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) if (i !== j) lo = Math.min(lo, L[i * n + j]), hi = Math.max(hi, L[i * n + j]);
   const span = hi - lo || 1;
@@ -537,18 +576,18 @@ function renderMatrix() {
   if (sl) for (let p = 0; p < sl.n; p++) kept.add(pairKey(sl.pairs[2 * p], sl.pairs[2 * p + 1]));
   const out = [];
   const every = cell >= 16 ? 1 : Math.ceil(16 / cell);
-  for (let i = 0; i < n; i++) {
-    if (i % every === 0) {
-      out.push(`<text x="${pad + i * cell + cell / 2}" y="${pad - 8}" text-anchor="middle">${i + 1}</text>`);
-      out.push(`<text x="${pad - 6}" y="${pad + i * cell + cell / 2 + 3.5}" text-anchor="end">${i + 1}</text>`);
+  for (let k = 0; k < n - 1; k++) {
+    if (k % every === 0) {
+      out.push(`<text x="${X(k + 1) + cell / 2}" y="${pad - 8}" text-anchor="middle">${k + 2}</text>`);
+      out.push(`<text x="${pad - 6}" y="${Y(k) + cell / 2 + 3.5}" text-anchor="end">${k + 1}</text>`);
     }
   }
   const gap = cell >= 14 ? 2 : 1, marks = [];
   for (let i = 0; i < n; i++) {
-    for (let j = 0; j < n; j++) {
-      const x = pad + j * cell, y = pad + i * cell;
-      const fill = i === j ? css('--empty') : rampColor((L[i * n + j] - lo) / span);
-      if (i !== j && kept.has(pairKey(i, j))) marks.push([x + cell / 2, y + cell / 2, contrastInk(fill)]);
+    for (let j = i + 1; j < n; j++) {
+      const x = X(j), y = Y(i);
+      const fill = rampColor((L[i * n + j] - lo) / span);
+      if (kept.has(pairKey(i, j))) marks.push([x + cell / 2, y + cell / 2, contrastInk(fill)]);
       out.push(`<rect class="cell" data-i="${i}" data-j="${j}" x="${x + gap / 2}" y="${y + gap / 2}" width="${cell - gap}" ` +
                `height="${cell - gap}" rx="2" fill="${fill}"/>`);
     }
@@ -557,10 +596,8 @@ function renderMatrix() {
   for (const [x, y, ink] of marks) out.push(`<circle cx="${x}" cy="${y}" r="${radius}" fill="${ink}" pointer-events="none"/>`);
   if (state.selected) {
     const [i, j] = state.selected;
-    for (const [r, c] of [[i, j], [j, i]]) {
-      out.push(`<rect x="${pad + c * cell - 1}" y="${pad + r * cell - 1}" width="${cell + 2}" height="${cell + 2}" rx="3" ` +
-               `fill="none" stroke="${css('--accent')}" stroke-width="2" pointer-events="none"/>`);
-    }
+    out.push(`<rect x="${X(j) - 1}" y="${Y(i) - 1}" width="${cell + 2}" height="${cell + 2}" rx="3" ` +
+             `fill="none" stroke="${css('--accent')}" stroke-width="2" pointer-events="none"/>`);
   }
   svg.setAttribute('viewBox', `0 0 ${size + 2} ${size + 2}`);
   svg.setAttribute('width', size + 2);
@@ -578,11 +615,14 @@ function tipHtml(i, j) {
   if (sl) for (let p = 0; p < sl.n; p++) if (sl.pairs[2 * p] === a && sl.pairs[2 * p + 1] === b) rank = p;
   const r = state.results.get(pairKey(a, b));
   const lines = [`<b>${a + 1} ${state.images[a].name} – ${b + 1} ${state.images[b].name}</b>`,
-                 `level 1 <b>${fmt3(state.level1[a * n + b])}</b>` + (rank >= 0 ? `, shortlisted #${rank + 1}` : ', <span class="m">not shortlisted</span>')];
+                 `similarity <b>${fmt3(state.level1[a * n + b])}</b>` + (rank >= 0 ? `, picked #${rank + 1}` : ', <span class="m">not picked</span>')];
   const l2 = level2Of(a, b);
-  if (Number.isFinite(l2)) lines.push(`level 2 <b>${fmt3(l2)}</b>`);
-  if (r) lines.push(`level 3 <b>${fmt3(r.covisibility)}</b> after ${r.stopLayer} of ${r.layers} layers, ${r.n} matches`);
-  else lines.push('<span class="m">click to match</span>');
+  if (Number.isFinite(l2)) lines.push(`re-rank <b>${fmt3(l2)}</b>`);
+  if (r) {
+    const same = !r.checked || r.covisibility >= MIN_COVISIBILITY;
+    lines.push(`overlap <b>${fmt3(r.covisibility)}</b>: ` + (same ? `<b>${r.n}</b> matches` :
+               `different places${r.stopLayer < r.layers ? `, stopped after ${r.stopLayer} of ${r.layers} layers` : ''}`));
+  } else lines.push('<span class="m">click to match</span>');
   return lines.join('<br>');
 }
 
@@ -618,7 +658,7 @@ function renderPair() {
   const width = canvas.parentElement.clientWidth - 32;
   const dpr = devicePixelRatio || 1;
   if (!sel || !r) {
-    stats.innerHTML = '<div class="stat"><div class="k">Pick a pair in the shortlist.</div></div>';
+    stats.innerHTML = `<div class="stat"><div class="k">${sel ? 'Matched once the run is over.' : state.shortlist ? 'Click a pair in the grid or the table.' : 'Press Run, then click a pair.'}</div></div>`;
     canvas.width = Math.round(width * dpr);
     canvas.height = Math.round(120 * dpr);
     canvas.style.height = '120px';
@@ -629,10 +669,10 @@ function renderPair() {
   const n = state.images.length;
   const l2 = level2Of(i, j);
   const stat = (k, v) => `<div class="stat"><div class="v">${v}</div><div class="k">${k}</div></div>`;
-  stats.innerHTML = stat('pair', `${i + 1} – ${j + 1}`) + stat('matches', r.n) + stat('level 1', fmt3(state.level1[i * n + j])) +
-    (Number.isFinite(l2) ? stat('level 2', fmt3(l2)) : '') + stat('level 3 (FlexGlue)', fmt3(r.covisibility)) +
-    stat('layers run', `${r.stopLayer} / ${r.layers}`) + stat('match time', `${fmtMs(r.ms)} ms`) +
-    `<div class="stat"><div class="v" style="font-size:14px;padding-top:4px">${verdict(r) || '–'}</div><div class="k">verdict</div></div>`;
+  stats.innerHTML = `<div class="stat"><div class="v" style="font-size:14px;padding-top:4px">${verdict(r) || '–'}</div><div class="k">verdict</div></div>` +
+    stat(`${A.name} – ${B.name}`, `${i + 1} – ${j + 1}`) + stat('matches', r.n) +
+    stat('similarity', fmt3(state.level1[i * n + j])) + (Number.isFinite(l2) ? stat('re-rank', fmt3(l2)) : '') +
+    stat('overlap', fmt3(r.covisibility)) + stat('layers run', `${r.stopLayer} / ${r.layers}`) + stat('match time', `${fmtMs(r.ms)} ms`);
   const aA = A.bitmap.width / A.bitmap.height, aB = B.bitmap.width / B.bitmap.height, gap = 8;
   const stacked = aA >= 1.5 && aB >= 1.5;
   let rectA, rectB, height;
@@ -726,6 +766,7 @@ async function init() {
     f16.disabled = true;
     document.querySelector('input[name=precision][value=fp32]').checked = true;
     $('precision-hint').textContent = 'This GPU has no shader-f16: FP32 only.';
+    $('precision-hint').hidden = false;
   }
 
   $('weights-open').addEventListener('click', () => !state.busy && $('weights-file').click());
@@ -733,7 +774,7 @@ async function init() {
     if (e.target.files[0]) await useWeightsFile(e.target.files[0]);
     e.target.value = '';
   });
-  $('weights-forget').addEventListener('click', forgetWeights);
+  $('weights-keep').addEventListener('change', e => keepWeights(e.target.checked));
   await restoreWeights();
 
   $('samples').addEventListener('click', () => !state.busy && loadSamples());
@@ -772,7 +813,7 @@ async function init() {
   wireMatrix();
   renderPair();
   await loadSamples();
-  if (!state.weights) setStatus("Load FlexGlue's weights to run (left).");
+  if (!state.weights) setStatus("FlexGlue's weights are needed to run: download them, then load them.");
   if (params.get('run') === '1' && state.weights) await run();
 }
 

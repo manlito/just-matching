@@ -23,7 +23,8 @@ a.destroy(); b.destroy(); matcher.destroy();
 Serve `jmt.js`, `jmt_wasm.js` and `jmt_wasm.wasm` as static files; nothing runs on a server. The weights come from
 the user: FlexGlue's backbone is under Meta's DINOv3 License ([Licences](licences.md)), so a page should not serve
 them. <a href="demo/index.html">The live demo</a> asks for `flexglue.pth` with a button or a drop, reads it in the
-browser, and keeps a copy in the origin's private file system for the next visit.
+browser, and keeps a copy in the origin's private file system for the next visit only when the visitor ticks
+"Keep in this browser".
 
 The module converts the checkpoint while it creates the matcher. Meanwhile memory holds the file and the converted
 weights: about 1.2 GB for the 567 MB checkpoint.

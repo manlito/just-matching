@@ -31,6 +31,7 @@
     --cell-gap: #1c1c1f; --kept: #f2f2f7; --empty: #2a2a2d;
   }
   * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
   body { background: var(--bg); color: var(--fg); font: 14px/1.45 system-ui, -apple-system, sans-serif; margin: 0; }
   main { max-width: 1320px; margin: 0 auto; padding: 24px 16px 48px; }
   h1 { font-size: 22px; margin: 0 0 6px; }
@@ -45,13 +46,15 @@
   .field > .label, .field > label.label { display: block; color: var(--muted); font-size: 12.5px; margin-bottom: 4px; }
   .hint { color: var(--faint); font-size: 12.5px; margin: 4px 0 0; }
   .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
-  button, select, input[type=number] {
+  button, select, input[type=number], a.button {
     font: inherit; color: var(--fg); background: var(--panel); border: 1px solid var(--line); border-radius: 7px; padding: 5px 10px;
   }
   input[type=number] { width: 72px; }
   select { max-width: 100%; }
   #timings td.l { white-space: normal; }
   button { cursor: pointer; }
+  a.button { display: inline-block; text-decoration: none; line-height: inherit; }
+  a.button:hover { border-color: var(--faint); }
   button:hover:not(:disabled) { border-color: var(--faint); }
   button:disabled { opacity: 0.5; cursor: default; }
   button.primary { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); font-weight: 600; padding: 7px 16px; }
@@ -71,8 +74,15 @@
   .drop { border: 1.5px dashed var(--line); border-radius: 8px; padding: 10px; text-align: center; color: var(--faint); font-size: 12.5px; }
   .drop.over { border-color: var(--accent); color: var(--accent); }
   #weights-panel.need { border-color: var(--accent); }
+  #weights-panel.flash { animation: flash 1.2s ease-out 2; }
+  @keyframes flash { 0%, 40% { box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 45%, transparent); } 100% { box-shadow: none; } }
+  .label[title], th[title], h2[title], .legend [title] { cursor: help; text-decoration: underline dotted var(--faint); text-underline-offset: 3px; }
   #weights-status.ok { color: var(--ok); }
   .banner { border-radius: 8px; padding: 10px 12px; margin: 0 0 16px; border: 1px solid var(--warn); color: var(--fg); }
+  .runbar { position: sticky; top: 0; z-index: 5; display: flex; gap: 12px; align-items: center; flex-wrap: wrap;
+            background: var(--bg); padding: 10px 0; margin: 0 0 6px; }
+  .runbar #status { flex: 1 1 240px; min-width: 0; }
+  .runbar progress { flex: 0 1 220px; width: 220px; }
   #status { font-weight: 600; min-height: 1.45em; }
   #status.bad { color: var(--bad); }
   progress { width: 100%; height: 6px; accent-color: var(--accent); }
@@ -85,7 +95,6 @@
   tbody tr.sel { background: color-mix(in srgb, var(--accent) 16%, transparent); }
   .tag { font-size: 12px; padding: 1px 6px; border-radius: 10px; border: 1px solid var(--line); color: var(--muted); }
   .tag.pass { color: var(--ok); border-color: var(--ok); }
-  .tag.stop { color: var(--bad); border-color: var(--bad); }
   .scroll { overflow-x: auto; }
   .covis { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 16px; align-items: start; }
   @media (max-width: 1100px) { .covis { grid-template-columns: minmax(0, 1fr); } }
@@ -105,59 +114,61 @@
   .stat .k { color: var(--muted); font-size: 12px; }
   footer { color: var(--faint); font-size: 12px; margin-top: 24px; max-width: 100ch; }
   footer a { color: inherit; }
-  .panel a { color: var(--accent); }
+  .panel a:not(.button) { color: var(--accent); }
 </style>
 </head>
 <body>
 <!-- site:header -->
 <main id="content">
   <h1>just-matching demo</h1>
-  <p class="lede">FlexGlue in this page on your GPU, through WebGPU. Each image is described once; the covisibility
-  levels then pick the pairs worth matching (level 1: the images' mean feature vectors, level 2: a coarse grid through
-  the first matching head), and FlexGlue matches those pairs, stopping early on pairs it judges to show different
-  places (level 3). Keypoints come from just-keypoints (RaCo, best 2048 per image). Nothing is uploaded: images and
-  weights stay in your browser.</p>
+  <p class="lede">Finds which images show the same place and matches them with FlexGlue, on your GPU.
+  Nothing is uploaded.</p>
 
   <div class="banner" id="banner" hidden></div>
+
+  <div class="runbar">
+    <button type="button" class="primary" id="run">Run</button>
+    <div id="status" role="status">Loading…</div>
+    <progress id="progress" max="1" value="0" hidden></progress>
+  </div>
 
   <div class="layout">
     <div>
       <section class="panel" id="weights-panel" aria-labelledby="h-weights">
         <h2 id="h-weights">FlexGlue weights</h2>
-        <p class="hint" style="margin-top:0">FlexGlue's backbone is Meta's DINOv3, under the
-        <a href="https://github.com/cvg/FlexGlue/blob/main/DINOv3_LICENSE.md" target="_blank" rel="noopener">DINOv3 License</a>,
-        so this page does not serve the weights. Download <code>flexglue.pth</code> (567 MB) from
-        <a href="https://github.com/cvg/FlexGlue/releases/tag/v0.1" target="_blank" rel="noopener">FlexGlue's release</a>
-        yourself, then load it here; a <code>.jmtw</code> file works too.</p>
         <div class="row">
-          <button type="button" id="weights-open">Load weights…</button>
-          <button type="button" id="weights-forget" hidden>Forget</button>
+          <a class="button" id="weights-download" href="https://github.com/cvg/FlexGlue/releases/download/v0.1/flexglue.pth"
+             title="flexglue.pth, 567 MB, from FlexGlue's release on GitHub, to your disk">1. Download</a>
+          <button type="button" id="weights-open" title="flexglue.pth or a .jmtw file. You can also drop it on the page.">2. Load…</button>
         </div>
+        <label class="check" style="margin-top:8px" title="Saves the 567 MB file in this browser's storage, so the next visit does not ask for it. Untick to delete it."><input type="checkbox" id="weights-keep"> Keep in this browser</label>
+        <p class="hint" id="weights-status">Not loaded.</p>
+        <p class="hint">Not hosted by this page: the weights are under the
+        <a href="https://github.com/cvg/FlexGlue/blob/main/DINOv3_LICENSE.md" target="_blank" rel="noopener">DINOv3 License</a>.</p>
         <input type="file" id="weights-file" accept=".pth,.jmtw" hidden>
-        <p class="hint" id="weights-status">Not loaded. You can also drop the file on this page.</p>
       </section>
 
       <section class="panel" aria-labelledby="h-images">
         <h2 id="h-images">Images</h2>
         <div class="row">
-          <button type="button" id="samples">Sample set</button>
+          <button type="button" id="samples" title="Four indoor frames (TUM) and eight street frames (KITTI): consecutive frames, a corner passed twice, and two different streets that look alike">Sample set</button>
           <button type="button" id="open">Add images…</button>
           <button type="button" id="clear">Clear</button>
         </div>
         <input type="file" id="file" accept="image/*" multiple hidden>
         <div class="thumbs" id="thumbs"></div>
-        <div class="drop" id="drop">Or drop images here. Order matters for "neighbours".</div>
+        <div class="drop" id="drop" title="Order matters: each image is also paired with the next ones (see Settings)">Or drop images here.</div>
       </section>
 
       <section class="panel" aria-labelledby="h-settings">
         <h2 id="h-settings">Settings</h2>
         <div class="field">
-          <span class="label">Precision</span>
+          <span class="label" title="Both run from the same weights file">Precision</span>
           <div class="seg" role="radiogroup" aria-label="Precision">
             <label><input type="radio" name="precision" value="fp16" checked>FP16</label>
             <label><input type="radio" name="precision" value="fp32">FP32</label>
           </div>
-          <p class="hint" id="precision-hint">Both run from the same weights file.</p>
+          <p class="hint" id="precision-hint" hidden></p>
         </div>
         <div class="field">
           <span class="label">Network input and depth</span>
@@ -167,73 +178,65 @@
           </div>
         </div>
         <div class="field">
-          <span class="label">Shortlist</span>
+          <span class="label">Pairs to match</span>
           <div class="row">
-            <label class="check">k <input type="number" id="k" min="1" max="50" value="3"></label>
-            <label class="check">neighbours <input type="number" id="neighbours" min="0" max="10" value="1"></label>
+            <label class="check" title="Each image is paired with its k most similar images. A pair is matched when either image picks it.">best <input type="number" id="k" min="1" max="50" value="3"></label>
+            <label class="check" title="Each image is also paired with this many images after it, in the order given (the sample set is in capture order).">next <input type="number" id="neighbours" min="0" max="10" value="1"></label>
           </div>
-          <label class="check" style="margin-top:6px"><input type="checkbox" id="rerank" checked> Re-rank with level 2</label>
-          <p class="hint">Every image keeps its k best partners by level 1; a pair is kept when either image keeps it.
-          Neighbours also keep the next images in the order given (the sample set is in capture order).</p>
+          <label class="check" style="margin-top:6px" title="Level 2: re-orders the picked pairs by a finer similarity, computed on a coarse grid through FlexGlue's first layer"><input type="checkbox" id="rerank" checked> Re-rank</label>
         </div>
         <div class="field">
-          <label class="label" for="early">Early stop (level 3)</label>
+          <label class="label" for="early" title="Level 3: after each layer from 2 on, FlexGlue estimates how much the two images overlap. A pair below 0.8 × (1 − decay)^(9 − layer) is judged to show different places: it stops there and gets no matches.">Early stop</label>
           <select id="early">
-            <option value="0.5" selected>Minimum covisibility 0.8, decay 0.5</option>
-            <option value="0.2">Minimum covisibility 0.8, decay 0.2 (stops earlier)</option>
+            <option value="0.5" selected>On</option>
+            <option value="0.2">On, stops sooner</option>
             <option value="off">Off: every pair runs all layers</option>
           </select>
-          <p class="hint">After each layer from 2 on, a pair whose covisibility is below 0.8 &times; (1 &minus; decay)<sup>9 &minus; layer</sup>
-          stops and gets no matches.</p>
         </div>
-        <button type="button" class="primary" id="run">Run</button>
       </section>
 
       <section class="panel" aria-labelledby="h-time">
-        <h2 id="h-time">Timings</h2>
+        <h2 id="h-time" title="Medians. The first image and the first pair also compile the GPU kernels; loading the modules and weights is counted once.">Timings</h2>
         <table id="timings"><tbody><tr><td class="l">Not run yet.</td></tr></tbody></table>
-        <p class="hint">Medians; the first image and the first pair also compile the kernels. Weights and module
-        loading are counted once.</p>
+        <p class="hint" id="adapter"></p>
       </section>
     </div>
 
     <div>
-      <section class="panel">
-        <div id="status" role="status">Loading…</div>
-        <progress id="progress" max="1" value="0" hidden></progress>
-        <p class="hint" id="adapter"></p>
-      </section>
-
       <section class="panel" aria-labelledby="h-covis">
-        <h2 id="h-covis">Shortlist</h2>
+        <h2 id="h-covis">Pairs</h2>
         <div class="covis">
           <div>
-            <svg id="matrix" role="img" aria-label="Level-1 covisibility of every pair of images; shortlisted pairs marked with a dot"></svg>
+            <svg id="matrix" role="img" aria-label="Similarity of every pair of images; pairs picked to match marked with a dot"></svg>
             <div class="legend" id="legend" hidden>
-              <span>level 1</span><span id="lmin"></span><span class="ramp" id="ramp"></span><span id="lmax"></span>
-              <span><span class="dot"></span> shortlisted</span>
+              <span title="Level 1: how alike two images look overall (their mean feature vectors). It picks the pairs to match.">similarity</span>
+              <span id="lmin"></span><span class="ramp" id="ramp"></span><span id="lmax"></span>
+              <span><span class="dot"></span> picked to match</span>
             </div>
-            <p class="hint">Click any cell to match that pair, kept or not.</p>
+            <p class="hint" id="matrix-hint" hidden>Each square is a pair of images. Click one to see its matches below.</p>
           </div>
           <div class="scroll">
             <table id="pairs">
-              <thead><tr><th>#</th><th class="l">pair</th><th>level 1</th><th id="th-l2">level 2</th><th>level 3</th>
-                <th>layers</th><th>matches</th><th>ms</th><th class="l">verdict</th></tr></thead>
+              <thead><tr><th>#</th><th class="l">pair</th>
+                <th title="Level 1: how alike the two images look overall. It picks the pairs to match.">similarity</th>
+                <th id="th-l2" title="Level 2: a finer similarity that re-orders the picked pairs">re-rank</th>
+                <th title="Level 3: FlexGlue's estimate of how much the two images show the same scene, 0 to 1. Below 0.8 the pair is judged to show different places.">overlap</th>
+                <th title="FlexGlue layers run before it decided">layers</th><th>matches</th><th>ms</th>
+                <th class="l" title="FlexGlue's verdict: same place (matched), or different places (stopped early, no matches)">verdict</th></tr></thead>
               <tbody><tr><td colspan="9" class="l">Run to see the pairs worth matching.</td></tr></tbody>
             </table>
           </div>
         </div>
       </section>
 
-      <section class="panel" aria-labelledby="h-pair">
-        <h2 id="h-pair">Pair</h2>
+      <section class="panel" id="pair-panel" aria-labelledby="h-pair">
+        <h2 id="h-pair">Matches</h2>
         <div class="stats" id="pair-stats"></div>
         <canvas id="view" width="800" height="300" aria-label="The two images with lines between matched keypoints"></canvas>
         <div class="row" style="margin-top:8px">
-          <label class="check">Lines <select id="lines"><option value="100" selected>100</option><option value="300">300</option>
+          <label class="check" title="Every match is a dot; lines join an even sample of them">Lines <select id="lines"><option value="100" selected>100</option><option value="300">300</option>
             <option value="all">all</option></select></label>
           <label class="check"><input type="checkbox" id="show-kp"> Show all keypoints</label>
-          <span class="hint" style="margin:0">Every match is a dot; lines join an even sample of them.</span>
         </div>
       </section>
     </div>
