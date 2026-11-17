@@ -34,15 +34,17 @@ Marc Pollefeys. "RaCo: Ranking and Covariance for Practical Learned Keypoints." 
 - Four frames of the TUM RGB-D benchmark. Jürgen Sturm, Nikolas Engelhard, Felix Endres, Wolfram Burgard and
   Daniel Cremers. "A Benchmark for the Evaluation of RGB-D SLAM Systems." IROS 2012.
   <https://cvg.cit.tum.de/data/datasets/rgbd-dataset>. CC BY 4.0.
-- Four frames of the KITTI odometry benchmark. Andreas Geiger, Philip Lenz and Raquel Urtasun. "Are we ready for
-  Autonomous Driving? The KITTI Vision Benchmark Suite." CVPR 2012. <https://www.cvlibs.net/datasets/kitti/>.
-  CC BY-NC-SA 3.0.
-- Two views of one place in Berlin, from the sample images of the FlexGlue repository.
-- Two images of the LaMAR dataset (the CAB building), from the sample images of the FlexGlue repository. Paul-Edouard
-  Sarlin, Mihai Dusmanu and others. "LaMAR: Benchmarking Localization and Mapping for Augmented Reality." ECCV 2022.
-  <https://lamar.ethz.ch>.
+- Four frames of the KITTI odometry benchmark (sequence 00). Andreas Geiger, Philip Lenz and Raquel Urtasun. "Are
+  we ready for Autonomous Driving? The KITTI Vision Benchmark Suite." CVPR 2012.
+  <https://www.cvlibs.net/datasets/kitti/>. CC BY-NC-SA 3.0.
+- Four more frames of the same drive in the KITTI raw data (`2011_10_03_drive_0027`, left colour camera): one street
+  corner passed twice, and two different streets that look alike. Andreas Geiger, Philip Lenz, Christoph Stiller and
+  Raquel Urtasun. "Vision meets Robotics: The KITTI Dataset." IJRR 2013.
+  <https://www.cvlibs.net/datasets/kitti/raw_data.php>. CC BY-NC-SA 3.0.
 
-The TUM and KITTI frames are among the sample images of the ALIKED repository; they were re-encoded as JPEG.
+The TUM frames and the first four KITTI frames are among the sample images of the ALIKED repository. All were
+re-encoded as JPEG; the KITTI images, and these copies, are for non-commercial use only. Frame numbers are in
+`web/samples/README.md`.
 
 ## Software
 
