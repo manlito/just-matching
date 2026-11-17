@@ -1,5 +1,5 @@
 // Checks the C API on the image pair of a golden file: jmt_match_batch gives what jmt_match gives pair by
-// pair, and matching again allocates no device buffers.
+// pair, and matching again allocates no device buffers; without and with early stop.
 //   batch_test WEIGHTS.jmtw GOLDEN.jmtt [cpu|metal|cuda|webgpu, each GPU one also :fp16]
 #include <cmath>
 #include <cstdio>
@@ -17,12 +17,14 @@ struct Copy {
   std::vector<int32_t> idx;
   std::vector<float> score, a_in_b, conf_a;
   float covisibility;
+  int stop_layer;
   explicit Copy(const jmt_matches& m)
       : idx(m.idx, m.idx + 2 * static_cast<size_t>(m.n)), score(m.score, m.score + m.n),
         a_in_b(m.a_in_b, m.a_in_b + 2 * static_cast<size_t>(m.n_a)), conf_a(m.conf_a, m.conf_a + m.n_a),
-        covisibility(m.covisibility) {}
+        covisibility(m.covisibility), stop_layer(m.stop_layer) {}
   bool operator==(const Copy& o) const {
-    return idx == o.idx && score == o.score && a_in_b == o.a_in_b && conf_a == o.conf_a && covisibility == o.covisibility;
+    return idx == o.idx && score == o.score && a_in_b == o.a_in_b && conf_a == o.conf_a && covisibility == o.covisibility &&
+           stop_layer == o.stop_layer;
   }
 };
 
@@ -61,35 +63,41 @@ int main(int argc, char** argv) {
       for (size_t j = 0; j < xy[i].size(); ++j) xy[i][j] = k.data[j] - 0.5f;
     }
     const int n0 = static_cast<int>(xy[0].size() / 2), n1 = static_cast<int>(xy[1].size() / 2);
-    jmt_match_options options;
-    jmt_match_options_default(&options);
-    options.n_layers = golden.meta_int("layers");
-
-    // One by one.
-    jmt_matches m;
-    if (jmt_match(ctx, f[0], xy[0].data(), n0, f[1], xy[1].data(), n1, &options, &m)) throw std::runtime_error(jmt_last_error());
-    const Copy ab(m);
-    if (jmt_match(ctx, f[1], xy[1].data(), n1, f[0], xy[0].data(), n0, &options, &m)) throw std::runtime_error(jmt_last_error());
-    const Copy ba(m);
-
-    // As a batch, longer than the pipeline, twice: the second time must not allocate on the device.
-    const jmt_pair pab = {f[0], xy[0].data(), n0, f[1], xy[1].data(), n1}, pba = {f[1], xy[1].data(), n1, f[0], xy[0].data(), n0};
-    const std::vector<jmt_pair> pairs = {pab, pba, pab, pab, pba, pab, pba};
-    std::vector<jmt_matches> all(pairs.size());
     int failed = 0;
-    long allocations = 0;
-    for (int round = 0; round < 2; ++round) {
-      if (jmt_match_batch(ctx, pairs.data(), static_cast<int>(pairs.size()), &options, all.data())) throw std::runtime_error(jmt_last_error());
-      for (size_t i = 0; i < pairs.size(); ++i) {
-        const bool same = Copy(all[i]) == (pairs[i].a == f[0] ? ab : ba);
-        if (!same) std::printf("round %d, pair %zu: FAIL (differs from jmt_match)\n", round, i), ++failed;
+    // Without early stop; with a bar a look-alike pair does not pass; with a low bar checked after every layer.
+    const float settings[3][2] = {{0.0f, -1.0f}, {0.8f, 0.5f}, {0.01f, 0.0f}};
+    for (const auto& setting : settings) {
+      jmt_match_options options;
+      jmt_match_options_default(&options);
+      options.n_layers = golden.meta_int("layers");
+      options.min_covisibility = setting[0], options.early_stop_decay = setting[1];
+
+      // One by one.
+      jmt_matches m;
+      if (jmt_match(ctx, f[0], xy[0].data(), n0, f[1], xy[1].data(), n1, &options, &m)) throw std::runtime_error(jmt_last_error());
+      const Copy ab(m);
+      if (jmt_match(ctx, f[1], xy[1].data(), n1, f[0], xy[0].data(), n0, &options, &m)) throw std::runtime_error(jmt_last_error());
+      const Copy ba(m);
+
+      // As a batch, longer than the pipeline, twice: the second time must not allocate on the device.
+      const jmt_pair pab = {f[0], xy[0].data(), n0, f[1], xy[1].data(), n1}, pba = {f[1], xy[1].data(), n1, f[0], xy[0].data(), n0};
+      const std::vector<jmt_pair> pairs = {pab, pba, pab, pab, pba, pab, pba};
+      std::vector<jmt_matches> all(pairs.size());
+      long allocations = 0;
+      for (int round = 0; round < 2; ++round) {
+        if (jmt_match_batch(ctx, pairs.data(), static_cast<int>(pairs.size()), &options, all.data())) throw std::runtime_error(jmt_last_error());
+        for (size_t i = 0; i < pairs.size(); ++i) {
+          const bool same = Copy(all[i]) == (pairs[i].a == f[0] ? ab : ba);
+          if (!same) std::printf("round %d, pair %zu: FAIL (differs from jmt_match)\n", round, i), ++failed;
+        }
+        const long now = jmt::ops_of(ctx).device_allocations();
+        if (round == 1 && now != allocations) std::printf("FAIL: the second batch created %ld device buffers\n", now - allocations), ++failed;
+        allocations = now;
       }
-      const long now = jmt::ops_of(ctx).device_allocations();
-      if (round == 1 && now != allocations) std::printf("FAIL: the second batch created %ld device buffers\n", now - allocations), ++failed;
-      allocations = now;
+      std::printf("min_covisibility %.2f, early_stop_decay %.1f: %zu pairs twice: %d matches a->b, %d b->a, "
+                  "%d / %d layers, %ld device buffers in all\n", setting[0], setting[1], pairs.size(), static_cast<int>(ab.score.size()),
+                  static_cast<int>(ba.score.size()), ab.stop_layer, ba.stop_layer, allocations);
     }
-    std::printf("%zu pairs twice: %d matches a->b, %d b->a, %ld device buffers in all\n", pairs.size(),
-                static_cast<int>(ab.score.size()), static_cast<int>(ba.score.size()), allocations);
     jmt_features_free(f[0]), jmt_features_free(f[1]);
     jmt_destroy(ctx);
     std::printf(failed ? "FAILED (%d)\n" : "batch matches single pairs\n", failed);

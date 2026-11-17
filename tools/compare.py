@@ -17,6 +17,7 @@ Reported per pair, a against b:
     pos       largest / median difference of the predicted points, in image pixels, over confident queries
     conf      largest difference of the query confidences
     covis     covisibility score of a and of b
+    layer     layers run by a and by b (fewer than --layers when --early-stop stops the pair)
     matches   number of matches of a and of b, and how many are the same pair
 
 --save DIR writes the matches of each implementation as text, one match per line (keypoint index in A,
@@ -40,13 +41,15 @@ def main():
     ap.add_argument("--layers", type=int, default=9)
     ap.add_argument("--size", type=int, default=512)
     ap.add_argument("--keypoints", type=int, default=2048)
+    ap.add_argument("--min-covisibility", type=float, default=0.0)
+    ap.add_argument("--early-stop", type=float, help="early_stop_decay, in [0, 1); needs --min-covisibility")
     ap.add_argument("--save", help="directory for the match lists of both implementations, as text")
     args = ap.parse_args()
     if len(args.images) % 2:
         ap.error("images must come in pairs")
     a, b = common.Impl(args.a), common.Impl(args.b)
     resize = (args.size, args.size)
-    worst = {"feat": 0.0, "tokens": 0.0, "pos": 0.0, "conf": 0.0, "same": 1.0}
+    worst = {"feat": 0.0, "tokens": 0.0, "pos": 0.0, "conf": 0.0, "same": 1.0, "layers": 0}
     for p0, p1 in zip(args.images[::2], args.images[1::2]):
         im = [common.load_image(p) for p in (p0, p1)]
         xy = [common.keypoints(p, args.keypoints) for p in (p0, p1)]
@@ -55,7 +58,8 @@ def main():
             f = [impl.describe(i, resize=resize) for i in im]
             st = {}
             out.append(impl.match(f[0], xy[0], common.size_of(im[0]), f[1], xy[1], common.size_of(im[1]),
-                                  n_layers=args.layers, stages=st))
+                                  n_layers=args.layers, min_covisibility=args.min_covisibility,
+                                  early_stop_decay=args.early_stop, stages=st))
             feats.append([impl.features(x) for x in f])
             stages.append(st)
         feat = max((feats[0][i] - feats[1][i]).abs().max().item() for i in (0, 1))
@@ -74,12 +78,15 @@ def main():
         print(f"{p0.split('/')[-1]} - {p1.split('/')[-1]}: feat {feat:.2e}  tokens {tokens:.2e}  "
               f"pos max {pos:.2e} median {med:.2e} px  conf {conf:.2e}  "
               f"covis {out[0]['covisibility']:.4f} / {out[1]['covisibility']:.4f}  "
+              f"layer {out[0]['stop_layer']} / {out[1]['stop_layer']}  "
               f"matches {na} / {nb}, same {same}")
         worst["feat"], worst["tokens"] = max(worst["feat"], feat), max(worst["tokens"], tokens if tokens == tokens else 0.0)
         worst["pos"], worst["conf"] = max(worst["pos"], pos), max(worst["conf"], conf)
-        worst["same"] = min(worst["same"], same / max(na, nb, 1))
+        worst["same"] = min(worst["same"], same / max(na, nb) if max(na, nb) else 1.0)
+        worst["layers"] += out[0]["stop_layer"] != out[1]["stop_layer"]
     print(f"worst: feat {worst['feat']:.2e}  tokens {worst['tokens']:.2e}  pos {worst['pos']:.2e} px  "
-          f"conf {worst['conf']:.2e}  same matches {100 * worst['same']:.2f} %")
+          f"conf {worst['conf']:.2e}  same matches {100 * worst['same']:.2f} %  "
+          f"stop layer differs on {worst['layers']} pairs")
 
 
 def save_matches(directory, setting, p0, p1, out, xy):
