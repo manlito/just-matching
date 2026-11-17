@@ -866,6 +866,52 @@ class WebGpuOps : public Ops {
     return out;
   }
 
+  TensorPtr rotary_keypoints(const TensorPtr& xp, const TensorPtr& cosp, const TensorPtr& sinp, int heads) override {
+    const GpuTensor &x = dev(xp), &c = dev(cosp), &sn = dev(sinp);
+    const int pairs = x.c / heads / 2;
+    if (c.n() != x.n() || c.c != pairs || sn.n() != x.n() || sn.c != pairs || c.half != x.half || sn.half != x.half)
+      fail("rotary_keypoints: shape mismatch");
+    auto out = std::make_shared<GpuTensor>(ctx_, x.h, x.w, x.c);
+    ctx_->run("k_rotary_t", static_cast<long long>(x.n()) * heads * pairs, x.d(), c.d(), sn.d(), out->d(), x.n(), heads, pairs);
+    return out;
+  }
+
+  TensorPtr gather_rows(const TensorPtr& xp, const std::vector<int>& rows) override {
+    const GpuTensor& x = dev(xp);
+    const int count = static_cast<int>(rows.size());
+    for (int r : rows)
+      if (r < 0 || r >= x.n()) fail("gather_rows: index out of range");
+    auto out = std::make_shared<GpuTensor>(ctx_, 1, count, x.c);
+    if (count == 0) return out;
+    Buffer idx(ctx_, rows.size() * sizeof(int));
+    idx.write(rows.data(), rows.size() * sizeof(int));
+    ctx_->run("k_gather_rows", static_cast<long long>(count) * x.c, x.d(), idx.view(), out->d(), x.c, count);
+    return out;
+  }
+
+  // The similarity is the read-out's product (float in both precisions); the rest is four small passes.
+  void assignment(const TensorPtr& ap, const TensorPtr& bp, const TensorPtr& zap, const TensorPtr& zbp,
+                  std::vector<int>* best0, std::vector<float>* max0, std::vector<int>* best1,
+                  std::vector<float>* max1) override {
+    const GpuTensor &a = dev(ap), &b = dev(bp), &za = dev(zap), &zb = dev(zbp);
+    const int M = a.n(), N = b.n();
+    if (a.c != b.c || za.n() != M || zb.n() != N || za.c != 1 || zb.c != 1) fail("assignment: shape mismatch");
+    best0->assign(M, -1), max0->assign(M, -INFINITY), best1->assign(N, -1), max1->assign(N, -INFINITY);
+    if (M == 0 || N == 0) return;
+    TensorPtr s = readout_logits(ap, bp, 1.0f / std::sqrt(static_cast<float>(a.c)));
+    auto f32 = [&](int n) { return std::make_shared<GpuTensor>(ctx_, 1, n, 1, true); };
+    auto row_lse = f32(M), col_lse = f32(N), arg0 = f32(M), val0 = f32(M), arg1 = f32(N), val1 = f32(N);
+    const View sv = dev(s).d();
+    ctx_->run_groups("k_lse_rows", M, sv, row_lse->d(), M, N);
+    ctx_->run("k_lse_cols", N, sv, col_lse->d(), M, N);
+    ctx_->run_groups("k_best_rows", M, sv, row_lse->d(), col_lse->d(), za.d(), zb.d(), arg0->d(), val0->d(), M, N);
+    ctx_->run("k_best_cols", N, sv, row_lse->d(), col_lse->d(), za.d(), zb.d(), arg1->d(), val1->d(), M, N);
+    std::vector<float> idx0(M), idx1(N);
+    arg0->read(idx0.data()), val0->read(max0->data()), arg1->read(idx1.data()), val1->read(max1->data());
+    for (int i = 0; i < M; ++i) (*best0)[i] = static_cast<int>(idx0[i]);
+    for (int j = 0; j < N; ++j) (*best1)[j] = static_cast<int>(idx1[j]);
+  }
+
   TensorPtr sample(const TensorPtr& xp, const float* pts, int n) override {
     const GpuTensor& x = dev(xp);
     Buffer p(ctx_, static_cast<size_t>(n) * 2 * sizeof(float));

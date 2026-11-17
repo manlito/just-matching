@@ -129,6 +129,7 @@ FlexGlue& model_of(jmt_ctx* ctx) {
   return *ctx->model;
 }
 Ops& ops_of(jmt_ctx* ctx) { return *ctx->ops; }
+bool is_lightglue(const jmt_ctx* ctx) { return ctx->lightglue != nullptr; }
 
 }  // namespace jmt
 

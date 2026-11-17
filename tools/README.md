@@ -39,6 +39,7 @@ python tools/compare_covis.py IMAGE... --backend metal                      # jm
 | `covis.py` | evaluates the covisibility levels of the plan on folders of images |
 | `compare_covis.py` | levels 1 and 2 of `jmt shortlist` against `covis.py`'s reference, every pair of the images given |
 | `compare_all.sh` | `compare.py` on the 6 test pairs at 512 px / 9 layers and 384 px / 5 layers for one backend: `tools/compare_all.sh metal:fp16 [--save DIR]`; `JMT="tools/remote.sh user@host DIR build/release/jmt"` runs the CLI on another machine |
+| `bench_lightglue_torch.py` | time of the original LightGlue under PyTorch (MPS, CUDA or CPU) on two keypoint files, fixed depth and adaptive, FP32 and FP16, for the M9 speed table |
 | `bench_torch.py` | time of the original under PyTorch on the pair `bench.sh` uses, FP32 and FP16, for the benchmark table |
 | `bench.sh` | wall time and GPU time per kernel of the `jmt` CLI on the Berlin pair: `tools/bench.sh metal:fp16` (WebGPU: wall time per kernel, a round trip each) |
 | `remote.sh` | runs the `jmt` CLI on another machine over SSH, so `compare.py` can check a backend this machine lacks: `--b "cmd:tools/remote.sh user@host DIR build/release/jmt match --backend cuda"` |

@@ -121,8 +121,8 @@
 <!-- site:header -->
 <main id="content">
   <h1>just-matching demo</h1>
-  <p class="lede">Finds which images show the same place and matches them with FlexGlue, on your GPU.
-  Nothing is uploaded.</p>
+  <p class="lede">Matches your images with LightGlue, or finds which ones show the same place and matches them
+  with FlexGlue, on your GPU. Nothing is uploaded.</p>
 
   <div class="banner" id="banner" hidden></div>
 
@@ -134,7 +134,7 @@
 
   <div class="layout">
     <div>
-      <section class="panel" id="weights-panel" aria-labelledby="h-weights">
+      <section class="panel" id="weights-panel" data-model="flexglue" aria-labelledby="h-weights">
         <h2 id="h-weights">FlexGlue weights</h2>
         <div class="row">
           <a class="button" id="weights-download" href="https://github.com/cvg/FlexGlue/releases/download/v0.1/flexglue.pth"
@@ -163,6 +163,13 @@
       <section class="panel" aria-labelledby="h-settings">
         <h2 id="h-settings">Settings</h2>
         <div class="field">
+          <span class="label">Matcher</span>
+          <div class="seg" role="radiogroup" aria-label="Matcher">
+            <label title="ALIKED keypoints and descriptors; every pair is matched. Its weights (Apache-2.0) come with the page."><input type="radio" name="model" value="lightglue" checked>LightGlue</label>
+            <label title="RaCo keypoints; tells pairs of the same place from look-alikes. Needs its weights from you."><input type="radio" name="model" value="flexglue">FlexGlue</label>
+          </div>
+        </div>
+        <div class="field">
           <span class="label" title="Both run from the same weights file">Precision</span>
           <div class="seg" role="radiogroup" aria-label="Precision">
             <label><input type="radio" name="precision" value="fp16" checked>FP16</label>
@@ -173,11 +180,18 @@
         <div class="field">
           <span class="label">Network input and depth</span>
           <div class="row">
-            <select id="size" aria-label="Input size"><option value="512" selected>512 px</option><option value="384">384 px</option></select>
+            <select id="size" aria-label="Input size" data-model="flexglue"><option value="512" selected>512 px</option><option value="384">384 px</option></select>
             <select id="layers" aria-label="Layers"><option value="9" selected>9 layers</option><option value="5">5 layers</option></select>
           </div>
         </div>
-        <div class="field">
+        <div class="field" data-model="lightglue">
+          <label class="label" for="adaptive" title="After each layer LightGlue checks how sure it is: it stops once nearly every keypoint is settled, and drops keypoints that cannot match.">Adaptive depth and width</label>
+          <select id="adaptive">
+            <option value="on" selected>On</option>
+            <option value="off">Off: every layer, every keypoint</option>
+          </select>
+        </div>
+        <div class="field" data-model="flexglue">
           <span class="label">Pairs to match</span>
           <div class="row">
             <label class="check" title="Each image is paired with its k most similar images. A pair is matched when either image picks it.">best <input type="number" id="k" min="1" max="50" value="3"></label>
@@ -185,7 +199,7 @@
           </div>
           <label class="check" style="margin-top:6px" title="Level 2: re-orders the picked pairs by a finer similarity, computed on a coarse grid through FlexGlue's first layer"><input type="checkbox" id="rerank" checked> Re-rank</label>
         </div>
-        <div class="field">
+        <div class="field" data-model="flexglue">
           <label class="label" for="early" title="Level 3: after each layer from 2 on, FlexGlue estimates how much the two images overlap. A pair below 0.8 × (1 − decay)^(9 − layer) is judged to show different places: it stops there and gets no matches.">Early stop</label>
           <select id="early">
             <option value="0.5" selected>On</option>
@@ -209,9 +223,9 @@
           <div>
             <svg id="matrix" role="img" aria-label="Similarity of every pair of images; pairs picked to match marked with a dot"></svg>
             <div class="legend" id="legend" hidden>
-              <span title="Level 1: how alike two images look overall (their mean feature vectors). It picks the pairs to match.">similarity</span>
+              <span id="legend-label" title="FlexGlue: level 1, how alike two images look overall (their mean feature vectors); it picks the pairs to match. LightGlue: the number of matches.">similarity</span>
               <span id="lmin"></span><span class="ramp" id="ramp"></span><span id="lmax"></span>
-              <span><span class="dot"></span> picked to match</span>
+              <span id="legend-picked"><span class="dot"></span> picked to match</span>
             </div>
             <p class="hint" id="matrix-hint" hidden>Each square is a pair of images. Click one to see its matches below.</p>
           </div>
@@ -247,8 +261,8 @@
   from the ALIKED repository's samples, and eight of <a href="https://www.cvlibs.net/datasets/kitti/">KITTI</a>
   (Geiger et al., CVPR 2012 and IJRR 2013; <a href="https://creativecommons.org/licenses/by-nc-sa/3.0/">CC BY-NC-SA
   3.0</a>, non-commercial): four consecutive frames, one street corner passed twice, and two different streets that
-  look alike. All re-encoded as JPEG. FlexGlue: matcher weights MIT; DINOv3
-  backbone under the <!-- site:licence -->DINOv3 License<!-- /site:licence -->.</footer>
+  look alike. All re-encoded as JPEG. LightGlue: weights Apache-2.0; ALIKED: BSD-3-Clause. FlexGlue: matcher
+  weights MIT; DINOv3 backbone under the <!-- site:licence -->DINOv3 License<!-- /site:licence -->.</footer>
 </main>
 <div class="tip" id="tip" hidden></div>
 <script type="module" src="demo.js"></script>

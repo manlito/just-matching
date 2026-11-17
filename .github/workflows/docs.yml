@@ -8,7 +8,8 @@
 # site with pinned hashes (tools/fetch_jkp_web.sh). Deploying needs the repository secrets CLOUDFLARE_API_TOKEN
 # (permission "Cloudflare Pages: Edit") and CLOUDFLARE_ACCOUNT_ID, and a Pages project made for direct upload, named by the
 # repository variable CLOUDFLARE_PAGES_PROJECT (default "just-matching"). FlexGlue's weights are not built or
-# deployed: users load their own copy into the demo (docs/README.md).
+# deployed: users load their own copy into the demo (docs/README.md). LightGlue's (Apache-2.0) are: fetched from
+# its release by sha256 and converted to float16 by the jmt CLI.
 name: docs
 
 on:
@@ -51,6 +52,13 @@ jobs:
         run: |
           tools/fetch_webgpu.sh browser
           tools/fetch_jkp_web.sh
+      - name: LightGlue's weights for the demo (Apache-2.0), converted to float16 by the jmt CLI
+        run: |
+          tools/fetch_lightglue.sh weights
+          cmake -S . -B build/cli -G Ninja -DCMAKE_BUILD_TYPE=Release -DJMT_BUILD_TESTS=OFF -DJMT_CUDA=OFF \
+            -DJMT_METAL=OFF -DJMT_WEBGPU=OFF
+          cmake --build build/cli --target jmt_cli
+          build/cli/jmt convert third_party/lightglue-weights/aliked_lightglue.pth weights/lightglue-aliked-fp16.jmtw --fp16
       - name: Build the WebAssembly module
         run: |
           source "$RUNNER_TEMP/emsdk/emsdk_env.sh"

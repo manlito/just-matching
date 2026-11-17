@@ -1,9 +1,9 @@
 // Flat entry points of the WebAssembly module, over the C API (include/jmt/jmt.h). web/jmt.js wraps
 // them; an app that links just-matching into its own module calls the C API directly instead.
 //
-// jmtw_create, jmtw_describe, jmtw_match, jmtw_finish, jmtw_covisibility_level, jmtw_level1_matrix and
-// jmtw_shortlist wait for the GPU, so they are JSPI exports: in JavaScript they return promises, and the
-// module suspends at each wait instead of blocking the page.
+// jmtw_create, jmtw_describe, jmtw_describe_keypoints, jmtw_match, jmtw_finish, jmtw_covisibility_level,
+// jmtw_level1_matrix and jmtw_shortlist may wait for the GPU, so they are JSPI exports: in JavaScript they
+// return promises, and the module suspends at each wait instead of blocking the page.
 #include <emscripten/emscripten.h>
 
 #include <cmath>
@@ -28,8 +28,8 @@ EMSCRIPTEN_KEEPALIVE int jmtw_backend_available(int backend) {
   return jmt_backend_available(static_cast<jmt_backend>(backend));
 }
 
-// weights: a .jmtw file (float32 or float16) in module memory, copied by jmt_create. Returns null on
-// failure (jmtw_error).
+// weights: a .jmtw file (float32 or float16) in module memory, copied by jmt_create; the model is the
+// weights' (FlexGlue or LightGlue, see jmtw_model). Returns null on failure (jmtw_error).
 EMSCRIPTEN_KEEPALIVE Handle* jmtw_create(int backend, int precision, const void* weights, int weights_size, int input_size) {
   jmt_config config;
   jmt_config_default(&config);
@@ -57,6 +57,16 @@ EMSCRIPTEN_KEEPALIVE jmt_features* jmtw_describe(Handle* h, const uint8_t* rgba,
   return jmt_describe(h->ctx, &image);
 }
 
+// 1 when the matcher runs LightGlue (features from jmtw_describe_keypoints), 0 for FlexGlue (jmtw_describe).
+EMSCRIPTEN_KEEPALIVE int jmtw_model(Handle* h) { return jmt::is_lightglue(h->ctx) ? 1 : 0; }
+
+// LightGlue: n keypoints xy [n][2] of an image of width x height, and their descriptors desc [n][dim]
+// (jmt_describe_keypoints; the arrays are copied). Returns the features, or null (jmtw_error).
+EMSCRIPTEN_KEEPALIVE jmt_features* jmtw_describe_keypoints(Handle* h, int width, int height, const float* xy, const float* desc,
+                                                           int n, int dim) {
+  return jmt_describe_keypoints(h->ctx, width, height, xy, desc, n, dim);
+}
+
 EMSCRIPTEN_KEEPALIVE void jmtw_features_free(jmt_features* f) { jmt_features_free(f); }
 
 // Waits until everything queued on the GPU is done (for timings). Returns 0, or -1 (jmtw_error).
@@ -73,7 +83,8 @@ EMSCRIPTEN_KEEPALIVE int jmtw_finish(Handle* h) {
 // matches, or -1 (jmtw_error). The results stay valid until the next jmtw_match.
 EMSCRIPTEN_KEEPALIVE int jmtw_match(Handle* h, const jmt_features* a, const float* xy_a, int n_a, const jmt_features* b,
                                     const float* xy_b, int n_b, int n_layers, float filter_threshold, float max_distance_px,
-                                    float min_covisibility, float early_stop_decay) {
+                                    float min_covisibility, float early_stop_decay, float depth_confidence,
+                                    float width_confidence) {
   jmt_match_options o;
   jmt_match_options_default(&o);
   o.n_layers = n_layers;
@@ -81,6 +92,8 @@ EMSCRIPTEN_KEEPALIVE int jmtw_match(Handle* h, const jmt_features* a, const floa
   o.max_distance_px = max_distance_px;
   o.min_covisibility = min_covisibility;
   o.early_stop_decay = early_stop_decay;
+  o.depth_confidence = depth_confidence;
+  o.width_confidence = width_confidence;
   if (jmt_match(h->ctx, a, xy_a, n_a, b, xy_b, n_b, &o, &h->result) != 0) return -1;
   return h->result.n;
 }

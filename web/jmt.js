@@ -1,6 +1,11 @@
 // just-matching in the browser: a thin wrapper over the WebAssembly module (jmt_wasm.js + .wasm).
 //
 //   import * as jmt from './jmt.js';
+//   // LightGlue (Apache-2.0 weights, ALIKED keypoints and descriptors from just-keypoints):
+//   const lg = await jmt.create({ weightsUrl: 'lightglue-aliked-fp16.jmtw', precision: 'fp16' });
+//   const a = await lg.describeKeypoints(imageA, kpA.xy, kpA.desc), b = await lg.describeKeypoints(imageB, kpB.xy, kpB.desc);
+//   const m = await lg.match(a, kpA.xy, b, kpB.xy);
+//   // FlexGlue (the user's own weights, see the demo):
 //   const matcher = await jmt.create({ weightsUrl: 'flexglue-fp16.jmtw', precision: 'fp16' });
 //   const a = await matcher.describe(imageA), b = await matcher.describe(imageB);
 //   const m = await matcher.match(a, xyA, b, xyB);   // xy: Float32Array [n][2] from just-keypoints
@@ -9,6 +14,9 @@
 // Keypoints are pixels of the original image, (0, 0) = centre of the top-left pixel. Results are copies:
 // matches Int32Array [n][2] (index in a, index in b), scores [n], aInB [nA][2] and bInA [nB][2] (the point
 // predicted in the other image for every keypoint), confA [nA], confB [nB], covisibility, stopLayer.
+// matcher.model is 'flexglue' or 'lightglue', from the weights. LightGlue predicts no positions: aInB and bInA
+// hold the matched keypoint's position (NaN when unmatched), confA and confB the matchability, covisibility -1;
+// the covisibility functions below are FlexGlue's.
 // Covisibility: covisibility(a, b, level) scores one pair at level 1 (cosine of the mean feature vectors) or 2
 // (a 16 x 16 grid through the layer-0 head and back); level1([features]) is the level-1 matrix of n images
 // (Float32Array [n][n]); shortlist([features], options) returns { n, pairs: Int32Array [n][2] (first <
@@ -132,7 +140,7 @@ export async function create(options = {}) {
     M._free(wp);  // jmt_create copies the weights
   }
   if (!handle) throw new Error(M.UTF8ToString(M._jmtw_error()));
-  return new Matcher(M, handle, backend, precision);
+  return new Matcher(M, handle, backend, precision, M._jmtw_model(handle) ? 'lightglue' : 'flexglue');
 }
 
 // Dense features of one image, made by Matcher.describe; free them with destroy() when done.
@@ -150,11 +158,12 @@ class Features {
 }
 
 class Matcher {
-  constructor(M, handle, backend, precision) {
+  constructor(M, handle, backend, precision, model) {
     this.M = M;
     this.handle = handle;
     this.backend = backend;
     this.precision = precision;
+    this.model = model;
     this.buffers = {};  // reused module allocations, by role
   }
 
@@ -182,12 +191,29 @@ class Matcher {
     return new Features(this, f, data.width, data.height);
   }
 
+  // LightGlue: an image's keypoints xy (Float32Array [n][2], pixels) and descriptors desc (Float32Array [n][128],
+  // just-keypoints' aliked-n16). image gives the size: anything with width and height (an ImageBitmap, or
+  // { width, height }). match() then takes the same xy.
+  async describeKeypoints(image, xy, desc) {
+    const M = this.M;
+    if (!this.handle) throw new Error('matcher destroyed');
+    const n = xy.length / 2, dim = n ? desc.length / n : 128;
+    const px = this.scratch('kpXy', xy.length * 4), pd = this.scratch('kpDesc', desc.length * 4);
+    M.HEAPF32.set(xy, px / 4);
+    M.HEAPF32.set(desc, pd / 4);
+    const f = await M._jmtw_describe_keypoints(this.handle, image.width, image.height, px, pd, n, dim);
+    if (!f) throw new Error(M.UTF8ToString(M._jmtw_error()));
+    return new Features(this, f, image.width, image.height);
+  }
+
   // Waits for the GPU (describe may return before its work is done).
   async finish() {
     if ((await this.M._jmtw_finish(this.handle)) !== 0) throw new Error('webgpu: ' + this.M.UTF8ToString(this.M._jmtw_error()));
   }
 
-  // options: layers (9), filterThreshold (0.1), maxDistancePx (3), minCovisibility (0), earlyStopDecay (-1).
+  // options: layers (9), filterThreshold (0.1); FlexGlue: maxDistancePx (3), minCovisibility (0),
+  // earlyStopDecay (-1); LightGlue: depthConfidence (0.95; 0 runs every layer), widthConfidence (0.99; 0 keeps
+  // every keypoint).
   async match(a, xyA, b, xyB, options = {}) {
     const M = this.M;
     if (!this.handle) throw new Error('matcher destroyed');
@@ -197,7 +223,8 @@ class Matcher {
     M.HEAPF32.set(xyB, pb / 4);
     const n = await M._jmtw_match(this.handle, a.ptr, pa, nA, b.ptr, pb, nB, options.layers ?? 9,
                                   options.filterThreshold ?? 0.1, options.maxDistancePx ?? 3,
-                                  options.minCovisibility ?? 0, options.earlyStopDecay ?? -1);
+                                  options.minCovisibility ?? 0, options.earlyStopDecay ?? -1,
+                                  options.depthConfidence ?? 0.95, options.widthConfidence ?? 0.99);
     if (n < 0) throw new Error(M.UTF8ToString(M._jmtw_error()));
     const h = this.handle;
     const f32 = (ptr, count) => new Float32Array(M.HEAPF32.buffer, ptr, count).slice();

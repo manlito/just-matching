@@ -2,17 +2,22 @@
 # Fetch the original LightGlue at its pinned commit into third_party/LightGlue, and its two checkpoints for
 # 128-dim ALIKED descriptors into third_party/lightglue-weights/. Code and weights are Apache-2.0
 # (third_party/LightGlue/LICENSE); nothing in them comes from DINO.
+#
+#   tools/fetch_lightglue.sh            # the code and both checkpoints
+#   tools/fetch_lightglue.sh weights    # the checkpoints only (the docs deploy: no clone)
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 dest="$ROOT/third_party/LightGlue"
 commit=eb42fee2d71449efb0aa5c10549752b5d75384d8
-if [ ! -d "$dest/.git" ]; then
-  git clone -q https://github.com/cvg/LightGlue.git "$dest"
+if [ "${1:-}" != weights ]; then
+  if [ ! -d "$dest/.git" ]; then
+    git clone -q https://github.com/cvg/LightGlue.git "$dest"
+  fi
+  git -C "$dest" fetch -q origin 2>/dev/null || true
+  git -C "$dest" checkout -q "$commit"
+  echo "LightGlue at $(git -C "$dest" rev-parse HEAD) in $dest"
 fi
-git -C "$dest" fetch -q origin 2>/dev/null || true
-git -C "$dest" checkout -q "$commit"
-echo "LightGlue at $(git -C "$dest" rev-parse HEAD) in $dest"
 
 mkdir -p "$ROOT/third_party/lightglue-weights"
 release=https://github.com/cvg/LightGlue/releases/download/v0.1_arxiv

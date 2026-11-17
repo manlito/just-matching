@@ -186,14 +186,15 @@ if(EMSCRIPTEN AND JMT_BUILD_WASM)
   target_include_directories(jmt_wasm PRIVATE src)
   target_link_libraries(jmt_wasm PRIVATE jmt)
   set_target_properties(jmt_wasm PROPERTIES SUFFIX ".js" RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/web")
-  set(jmtw_exports jmtw_backend_available jmtw_create jmtw_describe jmtw_features_free jmtw_finish jmtw_match jmtw_idx
+  set(jmtw_exports jmtw_backend_available jmtw_create jmtw_model jmtw_describe jmtw_describe_keypoints jmtw_features_free
+      jmtw_finish jmtw_match jmtw_idx
       jmtw_score jmtw_a_in_b jmtw_b_in_a jmtw_conf_a jmtw_conf_b jmtw_covisibility jmtw_stop_layer jmtw_covisibility_level
       jmtw_level1_matrix jmtw_shortlist jmtw_pairs_idx jmtw_pairs_score jmtw_error jmtw_destroy)
   list(TRANSFORM jmtw_exports PREPEND "_" OUTPUT_VARIABLE jmtw_exported)
   string(REPLACE ";" "," jmtw_exported "_malloc,_free,${jmtw_exported}")
   target_link_options(jmt_wasm PRIVATE
     -sJSPI
-    "-sJSPI_EXPORTS=jmtw_create,jmtw_describe,jmtw_finish,jmtw_match,jmtw_covisibility_level,jmtw_level1_matrix,jmtw_shortlist"
+    "-sJSPI_EXPORTS=jmtw_create,jmtw_describe,jmtw_describe_keypoints,jmtw_finish,jmtw_match,jmtw_covisibility_level,jmtw_level1_matrix,jmtw_shortlist"
     "-sEXPORTED_FUNCTIONS=${jmtw_exported}"
     "-sEXPORTED_RUNTIME_METHODS=HEAPU8,HEAP32,HEAPU32,HEAPF32,UTF8ToString"
     -sMODULARIZE
@@ -209,7 +210,18 @@ if(EMSCRIPTEN AND JMT_BUILD_WASM)
   endforeach()
   add_custom_command(TARGET jmt_wasm POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_directory
                      "${CMAKE_CURRENT_SOURCE_DIR}/web/samples" "${CMAKE_CURRENT_BINARY_DIR}/web/samples")
-  # The demo takes its keypoints from just-keypoints' module (jkp.js, jkp_wasm.js, jkp_wasm.wasm, raco.jkpw),
+  # LightGlue's weights for the demo, in float16 (24 MB, under the 25 MiB file limit of static hosts):
+  # weights/lightglue-aliked-fp16.jmtw, made by `jmt convert aliked_lightglue.pth ... --fp16`.
+  set(JMT_DEMO_LIGHTGLUE "${CMAKE_CURRENT_SOURCE_DIR}/weights/lightglue-aliked-fp16.jmtw" CACHE FILEPATH
+      "LightGlue weights served next to the demo")
+  if(EXISTS "${JMT_DEMO_LIGHTGLUE}")
+    add_custom_command(TARGET jmt_wasm POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                       "${JMT_DEMO_LIGHTGLUE}" "${CMAKE_CURRENT_BINARY_DIR}/web/lightglue-aliked-fp16.jmtw")
+  else()
+    message(STATUS "LightGlue weights for the demo not found (${JMT_DEMO_LIGHTGLUE}): the demo will offer FlexGlue only")
+  endif()
+  # The demo takes its keypoints from just-keypoints' module (jkp.js, jkp_wasm.js, jkp_wasm.wasm; raco.jkpw and
+  # aliked-n16.jkpw),
   # copied to web/jkp: by default the one tools/fetch_jkp_web.sh puts in third_party/jkp-web, else the <build>/web
   # of a just-keypoints checkout next to this one; or point JMT_JKP_WEB_DIR at another.
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/jkp-web/jkp_wasm.wasm")
@@ -219,7 +231,7 @@ if(EMSCRIPTEN AND JMT_BUILD_WASM)
   endif()
   set(JMT_JKP_WEB_DIR "${jmt_jkp_default}" CACHE PATH "just-keypoints' built WebAssembly module, for the demo")
   if(EXISTS "${JMT_JKP_WEB_DIR}/jkp_wasm.wasm")
-    foreach(f jkp.js jkp_wasm.js jkp_wasm.wasm raco.jkpw)
+    foreach(f jkp.js jkp_wasm.js jkp_wasm.wasm raco.jkpw aliked-n16.jkpw)
       add_custom_command(TARGET jmt_wasm POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
                          "${JMT_JKP_WEB_DIR}/${f}" "${CMAKE_CURRENT_BINARY_DIR}/web/jkp/${f}")
     endforeach()
@@ -273,6 +285,13 @@ if(JMT_BUILD_TESTS)
     if(JMT_EMBED_WEIGHTS AND model IN_LIST JMT_EMBED_MODELS)
       add_test(NAME embedded_${model} COMMAND checkpoint_test "embedded:${model}" "${jmtw}")
     endif()
+    # jmt convert: the checkpoint to a .jmtw file, which must hold the checkpoint's tensors bit for bit.
+    if(TARGET jmt_cli AND EXISTS "${pth}")
+      set(converted "${CMAKE_CURRENT_BINARY_DIR}/convert_test_${model}.jmtw")
+      add_test(NAME convert_${model}
+               COMMAND sh -c "\"$1\" convert \"$2\" \"$3\" && \"$4\" \"$2\" \"$3\"" convert_test
+                       $<TARGET_FILE:jmt_cli> "${pth}" "${converted}" $<TARGET_FILE:checkpoint_test>)
+    endif()
   endforeach()
   add_executable(ops_bench tests/ops_bench.cpp)  # timings of single operations, not a test
   target_include_directories(ops_bench PRIVATE src)
@@ -284,14 +303,17 @@ if(JMT_BUILD_TESTS)
     endif()
   endforeach()
   # LightGlue: tools/fetch_lightglue.sh, python tools/export_weights.py --model <model>, then
-  # tools/dump_golden_lightglue.sh. CPU only until the GPU backends have LightGlue's operations (M9 step 5).
+  # tools/dump_golden_lightglue.sh. Every backend of the build, each GPU one in FP32 and FP16.
   foreach(model lightglue-aliked lightglue-raco-aliked)
     set(jmtw "${CMAKE_CURRENT_SOURCE_DIR}/weights/${model}.jmtw")
     file(GLOB lg_golden "${CMAKE_CURRENT_SOURCE_DIR}/build/golden/${model}/*.jmtt")
     if(EXISTS "${jmtw}")
       foreach(golden IN LISTS lg_golden)
         get_filename_component(name "${golden}" NAME_WLE)
-        add_test(NAME ${model}_cpu_${name} COMMAND lightglue_golden_test "${jmtw}" "${golden}" cpu)
+        foreach(backend IN LISTS jmt_backends)
+          string(REPLACE ":" "_" backend_name "${backend}")
+          add_test(NAME ${model}_${backend_name}_${name} COMMAND lightglue_golden_test "${jmtw}" "${golden}" ${backend})
+        endforeach()
       endforeach()
     endif()
   endforeach()

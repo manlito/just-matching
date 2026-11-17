@@ -3,6 +3,7 @@
 //   jmt match A B --kpts-a A.jkpt --kpts-b B.jkpt [--out OUT.jmtt] [options]
 //   jmt match --model lightglue-aliked --kpts-a A.jkpt --kpts-b B.jkpt [--out OUT.jmtt] [options]
 //   jmt shortlist IMAGE... [--out OUT.jmtt] [options]
+//   jmt convert IN OUT.jmtw [--fp16]        a checkpoint as released (.pth) or a .jmtw file -> .jmtw
 //
 // A, B: images (PNG, JPEG, ...). The keypoint files are just-keypoints outputs (`jkp extract --out`), or any
 // container with a float32 tensor "keypoints" (N, 2) in pixels with (0,0) at the centre of the top-left pixel.
@@ -63,7 +64,10 @@ void usage() {
                "  --neighbours N         also keep the N next images in the order given (default 0)\n"
                "  --rerank               score the kept pairs with level 2 (layer-0 grid round trip)\n"
                "  --min-score S          with --rerank, drop pairs scoring below S (default 0)\n"
-               "  --backend, --weights, --size, --threads as for match\n");
+               "  --backend, --weights, --size, --threads as for match\n"
+               "usage: jmt convert IN OUT.jmtw [--fp16]\n"
+               "  IN: a checkpoint as released (flexglue.pth, aliked_lightglue.pth, raco_aliked_lightglue.pth) or a\n"
+               "  .jmtw file; OUT gets the tensors the library reads, as float32 or with --fp16 as float16\n");
 }
 
 bool file_exists(const std::string& path) {
@@ -225,6 +229,33 @@ int shortlist(int argc, char** argv) {
 }  // namespace
 
 int main(int argc, char** argv) {
+  if (argc >= 2 && std::strcmp(argv[1], "convert") == 0) {
+    try {
+      std::vector<std::string> paths;
+      bool fp16 = false;
+      for (int i = 2; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--fp16") == 0) fp16 = true;
+        else if (argv[i][0] == '-' && argv[i][1] == '-') throw std::runtime_error(std::string("unknown option ") + argv[i]);
+        else paths.push_back(argv[i]);
+      }
+      if (paths.size() != 2) throw std::runtime_error("convert: IN and OUT are required");
+      const jmt::Weights w = jmt::Weights::from_file(paths[0]);
+      std::vector<jmt::NamedTensor> tensors;
+      size_t values = 0;
+      for (const std::string& name : w.names()) {
+        const jmt::Param& p = w.get(name);
+        tensors.push_back({name, p.shape, p.data});
+        values += p.size();
+      }
+      jmt::write_container(paths[1], w.metadata(), tensors, fp16);
+      std::printf("%s: %s, %zu tensors, %zu values, %s\n", paths[1].c_str(), w.meta("model").c_str(), tensors.size(), values,
+                  fp16 ? "float16" : "float32");
+    } catch (const std::exception& e) {
+      std::fprintf(stderr, "error: %s\n", e.what());
+      return 1;
+    }
+    return 0;
+  }
   if (argc >= 2 && std::strcmp(argv[1], "shortlist") == 0) {
     try {
       return shortlist(argc, argv);

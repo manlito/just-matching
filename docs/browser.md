@@ -4,6 +4,25 @@ The browser build is the same C++ library compiled to WebAssembly, with the WebG
 on the visitor's GPU. A small JavaScript wrapper, `jmt.js`, loads it. Keypoints come from just-keypoints' own
 browser module.
 
+With LightGlue, the page serves the weights itself (Apache-2.0; `lightglue-aliked-fp16.jmtw` is 23.8 MB, under
+the file limit of static hosts) and just-keypoints gives ALIKED keypoints with their descriptors:
+
+```js
+import * as jmt from './jmt.js';
+import * as jkp from './jkp/jkp.js';
+
+const matcher = await jmt.create({ weightsUrl: 'lightglue-aliked-fp16.jmtw', precision: 'fp16' });
+const extractor = await jkp.create({ weightsUrl: 'jkp/aliked-n16.jkpw', topK: 2048 });
+
+const [imA, imB] = await Promise.all([fileA, fileB].map(f => createImageBitmap(f)));
+const kA = await extractor.extract(imA), kB = await extractor.extract(imB);
+const a = await matcher.describeKeypoints(imA, kA.xy, kA.desc), b = await matcher.describeKeypoints(imB, kB.xy, kB.desc);
+const m = await matcher.match(a, kA.xy, b, kB.xy);   // m.n matches: m.matches [n][2], m.scores [n]
+a.destroy(); b.destroy(); matcher.destroy();
+```
+
+`matcher.model` says which model the weights hold. With FlexGlue, the weights come from the user:
+
 ```js
 import * as jmt from './jmt.js';
 import * as jkp from './jkp/jkp.js';
@@ -42,7 +61,8 @@ weights: about 1.2 GB for the 567 MB checkpoint.
 
 | Method | Returns |
 |---|---|
-| `describe(image)` | the image's features; free them with `destroy()`. `image`: an `ImageBitmap`, `ImageData`, image element, video frame or canvas |
+| `describe(image)` | FlexGlue: the image's features; free them with `destroy()`. `image`: an `ImageBitmap`, `ImageData`, image element, video frame or canvas |
+| `describeKeypoints(image, xy, desc)` | LightGlue: the features of an image's keypoints `xy` (`Float32Array` `[n][2]`) and descriptors `desc` (`[n][128]`); `image` gives the size (anything with `width` and `height`) |
 | `match(a, xyA, b, xyB, options)` | `{ n, matches, scores, aInB, bInA, confA, confB, covisibility, stopLayer }`, as `jmt_matches`. `xyA`, `xyB`: `Float32Array` `[n][2]` |
 | `covisibility(a, b, level)` | the score of one pair at level 1 or 2 |
 | `level1(features)` | level 1 of every pair of n images: `Float32Array` `[n][n]` |
@@ -50,8 +70,8 @@ weights: about 1.2 GB for the 567 MB checkpoint.
 | `finish()` | waits for the GPU |
 | `destroy()` | frees the matcher |
 
-Options of `match`: `layers` (9), `filterThreshold` (0.1), `maxDistancePx` (3), `minCovisibility` (0),
-`earlyStopDecay` (-1, off). Options of `shortlist`: `k` (10), `neighbours` (0), `rerank` (false), `minScore` (0).
+Options of `match`: `layers` (9), `filterThreshold` (0.1); FlexGlue: `maxDistancePx` (3), `minCovisibility`
+(0), `earlyStopDecay` (-1, off); LightGlue: `depthConfidence` (0.95), `widthConfidence` (0.99). Options of `shortlist`: `k` (10), `neighbours` (0), `rerank` (false), `minScore` (0).
 Their meaning is the C API's: [C API](api.md), [Which pairs to match](covisibility.md).
 
 Results are copies. Calls on one matcher must not overlap.

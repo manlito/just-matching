@@ -26,6 +26,7 @@ class FlexGlue;
 std::vector<float> to_rgb01(const jmt_image& image);
 
 FlexGlue& model_of(jmt_ctx* ctx);  // throws on a LightGlue context
+bool is_lightglue(const jmt_ctx* ctx);
 Ops& ops_of(jmt_ctx* ctx);
 
 }  // namespace jmt

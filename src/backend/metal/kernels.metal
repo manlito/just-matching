@@ -263,6 +263,96 @@ kernel void k_rotary(device const real* x [[buffer(0)]], device const float* cos
   out[2 * size_t(gid) + 1] = real(b * c + a * s);
 }
 
+// Rotary encoding with the tables as tensors in the storage type (LightGlue: made per image). cos, sin:
+// (n, pairs). Grid: n * heads * pairs.
+kernel void k_rotary_t(device const real* x [[buffer(0)]], device const real* cosv [[buffer(1)]],
+                       device const real* sinv [[buffer(2)]], constant int& n [[buffer(3)]], constant int& heads [[buffer(4)]],
+                       constant int& pairs [[buffer(5)]], device real* out [[buffer(6)]],
+                       uint gid [[thread_position_in_grid]]) {
+  const int per_token = heads * pairs;
+  if (int(gid) >= n * per_token) return;
+  const int tok = int(gid) / per_token, j = (int(gid) % per_token) % pairs;
+  const float c = float(cosv[tok * pairs + j]), s = float(sinv[tok * pairs + j]);
+  const float a = float(x[2 * size_t(gid)]), b = float(x[2 * size_t(gid) + 1]);
+  out[2 * size_t(gid)] = real(a * c - b * s);
+  out[2 * size_t(gid) + 1] = real(b * c + a * s);
+}
+
+// out[r] = x[rows[r]], whole rows of c values. Grid: count * c.
+kernel void k_gather_rows(device const real* x [[buffer(0)]], device const int* rows [[buffer(1)]], constant int& c [[buffer(2)]],
+                          constant int& count [[buffer(3)]], device real* out [[buffer(4)]], uint gid [[thread_position_in_grid]]) {
+  if (gid >= uint(count) * uint(c)) return;
+  const uint r = gid / uint(c), ch = gid % uint(c);
+  out[gid] = x[size_t(rows[r]) * size_t(c) + ch];
+}
+
+// ---------------------------------------------------------------------------------------------
+// LightGlue's match assignment (core/ops.h) on s (M, N) float, made by the read-out product:
+//   score(i, j) = ((s_ij - row_lse_i) + (s_ij - col_lse_j)) + (logsigmoid(za_i) + logsigmoid(zb_j))
+// in four passes: the log-sum-exp of every row and of every column, then the best of every row and of
+// every column. The order of operations is the host's (core/assignment.h); ties go to the lower index.
+// ---------------------------------------------------------------------------------------------
+inline float log_sigmoid(float z) { return min(z, 0.0f) - precise::log(1.0f + precise::exp(-fabs(z))); }
+
+// Threadgroups: M, 32 threads each.
+kernel void k_lse_rows(device const float* s [[buffer(0)]], constant int& N [[buffer(1)]], device float* lse [[buffer(2)]],
+                       uint tg [[threadgroup_position_in_grid]], ushort lane [[thread_index_in_simdgroup]]) {
+  device const float* row = s + size_t(tg) * size_t(N);
+  float top = -INFINITY;
+  for (int j = lane; j < N; j += 32) top = max(top, row[j]);
+  top = simd_max(top);
+  float sum = 0;
+  for (int j = lane; j < N; j += 32) sum += precise::exp(row[j] - top);
+  sum = simd_sum(sum);
+  if (lane == 0) lse[tg] = top + precise::log(sum);
+}
+
+// Grid: N; each thread walks one column down the M rows (neighbouring threads read neighbouring values).
+kernel void k_lse_cols(device const float* s [[buffer(0)]], constant int& M [[buffer(1)]], constant int& N [[buffer(2)]],
+                       device float* lse [[buffer(3)]], uint gid [[thread_position_in_grid]]) {
+  if (gid >= uint(N)) return;
+  float top = -INFINITY;
+  for (int i = 0; i < M; ++i) top = max(top, s[size_t(i) * size_t(N) + gid]);
+  float sum = 0;
+  for (int i = 0; i < M; ++i) sum += precise::exp(s[size_t(i) * size_t(N) + gid] - top);
+  lse[gid] = top + precise::log(sum);
+}
+
+// Best column of every row. best: float (indices are exact below 2^24). Threadgroups: M, 32 threads each.
+kernel void k_best_rows(device const float* s [[buffer(0)]], constant int& N [[buffer(1)]], device const float* row_lse [[buffer(2)]],
+                        device const float* col_lse [[buffer(3)]], device const real* za [[buffer(4)]],
+                        device const real* zb [[buffer(5)]], device float* best [[buffer(6)]], device float* value [[buffer(7)]],
+                        uint tg [[threadgroup_position_in_grid]], ushort lane [[thread_index_in_simdgroup]]) {
+  device const float* row = s + size_t(tg) * size_t(N);
+  const float lr = row_lse[tg], l0 = log_sigmoid(float(za[tg]));
+  float top = -INFINITY;
+  int at = N;
+  for (int j = lane; j < N; j += 32) {
+    const float v = ((row[j] - lr) + (row[j] - col_lse[j])) + (l0 + log_sigmoid(float(zb[j])));
+    if (v > top) top = v, at = j;
+  }
+  const float m = simd_max(top);
+  const int arg = simd_min(top == m ? at : N);
+  if (lane == 0) best[tg] = float(arg), value[tg] = m;
+}
+
+// Best row of every column. Grid: N.
+kernel void k_best_cols(device const float* s [[buffer(0)]], constant int& M [[buffer(1)]], constant int& N [[buffer(2)]],
+                        device const float* row_lse [[buffer(3)]], device const float* col_lse [[buffer(4)]],
+                        device const real* za [[buffer(5)]], device const real* zb [[buffer(6)]], device float* best [[buffer(7)]],
+                        device float* value [[buffer(8)]], uint gid [[thread_position_in_grid]]) {
+  if (gid >= uint(N)) return;
+  const float lc = col_lse[gid], l1 = log_sigmoid(float(zb[gid]));
+  float top = -INFINITY;
+  int at = 0;
+  for (int i = 0; i < M; ++i) {
+    const float sij = s[size_t(i) * size_t(N) + gid];
+    const float v = ((sij - row_lse[i]) + (sij - lc)) + (log_sigmoid(float(za[i])) + l1);
+    if (v > top) top = v, at = i;
+  }
+  best[gid] = float(at), value[gid] = top;
+}
+
 // Bilinear samples at points in [-1, 1], border clamped. Grid: n * c.
 kernel void k_sample(device const real* x [[buffer(0)]], device const float* pts [[buffer(1)]], constant int& h [[buffer(2)]],
                      constant int& w [[buffer(3)]], constant int& c [[buffer(4)]], constant int& n [[buffer(5)]],

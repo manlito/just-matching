@@ -148,7 +148,8 @@ std::vector<std::string> Weights::names() const {
 int Weights::meta_int(const std::string& key) const { return std::stoi(meta(key)); }
 
 void write_container(const std::string& path, const std::map<std::string, std::string>& meta,
-                     const std::vector<NamedTensor>& tensors) {
+                     const std::vector<NamedTensor>& tensors, bool fp16) {
+  const size_t elem = fp16 ? 2 : 4;
   std::string head(kMagic, 4);
   put(head, kVersion, 4);
   put(head, meta.size(), 4);
@@ -165,14 +166,14 @@ void write_container(const std::string& path, const std::map<std::string, std::s
     size_t count = 1;
     for (int d : t.shape) count *= static_cast<size_t>(d);
     put_str(head, t.name);
-    put(head, 0, 1);  // float32
+    put(head, fp16 ? 1 : 0, 1);  // float16 or float32
     put(head, t.shape.size(), 1);
     for (int d : t.shape) put(head, static_cast<uint64_t>(d), 4);
     put(head, offset, 8);
-    put(head, count * 4, 8);
+    put(head, count * elem, 8);
     offsets.push_back(offset);
     sizes.push_back(count);
-    offset = align_up(offset + count * 4);
+    offset = align_up(offset + count * elem);
   }
   std::FILE* f = std::fopen(path.c_str(), "wb");
   if (!f) throw std::runtime_error("cannot write '" + path + "'");
@@ -180,6 +181,10 @@ void write_container(const std::string& path, const std::map<std::string, std::s
   for (size_t i = 0; i < tensors.size(); ++i) {
     out.resize(offsets[i], '\0');
     for (size_t j = 0; j < sizes[i]; ++j) {
+      if (fp16) {
+        put(out, float_to_half(tensors[i].data[j]), 2);
+        continue;
+      }
       uint32_t bits;
       std::memcpy(&bits, tensors[i].data + j, 4);
       put(out, bits, 4);
