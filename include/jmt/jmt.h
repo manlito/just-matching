@@ -51,9 +51,13 @@ typedef struct {
   float filter_threshold; /* minimum match score. Default 0.1 */
   float max_distance_px;  /* maximum distance between a keypoint and the point predicted for its partner,
                              mean of both directions, in pixels of the network input. Default 3; <= 0: off */
-  float min_covisibility; /* pairs whose covisibility is below it get no matches. Default 0 (off) */
-  float early_stop_decay; /* in [0, 1): stop after an early layer when the pair is confidently not
-                             covisible (needs min_covisibility > 0). Default -1 (off) */
+  float min_covisibility; /* pairs whose covisibility is below it get no matches. Default 0 (off). Unrelated
+                             scenes score 0.3 to 0.7, look-alikes near 0: the original suggests 0.8 */
+  float early_stop_decay; /* in [0, 1): after layer k (2 <= k < n_layers) stop when the pair's covisibility
+                             is below min_covisibility * (1 - early_stop_decay)^(9 - k), as the original
+                             does; the pair then gets no matches and stop_layer = k. Lower stops earlier:
+                             0.2 stopped 85 % of the pairs of different scenes and no pair that passes at
+                             full depth (PLAN.md, Notes from C3). Needs min_covisibility > 0. Default -1 (off) */
 } jmt_match_options;
 
 /* Keypoint coordinates, in and out, follow just-keypoints: pixels of the original image, x right / y down,
@@ -118,7 +122,9 @@ int jmt_match_batch(jmt_ctx* ctx, const jmt_pair* pairs, int n_pairs, const jmt_
         back; the share of points that return within one cell (8 pixels of the network input), mean of
         both directions, in [0, 1]. About 0.3 G multiply-adds per pair; each image keeps a 64-channel
         map (1 MB in FP32) with its features after first use.
-   Level 3, FlexGlue's own score, is jmt_matches.covisibility. Returns 0 on success. */
+   Level 3, FlexGlue's own score, is jmt_matches.covisibility: set min_covisibility and early_stop_decay
+   in jmt_match_options and a pair that fails stops after a few layers, while one that passes runs on to
+   full depth and is matched in the same call. Returns 0 on success. */
 int jmt_covisibility(jmt_ctx* ctx, const jmt_features* a, const jmt_features* b, int level, float* score);
 
 typedef struct {

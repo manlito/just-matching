@@ -9,7 +9,8 @@ the original. M5 is done on Metal: 314 ms per pair in FP32 and 105 ms in FP16 at
 against 376 and 157 ms for PyTorch on the same GPU, and on CUDA. M6 is done: the WebGPU backend matches the
 original natively (Dawn) and in Chrome (WebAssembly): per pair at full settings on the M5 Pro, 478 ms in
 FP32 and 313 ms in FP16 natively, 500 and 335 ms in Chrome. C2 is done: `jmt_covisibility` (levels 1 and 2)
-and `jmt_shortlist` on every backend. Numbers marked "estimate" are computed from the layer sizes, not measured.
+and `jmt_shortlist` on every backend. C3 is done: level 3 with early stop stops where the original does on
+every backend. Numbers marked "estimate" are computed from the layer sizes, not measured.
 
 ## What FlexGlue is (reviewed at release v0.1, 2026-10-26)
 
@@ -256,7 +257,17 @@ reference for recall, before any C++ is written for them.
   Against the reference (`tools/compare_covis.py`, 8 images of 5 scenes, all 28 pairs): level 1 within
   6.0e-5 (1.2e-4 in FP16), level 2 within 3 of 512 grid points (4 in WebGPU FP16) on CPU, Metal and WebGPU
   in both precisions. On the 53 images of `covis.py` with k = 5 it keeps the same 156 pairs. See "Notes from C2".
-- [ ] **C3** — level 3 with early stop, on each backend once that backend passes M2-M4.
+- [x] **C3** — level 3 with early stop, on each backend once that backend passes M2-M4.
+  Done: `min_covisibility` and `early_stop_decay` in `jmt_match_options` (`--min-covisibility`,
+  `--early-stop`), the original's rule after every layer from 2 on. A pair that passes runs on to full
+  depth in the same pass and is matched; nothing is computed twice. Against the original
+  (`tools/compare_all.sh B --min-covisibility 0.8 --early-stop D`, D = 0, 0.2, 0.5, which stop the 6 pairs
+  after layer 2, 4 or 8 or not at all): the same stop layer on every pair in all 42 runs (CPU, Metal, CUDA,
+  WebGPU, each GPU one in FP32 and FP16); the original's matches in FP32, and in FP16 the agreement of M5
+  (1 of 70 differs on the Berlin pair in CUDA FP16). `batch_test` checks a batch against single pairs with
+  early stop too, and the browser test page runs early stop in Chrome (24 runs, the native stop layer on
+  every pair). A pair stopped after layer 2 costs about a quarter of a full one (24-29 %); the check
+  after each layer costs 1 to 3.4 % on pairs that pass. See "Notes from C3".
 - [ ] **C4** — shortlist view in the demo.
 
 ## Risks
@@ -826,3 +837,60 @@ The first pass first; the second pass, at the end, replaced its products and att
   capture well is C1's question.
 - **Not done:** a faster CPU level 2 (10 times Metal; where its time goes is not measured), the shortlist in the WebAssembly module, saving the kept per-image vectors with
   the features.
+
+## Notes from C3 (level 3, early stop)
+
+- **Nothing to restructure.** The check is the covisibility head after layer k, read back on the host; a
+  pair that passes continues from the same tokens, so the shortlist -> verdict -> matches path is one call
+  per pair. The read-back is one round trip per layer from 2 to n_layers - 1. Doing these in step across
+  the pairs of a batch was considered and not done: on pairs that pass, the checks cost
+  2-5 ms per pair (1 % in FP32, 2 % in FP16) on Metal and WebGPU, 14 / 2 ms on CUDA (3 / 1 %), in a batch
+  of 8 as for single pairs.
+- **Speed**, per pair, 512 px, 9 layers, 2048 keypoints per image, best of 8 (M5 Pro; CUDA: RTX 2070
+  Max-Q). Passing: the Berlin pair; stopped after 8: berlin1 - lamar_cab_1446 (different places, 0.63 after
+  layer 8) at decay 0.2; after 4: the LaMAR look-alikes at decay 0.5; after 2: the same at decay 0.2.
+
+  | Backend | Off | Passing, checked | Stopped after 8 | after 4 | after 2 |
+  |---|---|---|---|---|---|
+  | Metal FP32 | 311 ms | 313 ms | 282 ms | 147 ms | 77 ms |
+  | Metal FP16 | 102 ms | 104 ms | 96 ms | 53 ms | 30 ms |
+  | WebGPU FP32 | 471 ms | 475 ms | 424 ms | 217 ms | 113 ms |
+  | WebGPU FP16 | 308 ms | 313 ms | 280 ms | 145 ms | 77 ms |
+  | CUDA FP32 | 413 ms | 427 ms | 389 ms | 201 ms | 106 ms |
+  | CUDA FP16 | 144 ms | 146 ms | 131 ms | 70 ms | 40 ms |
+
+  A stopped pair still runs the head at its stop layer for every keypoint (as the original does: its
+  predicted points and confidences are returned, only the matches are dropped); that is most of what is
+  left after layer 2.
+- **Which decay.** From the per-layer scores of the 53 images of `covis.py` (all 1378 pairs; 400 in the
+  same scene), with min_covisibility 0.8, the rule replayed on the reference scores:
+
+  | Decay | Pairs of other scenes stopped | Mean stop layer | Transformer work left | Pairs lost |
+  |---|---|---|---|---|
+  | 0 | 99.8 % | 2.0 | 45 % | 1 same-scene, 18 others that pass at 9 |
+  | 0.1 | 95.4 % | 3.7 | 60 % | 1 other |
+  | 0.2 | 84.9 % | 5.6 | 77 % | none |
+  | 0.5 | 41.9 % | 7.9 | 96 % | none |
+
+  "Lost": pairs that would score >= 0.8 after 9 layers but stop early. Unrelated scenes score 0.3-0.7 at
+  full depth, and the bar after layer k is 0.8 (1 - decay)^(9 - k): at 0.5 it is below 0.03 up to layer 4,
+  so only look-alikes (near 0) stop early. The original's README uses 0.2 in its example, its ONNX notes 0.5
+  (ETH3D, 42 % of pairs skip most of the work). 0.2 is what `jmt.h` points to; the default stays off.
+- **After a shortlist there is little left to stop.** On the k = 5 shortlist of the same images (156 pairs,
+  20 of other scenes) decay 0.2 stops 16 pairs and saves 6 % of the transformer; k = 10 (329 pairs, 59 of
+  other scenes): 50 pairs, 8 %. Early stop pays for exhaustive matching (small captures, where level 2 or
+  nothing builds the list) and for look-alikes the shortlist lets through.
+- **CUDA FP32, LaMAR pair stopped after layer 4:** one confidence differs from the original by 1.4e-3
+  (elsewhere within 2e-5; confident points within 2.2e-4 px). It is query 1098 of image A (confidence
+  0.009), whose two best cells at layer 4 differ by 2e-7 in logit in the original (float64; the smallest
+  gap of the 2048 queries) and lie 37 cells apart: FP32 rounding on CUDA picks the other one and the point
+  moves 453 px. The same with 4 layers and no early stop; the pair has no matches either way.
+- **In the browser** (`web/test.html`, Chrome in the desktop app's browser pane, M5 Pro): the page now
+  also runs the 6 pairs with early stop, at 512 px / 9 layers with 0.8 / 0.2 and at 384 px / 5 layers with
+  0.8 / 0 (stops after layer 2, 4 and 8, and pairs that pass), and requires the native stop layer. All 24
+  early-stop runs stop where the native CPU backend does, in FP32 and FP16; FP32 gives the native matches
+  (points within 3.0e-4 px), FP16 differs by at most 3 matches (67 of 70 shared on the Berlin pair). The
+  whole page, 48 runs, passes. A pair stopped after layer 2 takes 116 / 81 ms in FP32 / FP16 at 512 px,
+  one that passes 477 / 316 ms (berlin1_h1 - _h2; the first pair of each run also compiles the kernels).
+- **Not done:** a capture where the shortlist and early stop are measured together on real overlap (C1's
+  capture).

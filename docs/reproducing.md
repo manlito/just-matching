@@ -196,6 +196,20 @@ In FP16 a few unconfident queries land on another cell (the `pos max` of several
 That is the case FlexGlue's own float16 mode is in too: `python tools/compare.py ... --a upstream:cpu
 --b upstream:mps,fp16` (or `upstream:cuda,fp16`) shows the original against itself in half precision.
 
+### With early stop
+
+`--min-covisibility S --early-stop D` go to both implementations, and the CLI's own options of the same
+names to jmt. Each line then also shows `layer`, the layers each implementation ran, and the last line
+counts the pairs where they differ:
+
+```sh
+tools/compare_all.sh metal --min-covisibility 0.8 --early-stop 0.2    # also 0 and 0.5
+```
+
+On the 6 pairs these decays stop pairs after layer 2, 4 or 8, or not at all. On all seven backends and precisions (`cpu`,
+`metal`, `cuda`, `webgpu`, each GPU one also in FP16; 42 runs) the stop layer was the original's on every pair, and the matches agreed as in the table above:
+identical in FP32, 1 of 70 different on the Berlin pair in `cuda:fp16`.
+
 ## 4. A backend this machine does not have
 
 `tools/remote.sh` runs the CLI on another machine over SSH: input files are copied there, the result is

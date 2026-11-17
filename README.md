@@ -17,7 +17,8 @@ PyTorch on the same GPU:
 | RTX 2070 Max-Q laptop, CUDA | 0.42 s | 0.63 s | 0.14 s | 0.21 s | 54 / 18 ms |
 
 WebGPU (Dawn natively, Chrome in the browser) on the M5 Pro: see PLAN.md, M6. Covisibility levels 1 and 2
-(which pairs to match, from the features alone) and the shortlist are in; level 3 is FlexGlue's own score.
+(which pairs to match, from the features alone) and the shortlist are in; level 3 is FlexGlue's own score,
+with early stop on pairs it rejects, as in the original.
 
 ## Build
 
@@ -52,7 +53,8 @@ cmake --build build/wasm      # -> build/wasm/web: jmt_wasm.js / .wasm, jmt.js, 
 
 `web/jmt.js` wraps the module (`create`, `describe`, `match`); it needs JSPI (Chrome, Edge). The weights are
 served next to it and may be the FP16 file (284 MB instead of 567; widened to float32 on load). The test page
-compares the module with the native CPU backend on the 6 test pairs:
+compares the module with the native CPU backend on the 6 test pairs, without and with early stop
+(`?settings=2,3` runs only the latter):
 
 ```sh
 python tools/web_testdata.py --out build/wasm/web/testdata
@@ -126,6 +128,11 @@ jmt_shortlist(ctx, features, n_images, &so, &pairs);   /* pairs.idx[2*i], pairs.
 
 float s;
 jmt_covisibility(ctx, fa, fb, 2, &s);        /* one pair, level 1 or 2 */
+
+jmt_match_options mo;                        /* level 3: FlexGlue decides while matching */
+jmt_match_options_default(&mo);
+mo.min_covisibility = 0.8f;                  /* pairs below it get no matches */
+mo.early_stop_decay = 0.2f;                  /* and stop after a few layers: m.stop_layer < 9 */
 ```
 
 ## Validation against the original
