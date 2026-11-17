@@ -19,7 +19,7 @@ const WEIGHTS_URL = params.get('weights');
 const STORED = 'flexglue-weights';   // the visitor's weights file, in the origin private file system
 const jmt = await import(new URL(`${LIB}jmt.js`, location.href).href);
 const SAMPLES = ['tum-1', 'tum-2', 'tum-3', 'tum-4', 'kitti-1', 'kitti-2', 'kitti-3', 'kitti-4',
-                 'berlin-1', 'berlin-2', 'lamar-1', 'lamar-2'];
+                 'kitti-revisit-1', 'kitti-revisit-2', 'kitti-alike-1', 'kitti-alike-2'];
 const MAX_SIDE = 1600;   // larger images are scaled down before keypoints and matching
 const MAX_IMAGES = 48;
 const MIN_COVISIBILITY = 0.8;

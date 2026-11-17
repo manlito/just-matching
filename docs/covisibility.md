@@ -55,11 +55,14 @@ level 1, 0.9998 for level 2 and 1.0000 for level 3. With k = 5 the shortlist kee
 
 - **Level 1 scores sit in a narrow range**, 0.8 to 1 in practice: compare pairs with each other, not with a fixed
   bar. That is why the shortlist keeps the best k partners per image rather than every pair above a score.
-- **Level 1 ranks by look more than by place.** In the demo's 12 sample images, two views of one place in
-  Berlin, one of them a close-up, rank 7th of 11 for each other, behind the four street frames and the two LaMAR
-  images. With images in capture order, `neighbours` keeps such pairs.
-- **Level 2 needs the same scale.** The Berlin pair scores 0.11 at level 2, against 0.99 from FlexGlue itself. The
-  grid looks for each point in one cell of the other image, and a close-up spreads one cell over many.
+- **Level 1 ranks by look more than by place.** In the demo's 12 sample images, two KITTI frames of different
+  streets that look alike rank first for each other (0.984), above the frames of a corner passed twice (0.979 to
+  0.981 against them). FlexGlue scores the look-alikes 0.06. With images in capture order, `neighbours` keeps the
+  pairs that matter.
+- **Level 2 tells the look-alikes apart,** 0.17 against 0.44 for the corner passed twice, **but needs the same
+  scale.** FlexGlue's own example pair (`assets/berlin1.jpg` and `berlin2.jpg` in its repository, a close-up of one
+  facade) scores 0.11 at level 2, against 0.99 from FlexGlue itself. The grid looks for each point in one cell of
+  the other image, and a close-up spreads one cell over many.
 - Ranking partial overlap inside one capture, which is the shortlist's real job, has not been measured against a
   reference such as MegaLoc yet.
 
@@ -98,5 +101,5 @@ Every pair of the 53 images, with `min_covisibility` 0.8. "Lost" counts pairs th
 - **After a shortlist there is little left to stop.** On the k = 5 shortlist of the same images, decay 0.2 stops
   16 pairs and saves 6 % of the transformer's work. Early stop pays most when matching every pair of a small
   capture, and on look-alikes that the shortlist lets through.
-- **A pair can pass with a handful of matches.** In the demo's samples, a KITTI street frame and a LaMAR image of
-  another place score 0.99 with 16 matches. A minimum number of matches is a useful second test.
+- **A pair can pass with a handful of matches.** A KITTI street frame (`kitti-1` of the demo) and an indoor image of
+  FlexGlue's examples (`assets/lamar_cab_1446.jpg`) score 0.99 with 16 matches. A minimum number of matches is a useful second test.

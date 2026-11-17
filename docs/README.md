@@ -31,9 +31,8 @@ site is about 3 MB.
 
 ## Deploying
 
-Before the first deployment: the Berlin and LaMAR sample images (`web/samples/README.md`) have no stated licence.
-
-The `docs` workflow (`.github/workflows/docs.yml`) is started by hand:
+The `docs` workflow (`.github/workflows/docs.yml`) runs on every push to `main`, so merging a pull request
+builds the site and publishes it to Cloudflare Pages. It can also be started by hand:
 
 ```bash
 gh workflow run docs                    # build the modules and the site

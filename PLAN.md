@@ -256,11 +256,12 @@ reference for recall, before any C++ is written for them.
   the matches of any pair (one that was not kept is matched on click). The shortlist is now in the
   WebAssembly module (`covisibility`, `level1`, `shortlist` in `jmt.js`), and the test page checks it against
   the native CPU backend. Documentation site done (`docs/`, Sphinx and just-keypoints' theme; 10 pages; the
-  demo as `demo/`; `.github/workflows/docs.yml`, by hand, deploys to Cloudflare Pages). The demo takes the
+  demo as `demo/`; `.github/workflows/docs.yml` deploys to Cloudflare Pages on every push to main, or by hand). The demo takes the
   weights from the user: a Load weights button or a drop of `flexglue.pth` (or a `.jmtw`), kept in the origin
-  private file system until Forget. Open: deploying (secrets `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID`, and a
-  Pages project), and a stated licence for the Berlin and LaMAR samples before
-  anything is published. See "Notes from M7: documentation site and the weights".
+  private file system until Forget. Deploying is set up (secrets `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID`, and a
+  Pages project). The Berlin and LaMAR samples, which had no stated licence
+  (berlin1.jpg is a stock-agency photo), were replaced by KITTI frames (CC BY-NC-SA 3.0, credited in
+  `web/samples/README.md`): a corner passed twice and two look-alike streets. See "Notes from M7: documentation site and the weights".
 - [ ] **M8 — v1.0**: CMake package, npm package.
 - [ ] **M9 — LightGlue**: ALIKED descriptors from just-keypoints matched by LightGlue, so the library runs with
   weights it can ship; FlexGlue stays the option for doppelganger rejection, with the user's own weights.
