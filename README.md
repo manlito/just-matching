@@ -3,6 +3,14 @@
 Image matching (FlexGlue) and covisibility with minimal dependencies, the companion of
 [just-keypoints](../just-keypoints). No PyTorch, no ONNX Runtime at run time. Plan and status: [PLAN.md](PLAN.md).
 
+> [!IMPORTANT]
+> **Use [FlexGlue](https://github.com/cvg/FlexGlue) and [LightGlue](https://github.com/cvg/LightGlue).** This
+> repository is a test bed for batching and GPU kernels, not a replacement for them. It adds nothing to them except
+> speed: no new networks, training or weights, and only a subset of what they offer (inference, no training). Its one
+> extra, the shortlist of pairs, is built from FlexGlue's own features. The methods, and the credit for them, are
+> their authors'. For real work, FlexGlue and LightGlue are the libraries to depend on. LightGlue is not ported yet
+> (PLAN.md, M9).
+
 Status: the CPU reference backend and the Metal, CUDA and WebGPU backends work and reproduce the original
 FlexGlue; WebGPU also runs in the browser (WebAssembly). On the 6 test pairs at two settings, in FP32, they return the same matches as the original;
 predicted points agree within 0.0004 px. How to check this yourself, with the commands and their output:

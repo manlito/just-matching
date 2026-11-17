@@ -5,6 +5,14 @@ which image pairs are worth matching. No PyTorch, no ONNX Runtime, no cuDNN: one
 kernels for each backend. Keypoints come from
 [just-keypoints](https://just-keypoints.pages.dev); only their positions are used.
 
+:::{important}
+**Use [FlexGlue](https://github.com/cvg/FlexGlue) and [LightGlue](https://github.com/cvg/LightGlue).** This
+project is a test bed for batching and GPU kernels, not a replacement for them. It adds nothing to them except
+speed: no new networks, training or weights, and only a subset of what they offer (inference, no training). Its one
+extra, the shortlist of pairs, is built from FlexGlue's own features. The methods, and the credit for them, are
+their authors'. For real work, FlexGlue and LightGlue are the libraries to depend on. LightGlue is not ported yet.
+:::
+
 - **Backends**: the CPU (plain C++, the reference), CUDA on NVIDIA GPUs, Metal on Apple Silicon, and
   WebGPU, natively and in the browser through WebAssembly.
 - **Same results as the original**: in FP32 every backend returns the original FlexGlue's matches on the
