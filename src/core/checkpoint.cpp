@@ -1,6 +1,7 @@
 #include "core/checkpoint.h"
 
 #include <cstdint>
+#include <algorithm>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -360,15 +361,31 @@ bool ends_with(const std::string& s, const std::string& end) {
   return s.size() >= end.size() && s.compare(s.size() - end.size(), end.size(), end) == 0;
 }
 
+// Rows of self_attn.Wqkv from (head, dim, q|k|v) to (q|k|v, head, dim), as in both originals' forward.
+void reorder_wqkv(OwnedTensor& t, size_t heads) {
+  const size_t rows = t.shape.empty() ? 0 : t.shape[0];
+  if (!rows || rows % (3 * heads)) fail("shape of '" + t.name + "'");
+  const size_t row = t.data.size() / rows, head_dim = rows / (3 * heads);
+  std::vector<float> v(t.data.size());
+  for (size_t s = 0; s < 3; ++s)
+    for (size_t h = 0; h < heads; ++h)
+      for (size_t d = 0; d < head_dim; ++d) {
+        const size_t to = (s * heads + h) * head_dim + d, from = (h * head_dim + d) * 3 + s;
+        std::memcpy(&v[to * row], &t.data[from * row], row * sizeof(float));
+      }
+  t.data = std::move(v);
+}
+
 }  // namespace
 
 bool is_torch_checkpoint(const void* data, size_t size) {
   return size >= 4 && le(static_cast<const uint8_t*>(data), 4) == 0x04034b50;
 }
 
-Weights flexglue_from_checkpoint(const void* data, size_t size) {
-  const int kHeads = 8;
-  std::vector<OwnedTensor> sd = read_state_dict(static_cast<const uint8_t*>(data), size);
+namespace {
+
+Weights flexglue_from_state_dict(std::vector<OwnedTensor> sd) {
+  const size_t kHeads = 8;
   std::map<std::string, const OwnedTensor*> gammas;  // block prefix -> layer scale
   for (const OwnedTensor& t : sd)
     if (ends_with(t.name, ".gamma")) gammas[t.name.substr(0, t.name.size() - 5)] = &t;
@@ -387,19 +404,8 @@ Weights flexglue_from_checkpoint(const void* data, size_t size) {
       for (size_t r = 0; r < s.size(); ++r)
         for (size_t c = 0; c < row; ++c) t.data[r * row + c] = t.data[r * row + c] * s[r];
     }
-    // Wqkv rows from (head, dim, q|k|v) to (q|k|v, head, dim).
-    if (ends_with(t.name, "self_attn.Wqkv.weight") || ends_with(t.name, "self_attn.Wqkv.bias")) {
-      const size_t rows = t.shape[0], row = t.data.size() / rows, head_dim = rows / (3 * kHeads);
-      if (rows % (3 * kHeads)) fail("shape of '" + t.name + "'");
-      std::vector<float> v(t.data.size());
-      for (size_t s = 0; s < 3; ++s)
-        for (size_t h = 0; h < kHeads; ++h)
-          for (size_t d = 0; d < head_dim; ++d) {
-            const size_t to = (s * kHeads + h) * head_dim + d, from = (h * head_dim + d) * 3 + s;
-            std::memcpy(&v[to * row], &t.data[from * row], row * sizeof(float));
-          }
-      t.data = std::move(v);
-    }
+    if (ends_with(t.name, "self_attn.Wqkv.weight") || ends_with(t.name, "self_attn.Wqkv.bias"))
+      reorder_wqkv(t, kHeads);
     // 1x1 convolutions as (out, in) matrices; scalars (the readout temperatures) as one value, as in the file.
     if (t.shape.size() == 4 && t.shape[2] == 1 && t.shape[3] == 1) t.shape.resize(2);
     if (t.shape.empty()) t.shape = {1};
@@ -425,6 +431,44 @@ Weights flexglue_from_checkpoint(const void* data, size_t size) {
       {"depths", "3,3,27,3"},    {"widths", "128,256,512,1024"}, {"source", "flexglue.pth"},
       {"license", "backbone.*: DINOv3 License; everything else: MIT"}};
   return Weights::from_tensors(std::move(meta), std::move(out));
+}
+
+Weights lightglue_from_state_dict(std::vector<OwnedTensor> sd) {
+  const size_t kHeads = 4;
+  std::vector<OwnedTensor> out;
+  for (OwnedTensor& t : sd) {
+    if (t.name == "confidence_thresholds") continue;  // a buffer the graph computes
+    if (ends_with(t.name, "self_attn.Wqkv.weight") || ends_with(t.name, "self_attn.Wqkv.bias"))
+      reorder_wqkv(t, kHeads);
+    out.push_back(std::move(t));
+  }
+  const auto input = std::find_if(out.begin(), out.end(), [](const OwnedTensor& t) { return t.name == "input_proj.weight"; });
+  if (input == out.end() || input->shape != std::vector<int>{256, 128})
+    fail("not a LightGlue checkpoint for 128-dim descriptors (input_proj.weight)");
+  std::map<std::string, std::string> meta = {{"kind", "weights"},  {"model", "lightglue"}, {"n_layers", "9"},
+                                             {"dim", "256"},       {"heads", "4"},         {"input_dim", "128"},
+                                             {"license", "Apache-2.0"}, {"source", "LightGlue checkpoint"}};
+  return Weights::from_tensors(std::move(meta), std::move(out));
+}
+
+bool has_layer_scales(const std::vector<OwnedTensor>& sd) {
+  return std::any_of(sd.begin(), sd.end(), [](const OwnedTensor& t) { return ends_with(t.name, ".gamma"); });
+}
+
+}  // namespace
+
+Weights flexglue_from_checkpoint(const void* data, size_t size) {
+  return flexglue_from_state_dict(read_state_dict(static_cast<const uint8_t*>(data), size));
+}
+
+Weights lightglue_from_checkpoint(const void* data, size_t size) {
+  return lightglue_from_state_dict(read_state_dict(static_cast<const uint8_t*>(data), size));
+}
+
+Weights weights_from_checkpoint(const void* data, size_t size) {
+  // FlexGlue's backbone has ConvNeXt layer scales; LightGlue has none.
+  std::vector<OwnedTensor> sd = read_state_dict(static_cast<const uint8_t*>(data), size);
+  return has_layer_scales(sd) ? flexglue_from_state_dict(std::move(sd)) : lightglue_from_state_dict(std::move(sd));
 }
 
 }  // namespace jmt

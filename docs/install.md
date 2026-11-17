@@ -30,10 +30,25 @@ This gives the static library `libjmt.a`, the single public header `jmt/jmt.h` a
 | `JMT_BUILD_WASM` | `ON` | under Emscripten: build the WebAssembly module and its JavaScript wrapper |
 | `JMT_BUILD_CLI` | `ON` | build the `jmt` tool |
 | `JMT_BUILD_TESTS` | `ON` | build the tests |
+| `JMT_EMBED_WEIGHTS` | `OFF` | build LightGlue's weights into the library (`#embed`: Clang 19 or GCC 15); 47.6 MB per model |
+| `JMT_EMBED_MODELS` | both | which: `lightglue-aliked`, `lightglue-raco-aliked`, read from `weights/<model>.jmtw` |
 
 ## Weights
 
-The weights are not part of the library. Download `flexglue.pth` (567 MB) from
+LightGlue's weights (Apache-2.0) can be built into the library. Fetch the checkpoints, convert them, then
+configure with `JMT_EMBED_WEIGHTS=ON`; a context created with `config.model = "lightglue-aliked"` and no
+weights then uses them:
+
+```bash
+curl -fL -o aliked_lightglue.pth https://github.com/cvg/LightGlue/releases/download/v0.1_arxiv/aliked_lightglue.pth
+shasum -a 256 aliked_lightglue.pth    # d975e965b105311a6143194852297dff4f02aea5cc2e10cecfed966ca0e22503
+build/release/jmt convert aliked_lightglue.pth weights/lightglue-aliked.jmtw
+cmake -S . -B build/release -DJMT_EMBED_WEIGHTS=ON -DJMT_EMBED_MODELS=lightglue-aliked && cmake --build build/release
+```
+
+Without them, give the checkpoint or the `.jmtw` file at run time, as for FlexGlue.
+
+FlexGlue's weights are not part of the library. Download `flexglue.pth` (567 MB) from
 <a href="https://github.com/cvg/FlexGlue/releases/tag/v0.1">FlexGlue's v0.1 release</a> and give its path to the
 library or to `jmt --weights`; it reads the checkpoint as it is, without PyTorch. Its backbone is under Meta's
 DINOv3 License, which you accept by using it ([Licences](licences.md)).
@@ -68,5 +83,5 @@ emcmake cmake -S . -B build/wasm -DCMAKE_BUILD_TYPE=Release -DJMT_BUILD_CLI=OFF 
 cmake --build build/wasm
 ```
 
-`build/wasm/web` then holds the module (`jmt_wasm.js`, 100 KB, and `jmt_wasm.wasm`, 302 KB) and the wrapper
+`build/wasm/web` then holds the module (`jmt_wasm.js`, 100 KB, and `jmt_wasm.wasm`, 399 KB) and the wrapper
 `jmt.js`. Serve them and a weights file as static files; see [In the browser](browser.md).

@@ -8,6 +8,7 @@
 #include <stdexcept>
 #include <thread>
 
+#include "core/assignment.h"
 #include "core/ops.h"
 #include "core/preprocess.h"
 #include "core/readout.h"
@@ -280,18 +281,57 @@ class CpuOps : public Ops {
           for (int j = 0; j < d; ++j) axpy(qr[j] * scale, kt.data() + static_cast<size_t>(hd * d + j) * S, logits.data(), S);
           float top = logits[0];
           for (int s = 1; s < S; ++s) top = std::max(top, logits[s]);
-          float sum = 0;
+          double sum = 0;
           for (int s = 0; s < S; ++s) {
             logits[s] = std::exp(logits[s] - top);
             sum += logits[s];
           }
           float* o = out->row(p) + hd * d;
-          std::fill(o, o + d, 0.0f);
-          const float inv = 1.0f / sum;
-          for (int s = 0; s < S; ++s) axpy(logits[s] * inv, v.row(s) + hd * d, o, d);
+          std::vector<double> acc(d, 0.0);
+          const double inv = 1.0 / sum;
+          for (int s = 0; s < S; ++s) {
+            const double wgt = logits[s] * inv;
+            const float* vr = v.row(s) + hd * d;
+            for (int j = 0; j < d; ++j) acc[j] += wgt * vr[j];
+          }
+          for (int j = 0; j < d; ++j) o[j] = static_cast<float>(acc[j]);
         }
     });
     return out;
+  }
+
+  TensorPtr rotary_keypoints(const TensorPtr& xp, const TensorPtr& cosp, const TensorPtr& sinp, int heads) override {
+    const CpuTensor &x = cpu(xp), &c = cpu(cosp), &sn = cpu(sinp);
+    const int pairs = x.c / heads / 2;
+    if (c.n() != x.n() || c.c != pairs || sn.n() != x.n() || sn.c != pairs) throw std::runtime_error("rotary: shape mismatch");
+    auto out = make(x.h, x.w, x.c);
+    out->d = x.d;
+    parallel_for(x.n(), [&](int begin, int end) {
+      rotary_rows(out->row(begin), c.d.data() + static_cast<size_t>(begin) * pairs,
+                  sn.d.data() + static_cast<size_t>(begin) * pairs, end - begin, heads, pairs);
+    });
+    return out;
+  }
+
+  TensorPtr gather_rows(const TensorPtr& xp, const std::vector<int>& rows) override {
+    const CpuTensor& x = cpu(xp);
+    auto out = make(1, static_cast<int>(rows.size()), x.c);
+    for (size_t r = 0; r < rows.size(); ++r) {
+      if (rows[r] < 0 || rows[r] >= x.n()) throw std::runtime_error("gather_rows: index out of range");
+      std::memcpy(out->row(static_cast<int>(r)), x.row(rows[r]), x.c * sizeof(float));
+    }
+    return out;
+  }
+
+  void assignment(const TensorPtr& ap, const TensorPtr& bp, const TensorPtr& zap, const TensorPtr& zbp,
+                  std::vector<int>* best0, std::vector<float>* max0, std::vector<int>* best1,
+                  std::vector<float>* max1) override {
+    const CpuTensor &a = cpu(ap), &b = cpu(bp), &za = cpu(zap), &zb = cpu(zbp);
+    if (a.c != b.c || za.n() != a.n() || zb.n() != b.n() || za.c != 1 || zb.c != 1)
+      throw std::runtime_error("assignment: shape mismatch");
+    assignment_host(a.d.data(), a.n(), b.d.data(), b.n(), a.c, za.d.data(), zb.d.data(),
+                    [this](int n, const std::function<void(int, int)>& fn) { parallel_for(n, fn); }, best0, max0,
+                    best1, max1);
   }
 
   TensorPtr sample(const TensorPtr& xp, const float* pts, int n) override {

@@ -1,10 +1,15 @@
 // jmt: command line front end of the just-matching library.
 //
 //   jmt match A B --kpts-a A.jkpt --kpts-b B.jkpt [--out OUT.jmtt] [options]
+//   jmt match --model lightglue-aliked --kpts-a A.jkpt --kpts-b B.jkpt [--out OUT.jmtt] [options]
 //   jmt shortlist IMAGE... [--out OUT.jmtt] [options]
+//   jmt convert IN OUT.jmtw [--fp16]        a checkpoint as released (.pth) or a .jmtw file -> .jmtw
 //
 // A, B: images (PNG, JPEG, ...). The keypoint files are just-keypoints outputs (`jkp extract --out`), or any
 // container with a float32 tensor "keypoints" (N, 2) in pixels with (0,0) at the centre of the top-left pixel.
+// LightGlue reads no images: it needs "descriptors" (N, 128) and the image size (metadata width and height,
+// as just-keypoints writes them) from the keypoint files. Its a_in_b and b_in_a hold the matched keypoints'
+// positions (NaN when unmatched), conf_a and conf_b the matchability, covisibility -1.
 // OUT holds matches (K, 2: index in A, index in B), scores (K), a_in_b (Na, 2), b_in_a (Nb, 2), conf_a (Na),
 // conf_b (Nb), covisibility (1), stop_layer (1), all float32; with --dump-features also features_a and
 // features_b (h, w, 256).
@@ -33,15 +38,23 @@ namespace {
 void usage() {
   std::fprintf(stderr,
                "usage: jmt match A B --kpts-a A.jkpt --kpts-b B.jkpt [--out OUT.jmtt] [options]\n"
+               "       jmt match --model lightglue-aliked --kpts-a A.jkpt --kpts-b B.jkpt [--out OUT.jmtt] [options]\n"
+               "  --model M              flexglue (default), lightglue-aliked or lightglue-raco-aliked\n"
                "  --backend B            cpu (default), metal, metal:fp16, cuda, cuda:fp16,\n"
                "                         webgpu, webgpu:fp16\n"
-               "  --weights FILE         flexglue.pth as released, or a .jmtw file (default weights/flexglue.jmtw)\n"
+               "  --weights FILE         a checkpoint as released (.pth) or a .jmtw file (default weights/flexglue.jmtw;\n"
+               "                         LightGlue: weights/<model>.jmtw if it exists, else the built-in weights;\n"
+               "                         builtin: the built-in weights)\n"
                "  --size N               network input side, multiple of 32 (default 512)\n"
                "  --layers N             transformer layers, 0..9 (default 9)\n"
                "  --filter T             minimum match score (default 0.1)\n"
                "  --max-px D             maximum transfer error in network-input pixels (default 3; 0 = off)\n"
                "  --min-covisibility S   reject pairs scoring below S (default 0 = off)\n"
                "  --early-stop D         stop early on non-covisible pairs, decay D in [0,1) (default off)\n"
+               "  --depth-confidence C   LightGlue: stop when more than C of the keypoints are confident\n"
+               "                         (default 0.95; 0 = every layer)\n"
+               "  --width-confidence C   LightGlue: drop confident keypoints with matchability <= 1 - C\n"
+               "                         (default 0.99; 0 = keep all)\n"
                "  --threads N            CPU threads (default all)\n"
                "  --dump-features        also write the dense features to OUT\n"
                "  --runs N               repeat N times and report the fastest run (default 1)\n"
@@ -51,7 +64,67 @@ void usage() {
                "  --neighbours N         also keep the N next images in the order given (default 0)\n"
                "  --rerank               score the kept pairs with level 2 (layer-0 grid round trip)\n"
                "  --min-score S          with --rerank, drop pairs scoring below S (default 0)\n"
-               "  --backend, --weights, --size, --threads as for match\n");
+               "  --backend, --weights, --size, --threads as for match\n"
+               "usage: jmt convert IN OUT.jmtw [--fp16]\n"
+               "  IN: a checkpoint as released (flexglue.pth, aliked_lightglue.pth, raco_aliked_lightglue.pth) or a\n"
+               "  .jmtw file; OUT gets the tensors the library reads, as float32 or with --fp16 as float16\n");
+}
+
+bool file_exists(const std::string& path) {
+  if (FILE* f = std::fopen(path.c_str(), "rb")) {
+    std::fclose(f);
+    return true;
+  }
+  return false;
+}
+
+double now_ms();
+
+// jmt match --model lightglue-*: keypoints, descriptors and image sizes all come from the keypoint files.
+int match_lightglue(jmt_config config, std::string weights, const std::string& kpts_a, const std::string& kpts_b,
+                    const std::string& out_path, const jmt_match_options& options, int runs) {
+  if (weights.empty() && file_exists("weights/" + std::string(config.model) + ".jmtw"))
+    weights = "weights/" + std::string(config.model) + ".jmtw";
+  if (weights == "builtin") weights.clear();
+  config.weights_path = weights.empty() ? nullptr : weights.c_str();  // none: the built-in weights
+  double t0 = now_ms();
+  jmt_ctx* ctx = jmt_create(&config);
+  if (!ctx) throw std::runtime_error(jmt_last_error());
+  const double t_load = now_ms() - t0;
+  jmt::Weights file_a = jmt::Weights::from_file(kpts_a), file_b = jmt::Weights::from_file(kpts_b);
+  const jmt::Param &ka = file_a.get("keypoints"), &kb = file_b.get("keypoints");
+  const jmt::Param &da = file_a.get("descriptors"), &db = file_b.get("descriptors");
+  const int na = static_cast<int>(ka.size() / 2), nb = static_cast<int>(kb.size() / 2);
+  const int dim = da.shape.size() == 2 ? da.shape[1] : 0;
+  jmt_features *fa = nullptr, *fb = nullptr;
+  jmt_matches m;
+  double t_describe = 1e30, t_match = 1e30;
+  for (int run = 0; run < std::max(1, runs); ++run) {
+    jmt_features_free(fa), jmt_features_free(fb);
+    t0 = now_ms();
+    fa = jmt_describe_keypoints(ctx, file_a.meta_int("width"), file_a.meta_int("height"), ka.data, da.data, na, dim);
+    fb = fa ? jmt_describe_keypoints(ctx, file_b.meta_int("width"), file_b.meta_int("height"), kb.data, db.data, nb, dim)
+            : nullptr;
+    if (!fa || !fb) throw std::runtime_error(jmt_last_error());
+    t_describe = std::min(t_describe, (now_ms() - t0) / 2);
+    t0 = now_ms();
+    if (jmt_match(ctx, fa, ka.data, na, fb, kb.data, nb, &options, &m) != 0) throw std::runtime_error(jmt_last_error());
+    t_match = std::min(t_match, now_ms() - t0);
+  }
+  std::printf("%d matches from %d and %d keypoints, %d layers\n", m.n, na, nb, m.stop_layer);
+  std::printf("load %.0f ms, keypoints %.1f ms per image, match %.0f ms\n", t_load, t_describe, t_match);
+  if (!out_path.empty()) {
+    std::vector<float> idx(m.idx, m.idx + 2 * static_cast<size_t>(m.n));
+    float covis = m.covisibility, layer = static_cast<float>(m.stop_layer);
+    jmt::write_container(out_path, {{"kind", "matches"}, {"model", config.model}},
+                         {{"matches", {m.n, 2}, idx.data()}, {"scores", {m.n}, m.score},
+                          {"a_in_b", {na, 2}, m.a_in_b}, {"b_in_a", {nb, 2}, m.b_in_a},
+                          {"conf_a", {na}, m.conf_a}, {"conf_b", {nb}, m.conf_b},
+                          {"covisibility", {1}, &covis}, {"stop_layer", {1}, &layer}});
+  }
+  jmt_features_free(fa), jmt_features_free(fb);
+  jmt_destroy(ctx);
+  return 0;
 }
 
 void set_backend(const std::string& b, jmt_config* config) {
@@ -156,6 +229,33 @@ int shortlist(int argc, char** argv) {
 }  // namespace
 
 int main(int argc, char** argv) {
+  if (argc >= 2 && std::strcmp(argv[1], "convert") == 0) {
+    try {
+      std::vector<std::string> paths;
+      bool fp16 = false;
+      for (int i = 2; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--fp16") == 0) fp16 = true;
+        else if (argv[i][0] == '-' && argv[i][1] == '-') throw std::runtime_error(std::string("unknown option ") + argv[i]);
+        else paths.push_back(argv[i]);
+      }
+      if (paths.size() != 2) throw std::runtime_error("convert: IN and OUT are required");
+      const jmt::Weights w = jmt::Weights::from_file(paths[0]);
+      std::vector<jmt::NamedTensor> tensors;
+      size_t values = 0;
+      for (const std::string& name : w.names()) {
+        const jmt::Param& p = w.get(name);
+        tensors.push_back({name, p.shape, p.data});
+        values += p.size();
+      }
+      jmt::write_container(paths[1], w.metadata(), tensors, fp16);
+      std::printf("%s: %s, %zu tensors, %zu values, %s\n", paths[1].c_str(), w.meta("model").c_str(), tensors.size(), values,
+                  fp16 ? "float16" : "float32");
+    } catch (const std::exception& e) {
+      std::fprintf(stderr, "error: %s\n", e.what());
+      return 1;
+    }
+    return 0;
+  }
   if (argc >= 2 && std::strcmp(argv[1], "shortlist") == 0) {
     try {
       return shortlist(argc, argv);
@@ -169,7 +269,7 @@ int main(int argc, char** argv) {
     return 2;
   }
   try {
-    std::string kpts_a, kpts_b, out_path, weights = "weights/flexglue.jmtw";
+    std::string kpts_a, kpts_b, out_path, weights, model = "flexglue";
     std::vector<std::string> images;  // options may come before, between or after the two images
     jmt_config config;
     jmt_config_default(&config);
@@ -187,6 +287,7 @@ int main(int argc, char** argv) {
       else if (a == "--kpts-b") kpts_b = value();
       else if (a == "--out") out_path = value();
       else if (a == "--weights") weights = value();
+      else if (a == "--model") model = value();
       else if (a == "--backend") set_backend(value(), &config);
       else if (a == "--runs") runs = std::stoi(value());
       else if (a == "--batch") batch = std::stoi(value());
@@ -196,14 +297,19 @@ int main(int argc, char** argv) {
       else if (a == "--max-px") options.max_distance_px = std::stof(value());
       else if (a == "--min-covisibility") options.min_covisibility = std::stof(value());
       else if (a == "--early-stop") options.early_stop_decay = std::stof(value());
+      else if (a == "--depth-confidence") options.depth_confidence = std::stof(value());
+      else if (a == "--width-confidence") options.width_confidence = std::stof(value());
       else if (a == "--threads") config.num_threads = std::stoi(value());
       else if (a == "--dump-features") dump_features = true;
       else if (a.rfind("--", 0) == 0) throw std::runtime_error("unknown option " + a);
       else images.push_back(a);
     }
+    if (kpts_a.empty() || kpts_b.empty()) throw std::runtime_error("--kpts-a and --kpts-b are required");
+    config.model = model.c_str();
+    if (model != "flexglue") return match_lightglue(config, weights, kpts_a, kpts_b, out_path, options, runs);
     if (images.size() != 2) throw std::runtime_error("two images are required");
     const std::string path_a = images[0], path_b = images[1];
-    if (kpts_a.empty() || kpts_b.empty()) throw std::runtime_error("--kpts-a and --kpts-b are required");
+    if (weights.empty()) weights = "weights/flexglue.jmtw";
     config.weights_path = weights.c_str();
 
     double t0 = now_ms();

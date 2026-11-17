@@ -1,7 +1,8 @@
 # Weights format
 
-The library reads FlexGlue's released checkpoint, `flexglue.pth`, directly: a zip archive of a pickled state dict,
-which it reads without PyTorch and rearranges as below. It also reads its own container, `.jmtw`: one flat binary
+The library reads the released checkpoints directly, FlexGlue's `flexglue.pth` and LightGlue's
+`aliked_lightglue.pth` and `raco_aliked_lightglue.pth`: zip archives of a pickled state dict, which it reads
+without PyTorch and rearranges as below. It also reads its own container, `.jmtw`: one flat binary
 file with a header, a table of tensors and the raw data. It needs no parsing
 library and loads equally with `fread`, `mmap` or `fetch()` into an `ArrayBuffer`. It is the container of
 just-keypoints' `.jkpw` files, with FlexGlue's tensors.
@@ -25,8 +26,9 @@ padding, then the raw tensor data; each tensor starts at `offset` (from the star
 
 `dtype`: 0 = float32, 1 = float16, 2 = int32, 3 = uint8. Tensor data is row-major (C order).
 
-Metadata keys of the weights files: `kind`, `model`, `n_layers`, `dim`, `heads`, `feature_dim`, `search_dim`,
-`stride`, `depths`, `widths`, `source`, `source_commit`, `license`.
+Metadata keys of the weights files: `kind`, `model` (`flexglue` or `lightglue`), `n_layers`, `dim`, `heads`,
+`feature_dim`, `search_dim`, `stride`, `depths`, `widths` (FlexGlue), `input_dim` (LightGlue), `source`,
+`source_commit`, `license`.
 
 ## The weights
 
@@ -35,9 +37,13 @@ Metadata keys of the weights files: `kind`, `model`, `n_layers`, `dim`, `heads`,
 | `flexglue.pth` | FlexGlue's v0.1 checkpoint, as released | 567 MB |
 | `flexglue.jmtw` | 870 tensors, 141,741,444 values, float32 | 567 MB |
 | `flexglue-fp16.jmtw` | the same tensors as float16 | 284 MB |
+| `aliked_lightglue.pth`, `raco_aliked_lightglue.pth` | LightGlue's checkpoints for ALIKED descriptors, as released | 47.6 MB each |
+| `lightglue-aliked.jmtw`, `lightglue-raco-aliked.jmtw` | 253 tensors, 11,884,625 values, float32 | 47.6 MB each |
+| `lightglue-aliked-fp16.jmtw` | the same tensors as float16, what the demo loads | 23.8 MB |
 
-The repository's `tools/export_weights.py` makes the `.jmtw` files from the checkpoint; reading the checkpoint
-gives the float32 file's tensors bit for bit. 89.6 million of the values are the DINOv3 ConvNeXt-B backbone and
+`jmt convert IN OUT.jmtw [--fp16]` makes the `.jmtw` files from a checkpoint, and so does the repository's
+`tools/export_weights.py` (`--model lightglue-aliked` for LightGlue); reading a checkpoint gives the float32
+file's tensors bit for bit, and both write the same float16 file. 89.6 million of the values are the DINOv3 ConvNeXt-B backbone and
 its neck, under the DINOv3 License; the 52.2 million of the matcher are under the MIT licence
 ([Licences](licences.md)).
 
@@ -47,3 +53,6 @@ Changes made to the checkpoint, when it is read or exported, none of which alter
 - The rows of each attention layer's combined query-key-value projection are reordered so that queries, keys and
   values are contiguous.
 - 1x1 convolution weights are stored as matrices.
+
+LightGlue's checkpoints change less: the same reordering of the self-attention's query-key-value rows (4 heads),
+and the stored confidence thresholds left out (the library computes them).

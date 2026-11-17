@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Fetch just-keypoints' browser module (the demo's keypoints: RaCo) from just-keypoints' documentation site into
+# Fetch just-keypoints' browser module (the demo's keypoints: RaCo for FlexGlue, ALIKED with its descriptors for
+# LightGlue) from just-keypoints' documentation site into
 # third_party/jkp-web (not committed), checked against pinned hashes:
 #
 #   tools/fetch_jkp_web.sh
@@ -16,6 +17,7 @@ FILES=(
   "jkp_wasm.js 54d4ddebaa5187427297c2c1ef401ca8ba4016367ad763f96a4bc58b7e36ae9a"
   "jkp_wasm.wasm 3fc11898ad410815e8a399c7e110bc9cb218362088c91bba6f84ec8a12711d20"
   "raco.jkpw a206d87e639b697d478d7bc7ec86d1e7f5a00f51d972721e69dbc784efa82abc"
+  "aliked-n16.jkpw 8002a58d4f374335b58941dd3eac210daa2d19270105932c60fbf6ae2d33f3a8"
 )
 
 sha256() { if command -v sha256sum >/dev/null; then sha256sum "$1"; else shasum -a 256 "$1"; fi | cut -d' ' -f1; }

@@ -527,6 +527,168 @@ fn run(gid: u32) {
   out[2u * gid + 1u] = real(b * c + a * s);
 }
 
+//@kernel k_rotary_t
+// Rotary encoding with the tables as tensors in the storage type (LightGlue: made per image). cosv, sinv:
+// (n, pairs). Scalars: n, heads, pairs.
+@group(0) @binding(1) var<storage, read> x: array<real>;
+@group(0) @binding(2) var<storage, read> cosv: array<real>;
+@group(0) @binding(3) var<storage, read> sinv: array<real>;
+@group(0) @binding(4) var<storage, read_write> out: array<real>;
+
+fn run(gid: u32) {
+  let pairs = pu(2u);
+  let per_token = pu(1u) * pairs;
+  if (gid >= pu(0u) * per_token) { return; }
+  let tok = gid / per_token;
+  let j = (gid % per_token) % pairs;
+  let c = f32(cosv[tok * pairs + j]);
+  let s = f32(sinv[tok * pairs + j]);
+  let a = f32(x[2u * gid]);
+  let b = f32(x[2u * gid + 1u]);
+  out[2u * gid] = real(a * c - b * s);
+  out[2u * gid + 1u] = real(b * c + a * s);
+}
+
+//@kernel k_gather_rows
+// out[r] = x[rows[r]], whole rows of c values. Scalars: c, count.
+@group(0) @binding(1) var<storage, read> x: array<real>;
+@group(0) @binding(2) var<storage, read> rows: array<i32>;
+@group(0) @binding(3) var<storage, read_write> out: array<real>;
+
+fn run(gid: u32) {
+  let c = pu(0u);
+  if (gid >= c * pu(1u)) { return; }
+  out[gid] = x[u32(rows[gid / c]) * c + gid % c];
+}
+
+//@kernel k_lse_rows
+// LightGlue's match assignment (see core/ops.h and the Metal kernels of the same names): the log-sum-exp of
+// every row of s (M, N) float. Scalars: M, N. Groups: M.
+//@group 128
+@group(0) @binding(1) var<storage, read> s: array<f32>;
+@group(0) @binding(2) var<storage, read_write> lse: array<f32>;
+var<workgroup> part: array<f32, 128>;
+var<workgroup> result: f32;
+
+fn reduce(v: f32, li: u32, take_max: bool) -> f32 {
+  part[li] = v;
+  workgroupBarrier();
+  for (var k = 64u; k > 0u; k >>= 1u) {
+    if (li < k) { part[li] = select(part[li] + part[li + k], max(part[li], part[li + k]), take_max); }
+    workgroupBarrier();
+  }
+  if (li == 0u) { result = part[0]; }
+  return workgroupUniformLoad(&result);
+}
+
+fn group(g: u32, li: u32) {
+  let M = pu(0u);
+  let N = pu(1u);
+  if (g >= M) { return; }
+  let row = g * N;
+  var top = kLowest;
+  for (var j = li; j < N; j += 128u) { top = max(top, s[row + j]); }
+  top = reduce(top, li, true);
+  var sum = 0.0;
+  for (var j = li; j < N; j += 128u) { sum += exp(s[row + j] - top); }
+  sum = reduce(sum, li, false);
+  if (li == 0u) { lse[g] = top + log(sum); }
+}
+
+//@kernel k_lse_cols
+// The log-sum-exp of every column of s (M, N); each thread walks one column. Scalars: M, N.
+@group(0) @binding(1) var<storage, read> s: array<f32>;
+@group(0) @binding(2) var<storage, read_write> lse: array<f32>;
+
+fn run(gid: u32) {
+  let M = pu(0u);
+  let N = pu(1u);
+  if (gid >= N) { return; }
+  var top = kLowest;
+  for (var i = 0u; i < M; i++) { top = max(top, s[i * N + gid]); }
+  var sum = 0.0;
+  for (var i = 0u; i < M; i++) { sum += exp(s[i * N + gid] - top); }
+  lse[gid] = top + log(sum);
+}
+
+//@kernel k_best_rows
+// The best column of every row: score(i, j) = ((s - row_lse_i) + (s - col_lse_j)) + (logsigmoid(za_i) +
+// logsigmoid(zb_j)), ties to the lower index. best: f32 (indices are exact below 2^24). Scalars: M, N.
+// Groups: M.
+//@group 128
+@group(0) @binding(1) var<storage, read> s: array<f32>;
+@group(0) @binding(2) var<storage, read> row_lse: array<f32>;
+@group(0) @binding(3) var<storage, read> col_lse: array<f32>;
+@group(0) @binding(4) var<storage, read> za: array<real>;
+@group(0) @binding(5) var<storage, read> zb: array<real>;
+@group(0) @binding(6) var<storage, read_write> best: array<f32>;
+@group(0) @binding(7) var<storage, read_write> value: array<f32>;
+var<workgroup> fpart: array<f32, 128>;
+var<workgroup> ipart: array<u32, 128>;
+
+fn log_sigmoid(z: f32) -> f32 { return min(z, 0.0) - log(1.0 + exp(-abs(z))); }
+
+fn group(g: u32, li: u32) {
+  let M = pu(0u);
+  let N = pu(1u);
+  if (g >= M) { return; }
+  let row = g * N;
+  let lr = row_lse[g];
+  let l0 = log_sigmoid(f32(za[g]));
+  var top = kLowest;
+  var at = N;
+  for (var j = li; j < N; j += 128u) {
+    let v = ((s[row + j] - lr) + (s[row + j] - col_lse[j])) + (l0 + log_sigmoid(f32(zb[j])));
+    if (v > top) { top = v; at = j; }
+  }
+  fpart[li] = top;
+  ipart[li] = at;
+  workgroupBarrier();
+  for (var k = 64u; k > 0u; k >>= 1u) {
+    if (li < k) {
+      let o = li + k;
+      if (fpart[o] > fpart[li] || (fpart[o] == fpart[li] && ipart[o] < ipart[li])) {
+        fpart[li] = fpart[o];
+        ipart[li] = ipart[o];
+      }
+    }
+    workgroupBarrier();
+  }
+  if (li == 0u) {
+    best[g] = f32(ipart[0]);
+    value[g] = fpart[0];
+  }
+}
+
+//@kernel k_best_cols
+// The best row of every column, as k_best_rows; each thread walks one column. Scalars: M, N.
+@group(0) @binding(1) var<storage, read> s: array<f32>;
+@group(0) @binding(2) var<storage, read> row_lse: array<f32>;
+@group(0) @binding(3) var<storage, read> col_lse: array<f32>;
+@group(0) @binding(4) var<storage, read> za: array<real>;
+@group(0) @binding(5) var<storage, read> zb: array<real>;
+@group(0) @binding(6) var<storage, read_write> best: array<f32>;
+@group(0) @binding(7) var<storage, read_write> value: array<f32>;
+
+fn log_sigmoid(z: f32) -> f32 { return min(z, 0.0) - log(1.0 + exp(-abs(z))); }
+
+fn run(gid: u32) {
+  let M = pu(0u);
+  let N = pu(1u);
+  if (gid >= N) { return; }
+  let lc = col_lse[gid];
+  let l1 = log_sigmoid(f32(zb[gid]));
+  var top = kLowest;
+  var at = 0u;
+  for (var i = 0u; i < M; i++) {
+    let sij = s[i * N + gid];
+    let v = ((sij - row_lse[i]) + (sij - lc)) + (log_sigmoid(f32(za[i])) + l1);
+    if (v > top) { top = v; at = i; }
+  }
+  best[gid] = f32(at);
+  value[gid] = top;
+}
+
 //@kernel k_sample
 // Bilinear samples at points in [-1, 1], border clamped. Scalars: h, w, c, n.
 @group(0) @binding(1) var<storage, read> x: array<real>;

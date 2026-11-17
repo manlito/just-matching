@@ -1076,6 +1076,98 @@ __global__ void k_rotary(const R* x, const float* cosv, const float* sinv, int n
   st(out + 2 * i + 1, b * c + a * s);
 }
 
+// Rotary encoding with the tables as tensors in the storage type (LightGlue: made per image). cosv, sinv:
+// (n, pairs). Grid: n * heads * pairs.
+template <typename R>
+__global__ void k_rotary_t(const R* x, const R* cosv, const R* sinv, int n, int heads, int pairs, R* out) {
+  const long long i = thread_index();
+  const int per_token = heads * pairs;
+  if (i >= static_cast<long long>(n) * per_token) return;
+  const long long tok = i / per_token;
+  const int j = static_cast<int>(i % per_token) % pairs;
+  const float c = ld(cosv[tok * pairs + j]), s = ld(sinv[tok * pairs + j]);
+  const float a = ld(x[2 * i]), b = ld(x[2 * i + 1]);
+  st(out + 2 * i, a * c - b * s);
+  st(out + 2 * i + 1, b * c + a * s);
+}
+
+// out[r] = x[rows[r]], whole rows of c values. Grid: count * c.
+template <typename R>
+__global__ void k_gather_rows(const R* x, const int* rows, int c, int count, R* out) {
+  const long long i = thread_index();
+  if (i >= static_cast<long long>(count) * c) return;
+  out[i] = x[static_cast<long long>(rows[i / c]) * c + i % c];
+}
+
+// ---------------------------------------------------------------------------------------------
+// LightGlue's match assignment (core/ops.h) on s (M, N) float, made by the read-out's product:
+//   score(i, j) = ((s_ij - row_lse_i) + (s_ij - col_lse_j)) + (logsigmoid(za_i) + logsigmoid(zb_j))
+// in four passes: the log-sum-exp of every row and of every column, then the best of every row and of
+// every column. The order of operations is the host's (core/assignment.h); ties go to the lower index.
+// Row kernels: one warp per row, 8 per block (grid ceil(M / 8)). Column kernels: one thread per column.
+// ---------------------------------------------------------------------------------------------
+__device__ __forceinline__ float log_sigmoid(float z) { return fminf(z, 0.0f) - log1pf(expf(-fabsf(z))); }
+
+__global__ void k_lse_rows(const float* s, int M, int N, float* lse) {
+  const int lane = threadIdx.x & 31, r = blockIdx.x * 8 + (threadIdx.x >> 5);
+  if (r >= M) return;
+  const float* row = s + static_cast<long long>(r) * N;
+  float top = -INFINITY;
+  for (int j = lane; j < N; j += 32) top = fmaxf(top, row[j]);
+  for (int o = 16; o > 0; o >>= 1) top = fmaxf(top, __shfl_xor_sync(0xffffffffu, top, o));
+  float sum = 0.0f;
+  for (int j = lane; j < N; j += 32) sum += expf(row[j] - top);
+  for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+  if (lane == 0) lse[r] = top + logf(sum);
+}
+
+__global__ void k_lse_cols(const float* s, int M, int N, float* lse) {
+  const long long j = thread_index();
+  if (j >= N) return;
+  float top = -INFINITY;
+  for (int i = 0; i < M; ++i) top = fmaxf(top, s[static_cast<long long>(i) * N + j]);
+  float sum = 0.0f;
+  for (int i = 0; i < M; ++i) sum += expf(s[static_cast<long long>(i) * N + j] - top);
+  lse[j] = top + logf(sum);
+}
+
+template <typename R>
+__global__ void k_best_rows(const float* s, int M, int N, const float* row_lse, const float* col_lse, const R* za, const R* zb,
+                            int* best, float* value) {
+  const int lane = threadIdx.x & 31, r = blockIdx.x * 8 + (threadIdx.x >> 5);
+  if (r >= M) return;
+  const float* row = s + static_cast<long long>(r) * N;
+  const float lr = row_lse[r], l0 = log_sigmoid(ld(za[r]));
+  float top = -INFINITY;
+  int at = N;
+  for (int j = lane; j < N; j += 32) {
+    const float v = ((row[j] - lr) + (row[j] - col_lse[j])) + (l0 + log_sigmoid(ld(zb[j])));
+    if (v > top) top = v, at = j;
+  }
+  for (int o = 16; o > 0; o >>= 1) {
+    const float tv = __shfl_xor_sync(0xffffffffu, top, o);
+    const int ta = __shfl_xor_sync(0xffffffffu, at, o);
+    if (tv > top || (tv == top && ta < at)) top = tv, at = ta;
+  }
+  if (lane == 0) best[r] = at, value[r] = top;
+}
+
+template <typename R>
+__global__ void k_best_cols(const float* s, int M, int N, const float* row_lse, const float* col_lse, const R* za, const R* zb,
+                            int* best, float* value) {
+  const long long j = thread_index();
+  if (j >= N) return;
+  const float lc = col_lse[j], l1 = log_sigmoid(ld(zb[j]));
+  float top = -INFINITY;
+  int at = 0;
+  for (int i = 0; i < M; ++i) {
+    const float sij = s[static_cast<long long>(i) * N + j];
+    const float v = ((sij - row_lse[i]) + (sij - lc)) + (log_sigmoid(ld(za[i])) + l1);
+    if (v > top) top = v, at = i;
+  }
+  best[j] = at, value[j] = top;
+}
+
 // Bilinear samples at points in [-1, 1], border clamped. Grid: n * c.
 template <typename R>
 __global__ void k_sample(const R* x, const float* pts, int h, int w, int c, int n, R* out) {
@@ -1711,7 +1803,6 @@ class CudaOps : public Ops {
     const CudaTensor &q = dev(qp), &k = dev(kp), &v = dev(vp);
     if (q.c % heads != 0 || k.c != q.c || v.c != q.c || k.n() != v.n()) fail("attention: shape mismatch");
     const int P = q.n(), S = k.n(), d = q.c / heads;
-    if (d % 16 != 0 || S % 16 != 0) fail("attention: channels per head and tokens per image must be multiples of 16");
     Ptr out = make(q.h, q.w, q.c);
     // Without the logits buffer, on the tensor cores (see k_flash).
     if (flash_ && d == 64 && (kHalf ? tensor_ != 0 : split_) && q.c % 8 == 0 && k.c % 8 == 0 && v.c % 8 == 0) {
@@ -1722,6 +1813,8 @@ class CudaOps : public Ops {
                   v.buf.template as<R>(), P, S, q.c, k.c, v.c, q.c, out->buf.template as<R>());
       return out;
     }
+    // k_flash masks the source tokens past S; the path through the logits buffer needs whole tiles.
+    if (d % 16 != 0 || S % 16 != 0) fail("attention: channels per head and tokens per image must be multiples of 16");
     // Logits (heads, P, S) and the largest of every row.
     Buffer tops(pool_, static_cast<size_t>(heads) * P * sizeof(int));
     JMT_CUDA_CHECK(cudaMemset(tops.template as<int>(), 0x80, static_cast<size_t>(heads) * P * sizeof(int)));  // below any float
@@ -1757,6 +1850,63 @@ class CudaOps : public Ops {
     gemm<kSoftmax>(logits.template as<float>(), v.buf.template as<R>(), nullptr, tops.template as<int>(), b,
                    out->buf.template as<R>(), heads);
     return out;
+  }
+
+  TensorPtr rotary_keypoints(const TensorPtr& xp, const TensorPtr& cosp, const TensorPtr& sinp, int heads) override {
+    const CudaTensor &x = dev(xp), &c = dev(cosp), &sn = dev(sinp);
+    const int pairs = x.c / heads / 2;
+    if (c.n() != x.n() || c.c != pairs || sn.n() != x.n() || sn.c != pairs || c.half != x.half || sn.half != x.half)
+      fail("rotary_keypoints: shape mismatch");
+    Ptr out = make(x.h, x.w, x.c);
+    g_profile.tag("rotary");
+    launch(k_rotary_t<R>, static_cast<long long>(x.n()) * heads * pairs, x.buf.template as<R>(), c.buf.template as<R>(),
+           sn.buf.template as<R>(), x.n(), heads, pairs, out->buf.template as<R>());
+    return out;
+  }
+
+  TensorPtr gather_rows(const TensorPtr& xp, const std::vector<int>& rows) override {
+    const CudaTensor& x = dev(xp);
+    const int count = static_cast<int>(rows.size());
+    for (int r : rows)
+      if (r < 0 || r >= x.n()) fail("gather_rows: index out of range");
+    Ptr out = make(1, count, x.c);
+    if (count == 0) return out;
+    Buffer idx(pool_, rows.size() * sizeof(int));
+    idx.upload(rows.data(), rows.size() * sizeof(int));
+    g_profile.tag("gather");
+    launch(k_gather_rows<R>, static_cast<long long>(count) * x.c, x.buf.template as<R>(), idx.template as<int>(), x.c, count,
+           out->buf.template as<R>());
+    return out;
+  }
+
+  // The similarity is the read-out's product (float in both precisions); the rest is four small passes.
+  void assignment(const TensorPtr& ap, const TensorPtr& bp, const TensorPtr& zap, const TensorPtr& zbp,
+                  std::vector<int>* best0, std::vector<float>* max0, std::vector<int>* best1,
+                  std::vector<float>* max1) override {
+    const CudaTensor &a = dev(ap), &b = dev(bp), &za = dev(zap), &zb = dev(zbp);
+    const int M = a.n(), N = b.n(), d = a.c;
+    if (b.c != d || za.n() != M || zb.n() != N || za.c != 1 || zb.c != 1) fail("assignment: shape mismatch");
+    best0->assign(M, -1), max0->assign(M, -INFINITY), best1->assign(N, -1), max1->assign(N, -INFINITY);
+    if (M == 0 || N == 0) return;
+    if (d % 16 != 0) fail("assignment: the number of channels must be a multiple of 16");
+    Buffer s(pool_, static_cast<size_t>(M) * N * sizeof(float));
+    Gemm g{};
+    g.n = M, g.cin = d, g.cout = N, g.scale = 1.0f / std::sqrt(static_cast<float>(d));
+    g.x_row = d, g.w_in = 1, g.w_out = d, g.o_row = N;
+    g_profile.tag("assignment M %d N %d", M, N);
+    gemm<kPlain>(a.buf.template as<R>(), b.buf.template as<R>(), nullptr, nullptr, g, s.template as<float>(), 1);
+    Buffer row_lse(pool_, M * sizeof(float)), col_lse(pool_, N * sizeof(float));
+    Buffer arg0(pool_, M * sizeof(int)), val0(pool_, M * sizeof(float)), arg1(pool_, N * sizeof(int)), val1(pool_, N * sizeof(float));
+    const float* sp = s.template as<float>();
+    launch_grid(k_lse_rows, dim3((M + 7) / 8), dim3(kBlock), sp, M, N, row_lse.template as<float>());
+    launch(k_lse_cols, N, sp, M, N, col_lse.template as<float>());
+    launch_grid(k_best_rows<R>, dim3((M + 7) / 8), dim3(kBlock), sp, M, N, row_lse.template as<float>(),
+                col_lse.template as<float>(), za.buf.template as<R>(), zb.buf.template as<R>(), arg0.template as<int>(),
+                val0.template as<float>());
+    launch(k_best_cols<R>, N, sp, M, N, row_lse.template as<float>(), col_lse.template as<float>(), za.buf.template as<R>(),
+           zb.buf.template as<R>(), arg1.template as<int>(), val1.template as<float>());
+    arg0.download(best0->data(), M * sizeof(int)), val0.download(max0->data(), M * sizeof(float));
+    arg1.download(best1->data(), N * sizeof(int)), val1.download(max1->data(), N * sizeof(float));
   }
 
   TensorPtr sample(const TensorPtr& xp, const float* pts, int n) override {

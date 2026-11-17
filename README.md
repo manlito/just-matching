@@ -1,7 +1,13 @@
 # just-matching
 
-Image matching (FlexGlue) and covisibility with minimal dependencies, the companion of
-[just-keypoints](../just-keypoints). No PyTorch, no ONNX Runtime at run time. Plan and status: [PLAN.md](PLAN.md).
+Image matching (FlexGlue, and LightGlue on ALIKED descriptors) and covisibility with minimal dependencies, the
+companion of [just-keypoints](../just-keypoints). No PyTorch, no ONNX Runtime at run time. Plan and status:
+[PLAN.md](PLAN.md).
+
+LightGlue (M9): `jmt match --model lightglue-aliked --kpts-a A.jkpt --kpts-b B.jkpt`, on every backend, with the
+original's matches and its adaptive depth and width; 16 ms per pair on the M5 Pro (Metal FP16), 18 ms on the
+RTX 2070 (CUDA FP16), 2048 keypoints per image. Its weights are Apache-2.0: `tools/fetch_lightglue.sh`, then
+`jmt convert` (or `tools/export_weights.py --model lightglue-aliked`) and `-DJMT_EMBED_WEIGHTS=ON` to build them in.
 
 > [!IMPORTANT]
 > **Use [FlexGlue](https://github.com/cvg/FlexGlue) and [LightGlue](https://github.com/cvg/LightGlue).** This

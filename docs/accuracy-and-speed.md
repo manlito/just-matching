@@ -1,6 +1,41 @@
 # Accuracy and speed
 
-## Agreement with the original
+## LightGlue
+
+Every backend is checked against the original LightGlue (PyTorch) on 6 pairs, with both checkpoints: 2048
+ALIKED keypoints per image, or 2048 RaCo keypoints described by ALIKED.
+
+- **FP32**: on all 12 runs and on every backend, the original's matches, with scores within 2e-4; with the
+  adaptive options, the original's stop layer and the original's decision for every keypoint. LightGlue's
+  tokens drift with depth in any float32 run, the original's included (by 4e-4 at layer 5, against a float64
+  run of it), so the layers are checked against float64: every backend is within 4 times the original's own
+  float32 error, and the CPU is closer than the original on average.
+- **FP16** (Metal, CUDA, WebGPU): the same stop layers, at least 98 % of the matches the same, scores within 0.11.
+
+Milliseconds per pair, 2048 keypoints per image, best of 8 runs; fixed depth (9 layers), then with the adaptive
+defaults on three pairs (consecutive views, a large change of scale, different places), which stop after 7, 7
+and 4 layers:
+
+| | Metal FP32 | Metal FP16 | WebGPU FP32 | WebGPU FP16 | CPU | PyTorch MPS FP32 | PyTorch MPS FP16 |
+|---|---|---|---|---|---|---|---|
+| Fixed depth | 48 | 16 | 69 | 47 | 900 | 75 | 60 |
+| Adaptive | 23 to 38 | 10 to 16 | 32 to 52 | 22 to 37 | 333 to 561 | 36 to 80 | 31 to 69 |
+
+On an M5 Pro (macOS 26). On an RTX 2070 Max-Q laptop:
+
+| | CUDA FP32 | CUDA FP16 | PyTorch CUDA FP32 | PyTorch CUDA FP16 |
+|---|---|---|---|---|
+| Fixed depth | 54 to 58 | 18 | 95 to 99 | 94 to 98 |
+| Adaptive | 23 to 40 | 9 to 15 | 40 to 74 | 44 to 74 |
+
+In Chrome on the M5 Pro, a pair of the demo's sample set takes 71 ms in FP32 and 49 ms in FP16 at fixed depth,
+38 and 28 ms with the adaptive defaults (medians). As in the original, stopping early on images of different
+places lets through more stray matches than running all layers (39 against 18 on the pair above); they are
+outliers.
+
+## FlexGlue
+
+### Agreement with the original
 
 Every backend is checked against the original FlexGlue (release v0.1, PyTorch) on 6 pairs: FlexGlue's and
 ALIKED's sample images, with 2048 RaCo keypoints per image, at 512 px with 9 layers and at 384 px with 5 layers.
@@ -20,7 +55,7 @@ reference forward pass, written from the weights file alone, that matches the or
 With early stop (`min_covisibility` 0.8, decay 0, 0.2 and 0.5, which stop the pairs after layer 2, 4 or 8, or not
 at all), every backend in both precisions stops each pair at the original's layer.
 
-### FP16
+#### FP16
 
 FP16 stores feature maps and weights as 16-bit floats and does its arithmetic on the GPU's matrix hardware.
 Against the original, on the same 12 runs:
@@ -34,7 +69,7 @@ Against the original, on the same 12 runs:
 
 On Metal and native WebGPU the covisibility score moves by at most 3.2e-3.
 
-### Settings and accuracy
+#### Settings and accuracy
 
 The original network on 8 synthetic pairs (4 photos, each warped by a mild and a strong homography with a change
 of brightness, so the truth is exact), 2048 RaCo keypoints per image. Errors in pixels of the original images,
@@ -53,7 +88,7 @@ about 1000 px wide, over every keypoint whose true position is inside the other 
 These pairs are easier than real ones: read the table as trends. At 256 px a real pair with a large change of
 scale drops from 70 matches to 10, which is why 384 px is the smallest size to use.
 
-## Speed
+### Speed
 
 Milliseconds per pair, from two described images and their keypoints to matches in host memory, 2048 keypoints
 per image; best of 8 runs. "Describe" is per image, from 8-bit pixels in host memory.
