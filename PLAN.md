@@ -272,8 +272,9 @@ reference for recall, before any C++ is written for them.
   in release `v0.1_arxiv`: `aliked_lightglue.pth` (ALIKED keypoints, 47.6 MB) and `raco_aliked_lightglue.pth`
   (RaCo keypoints described by ALIKED, added 2026-02-17, sha256 `a804c3fe...6312`). just-keypoints already
   gives both inputs: `aliked-n16`, or `raco` with `descriptor = aliked-n16`, the normalization of
-  cvg/LightGlue's ALIKED. Both state dicts hold only the matcher, 11.88 M values in FP32. Step 1 is done:
-  the reference and golden files on the 6 pairs, for both models. See "M9 plan" and "Notes from M9".
+  cvg/LightGlue's ALIKED. Both state dicts hold only the matcher, 11.88 M values in FP32. Steps 1 and 2
+  are done: the reference and golden files on the 6 pairs for both models, then the weights read, exported
+  and built in. See "M9 plan" and "Notes from M9".
 
 ### Covisibility track (parallel, like the RaCo track in just-keypoints)
 
@@ -1048,8 +1049,9 @@ and message norms. Everything else LightGlue needs is already in `Ops`.
    `third_party/LightGlue` and fetches both checkpoints by sha256 into `third_party/lightglue-weights/`.
    `tools/dump_golden_lightglue.sh` writes the golden files for the 6 pairs of M2 and both models. See
    "Notes from M9".
-2. **Weights.** Read the `.pth` with `checkpoint.cpp` (the same torch zip) and write `.jmtw`. Build them
-   into the library like just-keypoints does (`JMT_EMBED_WEIGHTS`), in FP32 and FP16.
+2. **Weights.** Done. `tools/export_weights.py --model lightglue-aliked` (or `lightglue-raco-aliked`) writes
+   `weights/<model>.jmtw`. The library also reads the `.pth` as it is, and `JMT_EMBED_WEIGHTS=ON` builds
+   the `.jmtw` files into it, FP32 only. See "Notes from M9", Weights.
 3. **CPU graph** (`src/models/lightglue/`) at fixed depth. It should match the original to 1e-5 like M2.
    New code: the double softmax with matchability, and the mutual argmax on the host.
 4. **Adaptivity on CPU:** depth first, then width (compact the tokens and keep the index map).
@@ -1116,3 +1118,32 @@ and message norms. Everything else LightGlue needs is already in `Ops`.
   - **Consequence:** ALIKED (its keypoints and its checkpoint) is the more robust pair and becomes
     LightGlue's default, in the library and the demo. RaCo-ALIKED stays an option. FlexGlue in the demo
     keeps RaCo keypoints.
+
+### Weights (step 2)
+
+- **Export.** `tools/export_weights.py --model lightglue-aliked|lightglue-raco-aliked` writes
+  `weights/<model>.jmtw`: 253 tensors, 47.6 MB. The only change is the Wqkv rows grouped as q | k | v
+  (4 heads), as for FlexGlue; LightGlue lays out Wqkv the same way. The `confidence_thresholds` buffer of
+  the RaCo file is dropped, because the graph computes it. Metadata: model `lightglue`, `n_layers`, `dim`,
+  `heads`, `input_dim`, `license` Apache-2.0, and from the exporter `variant`, `source` and `source_commit`.
+- **The `.pth` read directly** (`src/core/checkpoint.cpp`). `Weights::from_memory` and `from_file` now read
+  either checkpoint, told apart by FlexGlue's ConvNeXt layer scales (`.gamma`), which LightGlue does not
+  have. Both read paths share one Wqkv reordering. 32 to 36 ms for 48 MB on the M5 Pro.
+  `checkpoint_test` now compares every metadata key of the `.jmtw` except source, source commit and
+  variant, which only the exporter knows. It finds both checkpoints bit for bit equal to their exported
+  files, and FlexGlue's still equal to its file. A `.pth` against the other model's file is reported
+  (the matchability tensors differ first).
+- **Built in** (`JMT_EMBED_WEIGHTS=ON`, off by default; `JMT_EMBED_MODELS` defaults to both). This uses
+  `cmake/embed.cmake` with `#embed` (Clang 19, GCC 15): a hex dump of 48 MB in the source, as
+  just-keypoints does for its 2.7 MB, would be some 300 MB of C++. Both models compile in 3 s on the M5
+  Pro and add 95 MB to `libjmt.a`. A program links them only if it calls `jmt::embedded_weights`, which
+  nothing in the API does until step 3. `checkpoint_test embedded:<model> <model>.jmtw` checks the built-in
+  copies bit for bit (ctest `embedded_*`). Only `lightglue-*` names are accepted: FlexGlue's weights are
+  never built in. A missing `.jmtw` stops the configure with the commands that make it.
+- **FP32 only.** The plan said FP32 and FP16. Like just-keypoints, one FP32 copy is built in, and FP16 mode
+  converts at load as it does for FlexGlue's FP32 file. A separate FP16 file
+  (`export_weights.py --fp16`, 24 MB) can still be made for the demo's download.
+- **Not done:** the `.jmtw` files are not committed (95 MB; `/weights/*.jmtw` stays ignored), so a fresh
+  checkout runs `tools/fetch_lightglue.sh` and the export before `JMT_EMBED_WEIGHTS=ON`. Shipping them is
+  M8's question: the CMake and npm packages. The WebAssembly build has not been tried with embedding; the
+  demo will fetch the weights file instead (48 MB, or 24 MB in FP16).

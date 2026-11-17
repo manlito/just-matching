@@ -12,6 +12,7 @@ cmake -S ../just-keypoints -B ../just-keypoints/build/release -DCMAKE_BUILD_TYPE
 A=third_party/FlexGlue/assets
 
 python tools/export_weights.py          # -> weights/flexglue.jmtw (add --fp16 for the half-size file)
+python tools/export_weights.py --model lightglue-aliked      # -> weights/lightglue-aliked.jmtw (also lightglue-raco-aliked)
 python tools/compare.py $A/berlin1.jpg $A/berlin2.jpg                       # original vs reference pass, CPU
 python tools/compare.py $A/berlin1.jpg $A/berlin2.jpg --layers 3 --size 256
 python tools/compare.py $A/berlin1.jpg $A/berlin2.jpg --a upstream:cpu --b upstream:mps,fp16
@@ -26,7 +27,7 @@ python tools/compare_covis.py IMAGE... --backend metal                      # jm
 | File | Purpose |
 |---|---|
 | `jmtfile.py` | weights / test-tensor container reader and writer (the just-keypoints `.jkpw` format, unchanged) |
-| `export_weights.py` | checkpoint -> `weights/flexglue.jmtw`; the few changes it makes are listed at its top |
+| `export_weights.py` | checkpoint -> `weights/flexglue.jmtw`, or with `--model lightglue-aliked` / `lightglue-raco-aliked` -> `weights/<model>.jmtw`; the few changes it makes are listed at its top |
 | `folded.py` | forward pass from the weights file only; the executable specification for the C++ backends |
 | `upstream.py` | runs the original FlexGlue behind the same interface and exposes its tokens per layer |
 | `common.py` | image loading, keypoints from the `jkp` CLI (`$JKP` overrides its path), implementation selection |

@@ -4,6 +4,10 @@ project(just_matching VERSION 0.1.0 LANGUAGES CXX)
 option(JMT_BUILD_CLI "Build the jmt command line tool" ON)
 option(JMT_BUILD_TESTS "Build tests" ON)
 option(JMT_BUILD_WASM "Emscripten: build the WebAssembly module, JS wrapper and test page (web/)" ON)
+# LightGlue's weights (Apache-2.0) can be built into the library: weights/<model>.jmtw, made by
+# tools/export_weights.py --model <model> (47.6 MB each). FlexGlue's never are (DINOv3 License).
+option(JMT_EMBED_WEIGHTS "Build the LightGlue weights of JMT_EMBED_MODELS into the library" OFF)
+set(JMT_EMBED_MODELS "lightglue-aliked;lightglue-raco-aliked" CACHE STRING "Models to embed when JMT_EMBED_WEIGHTS is ON")
 set(JMT_CUDA "AUTO" CACHE STRING "CUDA backend: AUTO (build it when a CUDA compiler is found), ON or OFF")
 set_property(CACHE JMT_CUDA PROPERTY STRINGS AUTO ON OFF)
 set(JMT_METAL "AUTO" CACHE STRING "Metal backend (Apple platforms): AUTO (build it when Metal.framework is found), ON or OFF")
@@ -85,14 +89,41 @@ if(NOT JMT_WEBGPU STREQUAL "OFF")
   endif()
 endif()
 
-# Weights are never compiled in (567 MB, and the backbone is under the DINOv3 License): a path or a memory
-# blob is given at run time.
+# FlexGlue's weights are never compiled in (567 MB, and the backbone is under the DINOv3 License): a path or a
+# memory blob is given at run time. LightGlue's can be (JMT_EMBED_WEIGHTS).
+set(embed_models "")
+set(embed_deps "")
+if(JMT_EMBED_WEIGHTS)
+  foreach(model IN LISTS JMT_EMBED_MODELS)
+    if(NOT model MATCHES "^lightglue-")
+      message(FATAL_ERROR "JMT_EMBED_MODELS: only LightGlue models can be built in, not '${model}'")
+    endif()
+    set(file "${CMAKE_CURRENT_SOURCE_DIR}/weights/${model}.jmtw")
+    if(NOT EXISTS "${file}")
+      message(FATAL_ERROR "JMT_EMBED_WEIGHTS: ${file} is missing. Make it with "
+                          "tools/fetch_lightglue.sh && python tools/export_weights.py --model ${model}")
+    endif()
+    list(APPEND embed_models "${model}=${file}")
+    list(APPEND embed_deps "${file}")
+  endforeach()
+endif()
+set(embed_cpp "${CMAKE_CURRENT_BINARY_DIR}/embedded_weights.cpp")
+string(REPLACE ";" "|" embed_models_arg "${embed_models}")  # a list does not survive the command line
+add_custom_command(
+  OUTPUT "${embed_cpp}"
+  COMMAND ${CMAKE_COMMAND} "-DOUT=${embed_cpp}" "-DMODELS=${embed_models_arg}" -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed.cmake"
+  DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed.cmake"
+  VERBATIM)
+# The generated file names the weights files; #embed reads them when it is compiled.
+set_source_files_properties("${embed_cpp}" PROPERTIES OBJECT_DEPENDS "${embed_deps}")
+
 add_library(jmt
   src/core/api.cpp
   src/core/weights.cpp
   src/core/checkpoint.cpp
   src/models/flexglue/flexglue.cpp
-  src/backend/cpu/cpu_ops.cpp)
+  src/backend/cpu/cpu_ops.cpp
+  "${embed_cpp}")
 target_include_directories(jmt PUBLIC include PRIVATE src)
 find_package(Threads REQUIRED)
 target_link_libraries(jmt PRIVATE Threads::Threads)
@@ -225,6 +256,19 @@ if(JMT_BUILD_TESTS)
     add_test(NAME checkpoint COMMAND checkpoint_test "${CMAKE_CURRENT_SOURCE_DIR}/third_party/flexglue.pth"
                                                      "${CMAKE_CURRENT_SOURCE_DIR}/weights/flexglue.jmtw")
   endif()
+  # LightGlue's checkpoints (tools/fetch_lightglue.sh) and, when built in, the embedded copies.
+  foreach(model lightglue-aliked lightglue-raco-aliked)
+    string(REPLACE "lightglue-" "" pth "${model}")
+    string(REPLACE "-" "_" pth "${pth}")
+    set(pth "${CMAKE_CURRENT_SOURCE_DIR}/third_party/lightglue-weights/${pth}_lightglue.pth")
+    set(jmtw "${CMAKE_CURRENT_SOURCE_DIR}/weights/${model}.jmtw")
+    if(EXISTS "${pth}" AND EXISTS "${jmtw}")
+      add_test(NAME checkpoint_${model} COMMAND checkpoint_test "${pth}" "${jmtw}")
+    endif()
+    if(JMT_EMBED_WEIGHTS AND model IN_LIST JMT_EMBED_MODELS)
+      add_test(NAME embedded_${model} COMMAND checkpoint_test "embedded:${model}" "${jmtw}")
+    endif()
+  endforeach()
   add_executable(ops_bench tests/ops_bench.cpp)  # timings of single operations, not a test
   target_include_directories(ops_bench PRIVATE src)
   target_link_libraries(ops_bench PRIVATE jmt)

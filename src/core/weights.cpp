@@ -64,7 +64,7 @@ Weights Weights::from_tensors(std::map<std::string, std::string> meta, std::vect
 }
 
 Weights Weights::from_memory(const void* data, size_t size) {
-  if (is_torch_checkpoint(data, size)) return flexglue_from_checkpoint(data, size);
+  if (is_torch_checkpoint(data, size)) return weights_from_checkpoint(data, size);
   Weights w;
   w.storage_.resize((size + 3) / 4);
   std::memcpy(w.storage_.data(), data, size);
