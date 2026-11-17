@@ -25,10 +25,11 @@
 <body>
 <h1>just-matching in the browser</h1>
 <p>Runs the WebAssembly module on WebGPU (FP32, and FP16 when the adapter has <code>shader-f16</code>) on the 6
-test pairs at 512 px / 9 layers and 384 px / 5 layers, and compares each result with the native CPU backend on
-the same pixels and keypoints (testdata/). FP32 must give the same matches, predicted points of confident
-queries within 0.01 px and covisibility within 1e-4; in FP16 at most 3 matches, or 10 % of them, may differ
-(present on one side only).</p>
+test pairs at 512 px / 9 layers and 384 px / 5 layers, then again with early stop (minimum covisibility 0.8,
+decay 0.2 and 0), and compares each result with the native CPU backend on the same pixels and keypoints
+(testdata/). FP32 must give the same matches, predicted points of confident queries within 0.01 px and
+covisibility within 1e-4; in FP16 at most 3 matches, or 10 % of them, may differ (present on one side only).
+With early stop, both precisions must also stop after the same layer.</p>
 <p id="status">Loading…</p>
 <p id="adapter"></p>
 <div class="wrap" id="tables"></div>
@@ -97,43 +98,50 @@ async function run() {
     `${navigator.userAgent.match(/Chrome\/[\d.]+/)?.[0] ?? navigator.userAgent}. Reference: ${manifest.reference}.`;
   const params = new URLSearchParams(location.search);
   const precisions = (params.get('precisions') ?? (hasF16 ? 'fp32,fp16' : 'fp32')).split(',');
-  const settings = manifest.pairs[0].refs.map(r => [r.size, r.layers]);
+  const settings = manifest.pairs[0].refs.map(r => [r.size, r.layers, r.min_covisibility ?? 0, r.early_stop_decay ?? -1]);
+  const only = params.get('settings');  // e.g. 2,3: the early-stop runs only
+  const chosen = only ? only.split(',').map(Number) : settings.map((_, i) => i);
 
   status.textContent = 'Loading the weights…';
   const weights = new Uint8Array(await fetchBuffer(params.get('weights') ?? 'flexglue.jmtw'));
   const summary = { adapter: adapterInfo, runs: [], ok: true };
   for (const precision of precisions) {
-    for (const [si, [size, layers]] of settings.entries()) {
+    for (const si of chosen) {
+      const [size, layers, minCovisibility, earlyStopDecay] = settings[si];
+      const early = earlyStopDecay >= 0;
+      const label = `${size} px / ${layers} layers` + (early ? `, early stop ${minCovisibility} / ${earlyStopDecay}` : '');
       status.textContent = `WebGPU ${precision}, ${size} px: creating the matcher…`;
       const t0 = performance.now();
       const matcher = await jmt.create({ weights, precision, inputSize: size });
       const tCreate = performance.now() - t0;
       const rows = [];
       for (const [pi, pair] of manifest.pairs.entries()) {
-        status.textContent = `WebGPU ${precision}, ${size} px / ${layers} layers: pair ${pi + 1} of ${manifest.pairs.length}…`;
+        status.textContent = `WebGPU ${precision}, ${label}: pair ${pi + 1} of ${manifest.pairs.length}…`;
         let t = performance.now();
         const fa = await matcher.describe(images[pair.a]), fb = await matcher.describe(images[pair.b]);
         await matcher.finish();
         const tDescribe = (performance.now() - t) / 2;
         t = performance.now();
-        const got = await matcher.match(fa, keypoints[pair.a], fb, keypoints[pair.b], { layers });
+        const got = await matcher.match(fa, keypoints[pair.a], fb, keypoints[pair.b], { layers, minCovisibility, earlyStopDecay });
         const tMatch = performance.now() - t;
         fa.destroy(), fb.destroy();
         const c = compare(got, pair.refs[si]);
-        const ok = precision === 'fp32' ? c.same && c.pos <= 0.01 && c.covis <= 1e-4 : c.differ <= Math.max(3, 0.1 * c.nRef);
+        c.layer = got.stopLayer, c.layerRef = pair.refs[si].stop_layer;
+        const ok = (precision === 'fp32' ? c.same && c.pos <= 0.01 && c.covis <= 1e-4 : c.differ <= Math.max(3, 0.1 * c.nRef)) &&
+                   c.layer === c.layerRef;
         summary.ok &&= ok;
         rows.push({ pair: `${pair.a} – ${pair.b}`, ok, tDescribe, tMatch, ...c });
       }
       matcher.destroy();
-      summary.runs.push({ precision, size, layers, tCreate, rows });
+      summary.runs.push({ precision, size, layers, minCovisibility, earlyStopDecay, tCreate, rows });
       const title = document.createElement('h2');
-      title.textContent = `WebGPU ${precision}, ${size} px, ${layers} layers (matcher created in ${ms(tCreate)} ms; ` +
+      title.textContent = `WebGPU ${precision}, ${label} (matcher created in ${ms(tCreate)} ms; ` +
         'the first pair compiles the kernels)';
       const table = document.createElement('table');
       table.innerHTML = '<tr><th>pair</th><th>matches</th><th>native</th><th>shared</th><th>points (px)</th>' +
-        '<th>confidence</th><th>covisibility</th><th>describe (ms per image)</th><th>match (ms)</th><th></th></tr>' +
+        '<th>confidence</th><th>covisibility</th><th>layers / native</th><th>describe (ms per image)</th><th>match (ms)</th><th></th></tr>' +
         rows.map(r => `<tr><td>${r.pair}</td><td>${r.n}</td><td>${r.nRef}</td><td>${(100 * r.overlap).toFixed(1)} %</td>` +
-          `<td>${fmt(r.pos)}</td><td>${fmt(r.conf)}</td><td>${fmt(r.covis)}</td><td>${ms(r.tDescribe)}</td>` +
+          `<td>${fmt(r.pos)}</td><td>${fmt(r.conf)}</td><td>${fmt(r.covis)}</td><td>${r.layer} / ${r.layerRef}</td><td>${ms(r.tDescribe)}</td>` +
           `<td>${ms(r.tMatch)}</td><td class="${r.ok ? 'ok' : 'bad'}">${r.ok ? 'ok' : 'FAIL'}</td></tr>`).join('');
       tables.append(title, table);
     }

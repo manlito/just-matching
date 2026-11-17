@@ -1,5 +1,6 @@
 """Test data for the browser test page (web/test.html): the 6 test pairs of tools/compare_all.sh as raw RGBA,
-their keypoints, and the native CPU backend's results on them at 512 px / 9 layers and 384 px / 5 layers.
+their keypoints, and the native CPU backend's results on them at 512 px / 9 layers and 384 px / 5 layers, without
+and with early stop (min_covisibility 0.8; decay 0.2 at 512 px, 0 at 384 px: pairs stop after layer 2, 4 or 8).
 
     python tools/web_testdata.py --out build/wasm/web/testdata [--jmt build/release/jmt]
 
@@ -28,7 +29,8 @@ S = os.path.join(common.ROOT, "build", "synth")
 PAIRS = [(f"{A}/berlin1.jpg", f"{A}/berlin2.jpg"), (f"{A}/lamar_cab_1446.jpg", f"{A}/lamar_cab_1450.jpg"),
          (f"{A}/berlin1.jpg", f"{A}/lamar_cab_1446.jpg"), (f"{S}/berlin1_h1.png", f"{S}/berlin1_h2.png"),
          (f"{S}/lamar_cab_1446_h1.png", f"{S}/lamar_cab_1446_h2.png"), (f"{S}/berlin2_h1.png", f"{S}/lamar_cab_1450_h2.png")]
-SETTINGS = [(512, 9), (384, 5)]
+# size, layers, min_covisibility, early_stop_decay (< 0: off)
+SETTINGS = [(512, 9, 0.0, -1.0), (384, 5, 0.0, -1.0), (512, 9, 0.8, 0.2), (384, 5, 0.8, 0.0)]
 
 
 def rounded(a, digits=6):
@@ -62,18 +64,22 @@ def main():
                 images[name] = {"rgba": name + ".rgba", "width": w, "height": h, "keypoints": rounded(xy)}
             names.append(name)
         refs = []
-        for size, layers in SETTINGS:
+        for size, layers, min_covis, decay in SETTINGS:
             out = os.path.join(tmp, "out.jmtt")
             cmd = [args.jmt, "match", os.path.join(tmp, names[0] + ".png"), os.path.join(tmp, names[1] + ".png"),
                    "--kpts-a", os.path.join(tmp, names[0] + ".jkpt"), "--kpts-b", os.path.join(tmp, names[1] + ".jkpt"),
                    "--backend", args.backend, "--size", str(size), "--layers", str(layers), "--out", out]
+            if decay >= 0:
+                cmd += ["--min-covisibility", str(min_covis), "--early-stop", str(decay)]
             subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL)
             _, t = jmtfile.read(out)
-            refs.append({"size": size, "layers": layers, "matches": [int(v) for v in t["matches"].ravel()],
+            refs.append({"size": size, "layers": layers, "min_covisibility": min_covis, "early_stop_decay": decay,
+                         "matches": [int(v) for v in t["matches"].ravel()],
                          "scores": rounded(t["scores"]), "a_in_b": rounded(t["a_in_b"], 4), "b_in_a": rounded(t["b_in_a"], 4),
                          "conf_a": rounded(t["conf_a"]), "conf_b": rounded(t["conf_b"]),
                          "covisibility": float(t["covisibility"][0]), "stop_layer": int(t["stop_layer"][0])})
-            print(f"{names[0]} - {names[1]}, {size} px, {layers} layers: {len(t['scores'])} matches", flush=True)
+            stop = f", early stop {decay}: {int(t['stop_layer'][0])} layers" if decay >= 0 else ""
+            print(f"{names[0]} - {names[1]}, {size} px, {layers} layers{stop}: {len(t['scores'])} matches", flush=True)
         pairs.append({"a": names[0], "b": names[1], "refs": refs})
     with open(os.path.join(args.out, "manifest.json"), "w") as f:
         json.dump({"reference": f"native {args.backend} backend", "images": images, "pairs": pairs}, f)

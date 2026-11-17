@@ -53,7 +53,8 @@ cmake --build build/wasm      # -> build/wasm/web: jmt_wasm.js / .wasm, jmt.js, 
 
 `web/jmt.js` wraps the module (`create`, `describe`, `match`); it needs JSPI (Chrome, Edge). The weights are
 served next to it and may be the FP16 file (284 MB instead of 567; widened to float32 on load). The test page
-compares the module with the native CPU backend on the 6 test pairs:
+compares the module with the native CPU backend on the 6 test pairs, without and with early stop
+(`?settings=2,3` runs only the latter):
 
 ```sh
 python tools/web_testdata.py --out build/wasm/web/testdata

@@ -265,7 +265,8 @@ reference for recall, before any C++ is written for them.
   after layer 2, 4 or 8 or not at all): the same stop layer on every pair in all 42 runs (CPU, Metal, CUDA,
   WebGPU, each GPU one in FP32 and FP16); the original's matches in FP32, and in FP16 the agreement of M5
   (1 of 70 differs on the Berlin pair in CUDA FP16). `batch_test` checks a batch against single pairs with
-  early stop too. A pair stopped after layer 2 costs about a quarter of a full one (24-29 %); the check
+  early stop too, and the browser test page runs early stop in Chrome (24 runs, the native stop layer on
+  every pair). A pair stopped after layer 2 costs about a quarter of a full one (24-29 %); the check
   after each layer costs 1 to 3.4 % on pairs that pass. See "Notes from C3".
 - [ ] **C4** — shortlist view in the demo.
 
@@ -880,8 +881,16 @@ The first pass first; the second pass, at the end, replaced its products and att
   other scenes): 50 pairs, 8 %. Early stop pays for exhaustive matching (small captures, where level 2 or
   nothing builds the list) and for look-alikes the shortlist lets through.
 - **CUDA FP32, LaMAR pair stopped after layer 4:** one confidence differs from the original by 1.4e-3
-  (elsewhere within 2e-5; points within 2.2e-4 px). Likely a query at the edge of the read-out's support;
-  the pair has no matches either way. Not followed up.
-- **Not done:** the browser (the rule is host code shared with native WebGPU; Chrome FP16's attention
-  differs slightly, so a pair near a bar could stop one layer apart), a capture where the shortlist and
-  early stop are measured together on real overlap (C1's capture).
+  (elsewhere within 2e-5; confident points within 2.2e-4 px). It is query 1098 of image A (confidence
+  0.009), whose two best cells at layer 4 differ by 2e-7 in logit in the original (float64; the smallest
+  gap of the 2048 queries) and lie 37 cells apart: FP32 rounding on CUDA picks the other one and the point
+  moves 453 px. The same with 4 layers and no early stop; the pair has no matches either way.
+- **In the browser** (`web/test.html`, Chrome in the desktop app's browser pane, M5 Pro): the page now
+  also runs the 6 pairs with early stop, at 512 px / 9 layers with 0.8 / 0.2 and at 384 px / 5 layers with
+  0.8 / 0 (stops after layer 2, 4 and 8, and pairs that pass), and requires the native stop layer. All 24
+  early-stop runs stop where the native CPU backend does, in FP32 and FP16; FP32 gives the native matches
+  (points within 3.0e-4 px), FP16 differs by at most 3 matches (67 of 70 shared on the Berlin pair). The
+  whole page, 48 runs, passes. A pair stopped after layer 2 takes 116 / 81 ms in FP32 / FP16 at 512 px,
+  one that passes 477 / 316 ms (berlin1_h1 - _h2; the first pair of each run also compiles the kernels).
+- **Not done:** a capture where the shortlist and early stop are measured together on real overlap (C1's
+  capture).
