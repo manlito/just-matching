@@ -35,6 +35,16 @@
 #include <cuda_runtime.h>
 #include <mma.h>
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
+
 #include <algorithm>
 #include <chrono>
 #include <climits>
@@ -2145,7 +2155,20 @@ class CudaOps : public Ops {
 
 }  // namespace
 
+// Whether NVIDIA's driver is installed. On Windows the static CUDA 13 runtime crashes in its first call when
+// nvcuda.dll is missing (an access violation on a hosted runner with CUDA 13.4, seen in poselib-gpu's wheel
+// tests, where CUDA 12.9 returns an error), so the driver is looked for first. Elsewhere the runtime reports it.
+static bool cuda_driver_present() {
+#ifdef _WIN32
+  HMODULE h = LoadLibraryExW(L"nvcuda.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+  if (!h) return false;
+  FreeLibrary(h);
+#endif
+  return true;
+}
+
 std::unique_ptr<Ops> make_cuda_ops(int device, bool fp16) {
+  if (!cuda_driver_present()) throw std::runtime_error("CUDA: no NVIDIA driver (nvcuda.dll not found)");
   if (fp16) return std::make_unique<CudaOps<__half>>(device);
   return std::make_unique<CudaOps<float>>(device);
 }
