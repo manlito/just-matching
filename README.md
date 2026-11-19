@@ -92,6 +92,36 @@ this browser" (unticking deletes it). For testing, `?weights=URL` fetches them
 instead; `?run=1` runs on load when weights are at hand. The documentation site serves this page; see
 [docs/README.md](docs/README.md).
 
+## Python
+
+```sh
+pip install just-matching        # CPU; Metal on macOS
+pip install just-matching-cu13   # or -cu12: CPU and CUDA, on Linux and Windows x86_64
+```
+
+```python
+import just_matching as jmt
+
+m = jmt.Matcher("aliked_lightglue.pth", backend="cuda")    # the released checkpoint, read without PyTorch
+a = m.describe_keypoints(width_a, height_a, xy_a, desc_a)  # just-keypoints' aliked-n16 output
+b = m.describe_keypoints(width_b, height_b, xy_b, desc_b)
+r = m.match(a, b)                                          # r.idx (n, 2), r.score (n,)
+```
+
+The packages hold no weights: give `Matcher` the file. More, and where to get the weights, in
+[bindings/python/README.md](bindings/python/README.md) (the PyPI page). The bindings are nanobind over the C API
+(`bindings/python/src/module.cpp`); from a checkout, with `bindings/python/requirements.txt` installed:
+
+```sh
+pip install .                                                  # the CPU package from source
+cmake -S . -B build/python -DJMT_BUILD_PYTHON=ON -DPython_EXECUTABLE=$(which python)
+cmake --build build/python && ctest --test-dir build/python -R python_tests
+```
+
+Every merge to main publishes a release (`.github/workflows/release.yml`): the three packages, with the version
+chosen by CI, the last release's patch bumped, or `project(VERSION)` in CMakeLists.txt when that is higher. See
+PLAN.md, "Python package".
+
 ## Command line
 
 Keypoints come from [just-keypoints](../just-keypoints); only their positions are used.
