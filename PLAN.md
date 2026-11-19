@@ -15,7 +15,9 @@ matches of a set of images, with the timings of each step, and the documentation
 builds; it is not deployed. FlexGlue's weights are never distributed: the backbone is under Meta's DINOv3 License,
 so each user fetches `flexglue.pth` from FlexGlue's release, and the library reads it as it is. M9 is done:
 LightGlue on ALIKED descriptors (Apache-2.0 weights, no DINO) runs on every backend with the original's
-matches and adaptive depth and width, 16 ms per pair on the M5 Pro (Metal FP16), and is the demo's default. Numbers marked "estimate" are
+matches and adaptive depth and width, 16 ms per pair on the M5 Pro (Metal FP16), and is the demo's default. The
+Python package is built: nanobind bindings, wheels for PyPI, released on every merge to main ("Python package",
+below). Numbers marked "estimate" are
 computed from the layer sizes, not measured.
 
 ## What FlexGlue is (reviewed at release v0.1, 2026-10-26)
@@ -78,7 +80,7 @@ convolution kernels; here it is one very good GEMM and one attention kernel per 
 | Speed presets | Number of layers and input size are run-time options. From M1: 512 px with 5-9 layers; 384 px is the smallest useful size; 256 px is not offered. |
 | Backends | `cpu` (reference), `metal`, `cuda`, `webgpu`, same pluggable structure as just-keypoints. |
 | Code sharing | Start by copying the just-keypoints core (weights loader, buffer pool, backend glue, CMake embedding, test harness). Extract a shared library only if both repos keep changing the same code. |
-| License | Code: to be decided. Matcher weights MIT. Backbone weights are under the DINOv3 License: redistribution allowed with a copy of the license, with trade-control and military-use restrictions. |
+| License | Code: Apache-2.0 (decided 2026-11-18). Matcher weights MIT. Backbone weights are under the DINOv3 License: redistribution allowed with a copy of the license, with trade-control and military-use restrictions. |
 
 ## Public API (C, plain buffers)
 
@@ -1312,3 +1314,54 @@ and message norms. Everything else LightGlue needs is already in `Ops`.
   repository.
 - **Not checked:** the deploy itself runs on the next push to main; its new step was run here by hand
   (fetch, CPU-only CLI, convert).
+
+## Python package
+
+As just-ba's (its document 08 and decisions D111 to D116, D129, D152), adapted to this library.
+
+- **Bindings:** `bindings/python` (`JMT_BUILD_PYTHON`, off by default), nanobind 3.1.0 over the C API, stable ABI
+  from Python 3.12 (one `cp312-abi3` wheel per platform), built statically into `just_matching._core`, with stubs
+  generated at build time. `Matcher` owns a context (the `jmt_config` fields as keyword arguments; weights as a
+  path or bytes); `Features` come from `describe` (FlexGlue) or `describe_keypoints(width, height, xy, desc)`
+  (LightGlue, which keeps the keypoints so `match(a, b)` needs no more); `match`, `match_batch`,
+  `covisibility` and `shortlist` take their options as keyword arguments and return NumPy copies. Features keep
+  their Matcher alive (GPU features are freed before their context). Each Matcher has a mutex and the GIL is
+  released while the library works. Errors are `RuntimeError` with `jmt_last_error()`.
+- **Packages:** `just-matching` (CPU; Metal on macOS arm64, deployment target 13.0, built on the `macos-26` runner:
+  the Metal 4 kernels need the macOS 26 SDK, which `macos-15`'s Xcode lacks) for Linux x86_64, macOS arm64
+  and Windows x86_64, with the sdist; `just-matching-cu12` and `just-matching-cu13` (CPU and CUDA) for Linux and
+  Windows x86_64, made from the same `pyproject.toml` by `packaging/variant.py`. One module, `just_matching`,
+  for all three. WebGPU is in none. The CUDA runtime is linked statically (CMake's default; `ldd` on the laptop's
+  cu13 build shows only libstdc++, libm, libgcc_s and libc) and the backend uses no other CUDA library, so the
+  CUDA packages need only the driver and depend on nothing from NVIDIA, unlike just-ba's (cuDSS). Both CUDA
+  packages build sm_75 to sm_100 and PTX for sm_120: the kernels use `ldmatrix` and `mma.sync.m16n8k8` without
+  an architecture guard, so nothing below Turing compiles (CUDA 12 would have reached Pascal and Volta).
+  `packaging/fetch_cuda.py` fetches nvcc, the runtime and the headers from NVIDIA's redistributable archives.
+  On Windows the backend looks for `nvcuda.dll` before its first CUDA call: CUDA 13.4's static runtime crashes
+  without the driver (found by poselib-gpu's wheel tests on a hosted runner), and `Matcher(backend="cuda")`
+  should raise instead. Not reachable in this repository's CI (no weights there), so not run without a driver.
+- **No weights in any package** (`JMT_EMBED_WEIGHTS` off). The owner's choice (2026-11-18): LightGlue's two
+  models would be 95 MB a wheel, at PyPI's 100 MB limit, and CI would need the checkpoints. Users pass a
+  checkpoint; the PyPI page (`bindings/python/README.md`) says where each one comes from, its sha256 and its
+  licence, and that FlexGlue's is never distributed (DINOv3 License).
+- **Tests:** `bindings/python/tests`, run by cibuildwheel on every wheel. Without weights (the wheel builds) they
+  check the API and its errors. With weights (`JMT_LIGHTGLUE_WEIGHTS`, `JMT_FLEXGLUE_WEIGHTS`, or the repository's
+  `third_party/`) they match on every compiled backend with a device: LightGlue finds a shuffled copy of an
+  image's keypoints, gives the CLI test's 219 matches after 7 layers on the Berlin pair (when its keypoints are
+  in `build/keypoints`), and is the same from four threads; FlexGlue describes, matches, scores and shortlists.
+  Checked 2026-11-18: all 11 on the M5 Pro (CPU, Metal), and on the laptop (RTX 2070, CUDA 13.4) with the cu13
+  wheel built from `pyproject.toml`.
+- **Releases:** `.github/workflows/release.yml` runs on every push to main, a merged pull request included,
+  builds and tests the seven wheels and the sdist on free hosted runners, publishes them through PyPI trusted
+  publishing (no environment, no token) and tags `vX.Y.Z`. By hand (`gh workflow run release`) it only builds,
+  unless `publish=true`. The version is chosen by `packaging/version.py`: the highest of the tags and the
+  packages' versions on PyPI with its patch bumped, or `project(VERSION)` in CMakeLists.txt when that is higher,
+  so a minor or major release is an edit there in the pull request that warrants it. One release at a time.
+- **First release, one package at a time:** PyPI takes one pending publisher per repository and workflow, so
+  before the first merge add the pending publisher of `just-matching` on PyPI (owner `manlito`, repository
+  `just-matching`, workflow `release.yml`, no environment). The first release uploads it and fails at
+  `just-matching-cu12`; add that one's pending publisher and re-run the failed publish job
+  (`gh run rerun <run> --failed`: uploaded files are skipped), then the same for `just-matching-cu13`. After
+  that all three are ordinary trusted publishers and each merge publishes them in one run.
+- **Decided (2026-11-18):** the code is Apache-2.0, as just-ba (`LICENSE`); the packages declare it.
+

@@ -1,0 +1,6 @@
+# Written by CMake (bindings/python/build_info.py.in); do not edit.
+__version__ = "@PROJECT_VERSION@"
+# "cpu" (just-matching), "cu12" or "cu13" (just-matching-cu12, just-matching-cu13), "source" (a CMake build).
+VARIANT = "@JMT_PACKAGE_VARIANT@"
+# The CUDA toolkit the CUDA backend was built with, or "" without one.
+CUDA_VERSION = "@JMT_CUDA_VERSION@"

@@ -1,4 +1,35 @@
-# Build
+# Install and build
+
+## Python
+
+```bash
+pip install just-matching        # CPU, and Metal on macOS 13 or later (arm64)
+pip install just-matching-cu12   # CPU and CUDA 12: Linux and Windows x86_64, NVIDIA driver R525 or later
+pip install just-matching-cu13   # CPU and CUDA 13: Linux and Windows x86_64, NVIDIA driver R580 or later
+```
+
+Install one: all three provide the module `just_matching`, for Python 3.12 or later. The CUDA packages need only
+the NVIDIA driver (the CUDA runtime is built in) and a GPU of compute capability 7.5 (Turing) or later. No weights
+are in any package: give `just_matching.Matcher` the checkpoint (see [Weights](#weights) below).
+
+```python
+import just_matching as jmt
+
+m = jmt.Matcher("aliked_lightglue.pth", backend="cuda")
+a = m.describe_keypoints(width_a, height_a, xy_a, desc_a)  # xy (n, 2), desc (n, 128)
+b = m.describe_keypoints(width_b, height_b, xy_b, desc_b)
+r = m.match(a, b)                                          # r.idx (n, 2), r.score (n,)
+
+f = jmt.Matcher("flexglue.pth", backend="cuda")
+fa, fb = f.describe(image_a), f.describe(image_b)          # uint8 (h, w, 3)
+r = f.match(fa, fb, xy_a, xy_b)
+pairs, scores = f.shortlist([fa, fb], k=10)
+```
+
+`Matcher` takes the options of `jmt_config` as keyword arguments (`backend`, `model`, `input_size`, `threads`,
+`device`, `precision`); `match` and `match_batch` those of `jmt_match_options`; arrays come back as NumPy arrays.
+
+## C and C++
 
 just-matching is built from source with CMake 3.16 or later and a C++17 compiler. The CPU backend needs nothing
 else. Each GPU backend is built when its toolkit is found, and uses no library beyond it.
