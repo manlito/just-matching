@@ -78,3 +78,5 @@ A `Matcher` is safe to share between threads (calls take turns); separate Matche
 
 `jmt.compiled_backends()` lists the backends of the installed package, `jmt.VARIANT` and `jmt.CUDA_VERSION` say
 which package it is.
+
+Licence: Apache-2.0. No weights are in the package; each model's weights carry their own licence (above).

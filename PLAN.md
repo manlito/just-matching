@@ -80,7 +80,7 @@ convolution kernels; here it is one very good GEMM and one attention kernel per 
 | Speed presets | Number of layers and input size are run-time options. From M1: 512 px with 5-9 layers; 384 px is the smallest useful size; 256 px is not offered. |
 | Backends | `cpu` (reference), `metal`, `cuda`, `webgpu`, same pluggable structure as just-keypoints. |
 | Code sharing | Start by copying the just-keypoints core (weights loader, buffer pool, backend glue, CMake embedding, test harness). Extract a shared library only if both repos keep changing the same code. |
-| License | Code: to be decided. Matcher weights MIT. Backbone weights are under the DINOv3 License: redistribution allowed with a copy of the license, with trade-control and military-use restrictions. |
+| License | Code: Apache-2.0 (decided 2026-11-18). Matcher weights MIT. Backbone weights are under the DINOv3 License: redistribution allowed with a copy of the license, with trade-control and military-use restrictions. |
 
 ## Public API (C, plain buffers)
 
@@ -1363,5 +1363,5 @@ As just-ba's (its document 08 and decisions D111 to D116, D129, D152), adapted t
   `just-matching-cu12`; add that one's pending publisher and re-run the failed publish job
   (`gh run rerun <run> --failed`: uploaded files are skipped), then the same for `just-matching-cu13`. After
   that all three are ordinary trusted publishers and each merge publishes them in one run.
-- **Open:** the code's licence is still to be decided (README, "Licenses"); the packages say none until it is.
+- **Decided (2026-11-18):** the code is Apache-2.0, as just-ba (`LICENSE`); the packages declare it.
 

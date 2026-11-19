@@ -209,7 +209,7 @@ python tools/dump_golden.py a.jpg b.jpg      # then: cmake -S . -B build/release
 
 ## Licenses
 
-Code in this repository: to be decided. FlexGlue's code and matcher weights are MIT (`weights/LICENSE-FLEXGLUE`);
+Code in this repository: Apache-2.0 (`LICENSE`). FlexGlue's code and matcher weights are MIT (`weights/LICENSE-FLEXGLUE`);
 its backbone weights are under the DINOv3 License (`weights/LICENSE-DINOv3.md`). No weights are committed, served
 or bundled: users fetch `flexglue.pth` themselves.
 `cli/stb_image.h` is public domain / MIT and is used only by the CLI.

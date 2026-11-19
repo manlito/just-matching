@@ -13,6 +13,8 @@ dynamic = ["version"]
 description = "FlexGlue and LightGlue image matching with minimal dependencies: CPU, Metal and CUDA backends"
 readme = "bindings/python/README.md"
 requires-python = ">=3.12"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 dependencies = ["numpy>=1.26"]
 keywords = ["feature matching", "LightGlue", "FlexGlue", "structure from motion", "photogrammetry"]
 classifiers = [
