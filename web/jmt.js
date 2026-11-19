@@ -114,6 +114,42 @@ export async function fetchWeights(url, { onProgress } = {}) {
   return out;
 }
 
+// A checkpoint (flexglue.pth, *_lightglue.pth) or a .jmtw file as a .jmtw file: float16 by default (half the
+// size, and what precision 'fp16' loads), the bytes `jmt convert IN OUT --fp16` writes. `source` is a Blob or
+// File (streamed into the module, never held whole in JavaScript), an ArrayBuffer or a Uint8Array.
+// onProgress(read, total) is called as the input is read. Converting flexglue.pth takes the module's memory to
+// about 1.4 GB, which a WebAssembly module never gives back: run it in a worker that ends afterwards, or reload.
+export async function convert(source, { fp16 = true, onProgress } = {}) {
+  const M = await module();
+  const size = source.size ?? source.byteLength;
+  const at = M._malloc(Math.max(size, 1));
+  if (!at) throw new Error('out of memory for the checkpoint');
+  try {
+    if (typeof Blob !== 'undefined' && source instanceof Blob) {
+      let pos = 0;
+      for (const reader = source.stream().getReader(); ;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        M.HEAPU8.set(value, at + pos);  // HEAPU8 is looked up each time: memory may have grown
+        pos += value.length;
+        onProgress?.(pos, size);
+      }
+      if (pos !== size) throw new Error(`read ${pos} of ${size} bytes`);
+    } else {
+      M.HEAPU8.set(source instanceof Uint8Array ? source : new Uint8Array(source), at);
+      onProgress?.(size, size);
+    }
+  } catch (e) {
+    M._free(at);
+    throw e;
+  }
+  const n = M._jmtw_convert(at, size, fp16 ? 1 : 0);  // takes the input over
+  if (n < 0) throw new Error(M.UTF8ToString(M._jmtw_convert_error()));
+  const out = M.HEAPU8.slice(M._jmtw_converted(), M._jmtw_converted() + n);
+  M._jmtw_converted_free();
+  return out;
+}
+
 // options: weightsUrl (a .jmtw file or a parts manifest, see fetchWeights) or weights (ArrayBuffer /
 // Uint8Array of a .jmtw file, float32 or float16); backend 'webgpu' (default) or 'cpu'; precision 'fp32'
 // (default) or 'fp16' (needs shader-f16); inputSize (512).

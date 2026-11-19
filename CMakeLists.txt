@@ -190,7 +190,8 @@ if(EMSCRIPTEN AND JMT_BUILD_WASM)
   set(jmtw_exports jmtw_backend_available jmtw_create jmtw_model jmtw_describe jmtw_describe_keypoints jmtw_features_free
       jmtw_finish jmtw_match jmtw_idx
       jmtw_score jmtw_a_in_b jmtw_b_in_a jmtw_conf_a jmtw_conf_b jmtw_covisibility jmtw_stop_layer jmtw_covisibility_level
-      jmtw_level1_matrix jmtw_shortlist jmtw_pairs_idx jmtw_pairs_score jmtw_error jmtw_destroy)
+      jmtw_level1_matrix jmtw_shortlist jmtw_pairs_idx jmtw_pairs_score jmtw_error jmtw_destroy
+      jmtw_convert jmtw_converted jmtw_converted_free jmtw_convert_error)
   list(TRANSFORM jmtw_exports PREPEND "_" OUTPUT_VARIABLE jmtw_exported)
   string(REPLACE ";" "," jmtw_exported "_malloc,_free,${jmtw_exported}")
   target_link_options(jmt_wasm PRIVATE
@@ -201,7 +202,7 @@ if(EMSCRIPTEN AND JMT_BUILD_WASM)
     -sMODULARIZE
     -sEXPORT_ES6
     -sEXPORT_NAME=createJmt
-    -sENVIRONMENT=web
+    -sENVIRONMENT=web,worker
     -sALLOW_MEMORY_GROWTH
     -sMAXIMUM_MEMORY=4GB
     -sSTACK_SIZE=1MB)

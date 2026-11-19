@@ -240,15 +240,15 @@ int main(int argc, char** argv) {
       }
       if (paths.size() != 2) throw std::runtime_error("convert: IN and OUT are required");
       const jmt::Weights w = jmt::Weights::from_file(paths[0]);
-      std::vector<jmt::NamedTensor> tensors;
       size_t values = 0;
-      for (const std::string& name : w.names()) {
-        const jmt::Param& p = w.get(name);
-        tensors.push_back({name, p.shape, p.data});
-        values += p.size();
-      }
-      jmt::write_container(paths[1], w.metadata(), tensors, fp16);
-      std::printf("%s: %s, %zu tensors, %zu values, %s\n", paths[1].c_str(), w.meta("model").c_str(), tensors.size(), values,
+      const auto names = w.names();
+      for (const std::string& name : names) values += w.get(name).size();
+      const std::string out = jmt::convert_weights(w, fp16);
+      std::FILE* f = std::fopen(paths[1].c_str(), "wb");
+      bool ok = f && std::fwrite(out.data(), 1, out.size(), f) == out.size();
+      if (f) ok = std::fclose(f) == 0 && ok;
+      if (!ok) throw std::runtime_error("cannot write '" + paths[1] + "'");
+      std::printf("%s: %s, %zu tensors, %zu values, %s\n", paths[1].c_str(), w.meta("model").c_str(), names.size(), values,
                   fp16 ? "float16" : "float32");
     } catch (const std::exception& e) {
       std::fprintf(stderr, "error: %s\n", e.what());
