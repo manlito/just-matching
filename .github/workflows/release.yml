@@ -18,7 +18,7 @@ name: release
 
 on:
   push:
-    branches: [main, wt/pypi-release]  # TEMPORARY: build test of the branch
+    branches: [main]
   workflow_dispatch:
     inputs:
       publish:

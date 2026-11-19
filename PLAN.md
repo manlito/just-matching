@@ -1327,7 +1327,8 @@ As just-ba's (its document 08 and decisions D111 to D116, D129, D152), adapted t
   `covisibility` and `shortlist` take their options as keyword arguments and return NumPy copies. Features keep
   their Matcher alive (GPU features are freed before their context). Each Matcher has a mutex and the GIL is
   released while the library works. Errors are `RuntimeError` with `jmt_last_error()`.
-- **Packages:** `just-matching` (CPU; Metal on macOS arm64, deployment target 13.0) for Linux x86_64, macOS arm64
+- **Packages:** `just-matching` (CPU; Metal on macOS arm64, deployment target 13.0, built on the `macos-26` runner:
+  the Metal 4 kernels need the macOS 26 SDK, which `macos-15`'s Xcode lacks) for Linux x86_64, macOS arm64
   and Windows x86_64, with the sdist; `just-matching-cu12` and `just-matching-cu13` (CPU and CUDA) for Linux and
   Windows x86_64, made from the same `pyproject.toml` by `packaging/variant.py`. One module, `just_matching`,
   for all three. WebGPU is in none. The CUDA runtime is linked statically (CMake's default; `ldd` on the laptop's
@@ -1336,6 +1337,9 @@ As just-ba's (its document 08 and decisions D111 to D116, D129, D152), adapted t
   packages build sm_75 to sm_100 and PTX for sm_120: the kernels use `ldmatrix` and `mma.sync.m16n8k8` without
   an architecture guard, so nothing below Turing compiles (CUDA 12 would have reached Pascal and Volta).
   `packaging/fetch_cuda.py` fetches nvcc, the runtime and the headers from NVIDIA's redistributable archives.
+  On Windows the backend looks for `nvcuda.dll` before its first CUDA call: CUDA 13.4's static runtime crashes
+  without the driver (found by poselib-gpu's wheel tests on a hosted runner), and `Matcher(backend="cuda")`
+  should raise instead. Not reachable in this repository's CI (no weights there), so not run without a driver.
 - **No weights in any package** (`JMT_EMBED_WEIGHTS` off). The owner's choice (2026-11-18): LightGlue's two
   models would be 95 MB a wheel, at PyPI's 100 MB limit, and CI would need the checkpoints. Users pass a
   checkpoint; the PyPI page (`bindings/python/README.md`) says where each one comes from, its sha256 and its
