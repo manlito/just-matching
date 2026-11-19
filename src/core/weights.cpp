@@ -147,8 +147,8 @@ std::vector<std::string> Weights::names() const {
 
 int Weights::meta_int(const std::string& key) const { return std::stoi(meta(key)); }
 
-void write_container(const std::string& path, const std::map<std::string, std::string>& meta,
-                     const std::vector<NamedTensor>& tensors, bool fp16) {
+std::string container_bytes(const std::map<std::string, std::string>& meta, const std::vector<NamedTensor>& tensors,
+                            bool fp16) {
   const size_t elem = fp16 ? 2 : 4;
   std::string head(kMagic, 4);
   put(head, kVersion, 4);
@@ -175,9 +175,8 @@ void write_container(const std::string& path, const std::map<std::string, std::s
     sizes.push_back(count);
     offset = align_up(offset + count * elem);
   }
-  std::FILE* f = std::fopen(path.c_str(), "wb");
-  if (!f) throw std::runtime_error("cannot write '" + path + "'");
-  std::string out = head;
+  std::string out = std::move(head);
+  out.reserve(offset);
   for (size_t i = 0; i < tensors.size(); ++i) {
     out.resize(offsets[i], '\0');
     for (size_t j = 0; j < sizes[i]; ++j) {
@@ -190,9 +189,26 @@ void write_container(const std::string& path, const std::map<std::string, std::s
       put(out, bits, 4);
     }
   }
+  return out;
+}
+
+void write_container(const std::string& path, const std::map<std::string, std::string>& meta,
+                     const std::vector<NamedTensor>& tensors, bool fp16) {
+  const std::string out = container_bytes(meta, tensors, fp16);
+  std::FILE* f = std::fopen(path.c_str(), "wb");
+  if (!f) throw std::runtime_error("cannot write '" + path + "'");
   bool ok = std::fwrite(out.data(), 1, out.size(), f) == out.size();
   ok = std::fclose(f) == 0 && ok;
   if (!ok) throw std::runtime_error("cannot write '" + path + "'");
+}
+
+std::string convert_weights(const Weights& w, bool fp16) {
+  std::vector<NamedTensor> tensors;
+  for (const std::string& name : w.names()) {
+    const Param& p = w.get(name);
+    tensors.push_back({name, p.shape, p.data});
+  }
+  return container_bytes(w.metadata(), tensors, fp16);
 }
 
 }  // namespace jmt

@@ -48,6 +48,19 @@ browser, and keeps a copy in the origin's private file system for the next visit
 The module converts the checkpoint while it creates the matcher. Meanwhile memory holds the file and the converted
 weights: about 1.2 GB for the 567 MB checkpoint.
 
+To convert once and keep the result, `jmt.convert` gives the `.jmtw` file's bytes, float16 by default (284 MB for
+FlexGlue), the same bytes as `jmt convert flexglue.pth out.jmtw --fp16`:
+
+```js
+// in a worker, so the module's memory (about 1.4 GB while it converts) goes when the worker ends
+const jmtw = await jmt.convert(file, { fp16: true, onProgress: (read, total) => {} });
+// keep jmtw (the origin private file system), then: jmt.create({ weights: jmtw, precision: 'fp16' })
+```
+
+A `Blob` or `File` is streamed into the module rather than read whole into JavaScript first. A WebAssembly
+module's memory never shrinks, so a page that converts on its main thread keeps that memory until it reloads.
+The module also runs in a worker.
+
 ## Options of `create`
 
 | Option | Default | Meaning |

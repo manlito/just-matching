@@ -8,10 +8,14 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
+#include <exception>
 #include <new>
+#include <string>
 
 #include "core/api_internal.h"
 #include "core/ops.h"
+#include "core/weights.h"
 #include "jmt/jmt.h"
 
 namespace {
@@ -20,6 +24,9 @@ struct Handle {
   jmt_matches result{};
   jmt_pair_list pairs{};
 };
+
+std::string converted;      // jmtw_convert's file, until jmtw_converted_free
+std::string convert_error;  // jmtw_convert's last failure
 }  // namespace
 
 extern "C" {
@@ -142,6 +149,33 @@ EMSCRIPTEN_KEEPALIVE int jmtw_shortlist(Handle* h, const jmt_features* const* im
 EMSCRIPTEN_KEEPALIVE const int32_t* jmtw_pairs_idx(Handle* h) { return h->pairs.idx; }
 EMSCRIPTEN_KEEPALIVE const float* jmtw_pairs_score(Handle* h) { return h->pairs.score; }
 EMSCRIPTEN_KEEPALIVE const char* jmtw_error() { return jmt_last_error(); }
+
+// A checkpoint (flexglue.pth, *_lightglue.pth) or a .jmtw file to a .jmtw file, float16 when fp16 (what
+// `jmt convert IN OUT [--fp16]` writes, byte for byte). `data` is a malloc'd copy of the input, which this
+// takes over and frees as soon as it is read, so memory holds the input and the tensors only briefly.
+// Returns the file's size, its bytes at jmtw_converted() until jmtw_converted_free(); -1 on failure
+// (jmtw_convert_error). Needs no GPU.
+EMSCRIPTEN_KEEPALIVE int jmtw_convert(void* data, int size, int fp16) {
+  converted.clear();
+  converted.shrink_to_fit();
+  try {
+    jmt::Weights w = jmt::Weights::from_memory(data, static_cast<size_t>(size));
+    std::free(data);
+    data = nullptr;
+    converted = jmt::convert_weights(w, fp16 != 0);
+  } catch (const std::exception& e) {
+    std::free(data);
+    convert_error = e.what();
+    return -1;
+  }
+  return static_cast<int>(converted.size());
+}
+EMSCRIPTEN_KEEPALIVE const char* jmtw_converted() { return converted.data(); }
+EMSCRIPTEN_KEEPALIVE void jmtw_converted_free() {
+  converted.clear();
+  converted.shrink_to_fit();
+}
+EMSCRIPTEN_KEEPALIVE const char* jmtw_convert_error() { return convert_error.c_str(); }
 
 EMSCRIPTEN_KEEPALIVE void jmtw_destroy(Handle* h) {
   if (!h) return;
