@@ -4,6 +4,7 @@ project(just_matching VERSION 0.1.0 LANGUAGES CXX)
 option(JMT_BUILD_CLI "Build the jmt command line tool" ON)
 option(JMT_BUILD_TESTS "Build tests" ON)
 option(JMT_BUILD_WASM "Emscripten: build the WebAssembly module, JS wrapper and test page (web/)" ON)
+option(JMT_BUILD_PYTHON "Build the Python bindings (bindings/python; needs nanobind)" OFF)
 # LightGlue's weights (Apache-2.0) can be built into the library: weights/<model>.jmtw, made by
 # tools/export_weights.py --model <model> (47.6 MB each). FlexGlue's never are (DINOv3 License).
 option(JMT_EMBED_WEIGHTS "Build the LightGlue weights of JMT_EMBED_MODELS into the library" OFF)
@@ -344,4 +345,8 @@ if(JMT_BUILD_TESTS)
                COMMAND shortlist_test "${CMAKE_CURRENT_SOURCE_DIR}/weights/flexglue.jmtw" "${golden}" ${backend})
     endforeach()
   endforeach()
+endif()
+
+if(JMT_BUILD_PYTHON)
+  add_subdirectory(bindings/python)
 endif()
