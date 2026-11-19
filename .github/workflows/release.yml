@@ -76,7 +76,9 @@ jobs:
       matrix:
         include:
           - { os: ubuntu-24.04, variant: cpu }
-          - { os: macos-15, variant: cpu }
+          # The Metal backend's fast kernels need the macOS 26 SDK (MTLLanguageVersion4_0, Xcode 26) to build;
+          # the wheel still targets macOS 13 and picks them at run time.
+          - { os: macos-26, variant: cpu }
           - { os: windows-2025, variant: cpu }
           - { os: ubuntu-24.04, variant: cu12, cuda: "12.9.1" }
           - { os: ubuntu-24.04, variant: cu13, cuda: "13.4.3" }
