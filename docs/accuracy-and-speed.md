@@ -40,9 +40,10 @@ pair, adaptive defaults:
 
 | CPU (M5 Pro) | Metal FP32 | Metal FP16 | WebGPU FP32 | WebGPU FP16 | CUDA FP32 | CUDA FP16 |
 |---|---|---|---|---|---|---|
-| 167 | 19 | 10 | 149 | 145 | 28 | 14 |
+| 167 | 19 | 10 | 20 | 16 | 28 | 14 |
 
-CUDA on the RTX 2070 Max-Q, the rest on the M5 Pro.
+CUDA on the RTX 2070 Max-Q, the rest on the M5 Pro (WebGPU natively, through Dawn). In Chrome on the M5 Pro a pair
+of the demo's sample set takes 23 ms in FP32 and 19 ms in FP16.
 
 ## FlexGlue
 
