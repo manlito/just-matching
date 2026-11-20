@@ -11,8 +11,8 @@ RTX 2070 (CUDA FP16), 2048 keypoints per image. Its weights are Apache-2.0: `too
 
 LighterGlue (M10), XFeat's smaller LightGlue (6 layers, width 96, one head; verlab/accelerated_features,
 Apache-2.0): `jmt match --model lightglue-xfeat` on just-keypoints' `xfeat` keypoints and 64-dim descriptors, on the
-CPU, Metal and WebGPU backends, with the original's matches; 19 ms per pair on the M5 Pro (Metal FP32, 10 ms FP16),
-2048 keypoints per image. Its weights (4.5 MB, `weights/lightglue-xfeat.jmtw`, with `weights/LICENSE-XFEAT`) are committed, so
+CPU, Metal, WebGPU and CUDA backends, with the original's matches; 19 ms per pair on the M5 Pro (Metal FP32, 10 ms
+FP16), 28 ms on the RTX 2070 (CUDA FP32, 14 ms FP16), 2048 keypoints per image. Its weights (4.5 MB, `weights/lightglue-xfeat.jmtw`, with `weights/LICENSE-XFEAT`) are committed, so
 `-DJMT_EMBED_WEIGHTS=ON -DJMT_EMBED_MODELS=lightglue-xfeat` builds them in without PyTorch; the fetch script gets
 the original `xfeat-lighterglue.pt` to check them against.
 

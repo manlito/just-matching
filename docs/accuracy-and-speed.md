@@ -33,6 +33,17 @@ In Chrome on the M5 Pro, a pair of the demo's sample set takes 71 ms in FP32 and
 places lets through more stray matches than running all layers (39 against 18 on the pair above); they are
 outliers.
 
+LighterGlue (`lightglue-xfeat`, 2048 XFeat keypoints per image, 6 pairs) gives the original's matches on the CPU,
+Metal, WebGPU and CUDA in FP32, scores within 6e-4 (its one head of 96 channels has larger logits: the original's
+own float32 scores drift by 2.6e-4 from float64); FP16 keeps 99 % of the matches. Milliseconds per pair, LaMAR
+pair, adaptive defaults:
+
+| CPU (M5 Pro) | Metal FP32 | Metal FP16 | WebGPU FP32 | WebGPU FP16 | CUDA FP32 | CUDA FP16 |
+|---|---|---|---|---|---|---|
+| 167 | 19 | 10 | 149 | 145 | 28 | 14 |
+
+CUDA on the RTX 2070 Max-Q, the rest on the M5 Pro.
+
 ## FlexGlue
 
 ### Agreement with the original
