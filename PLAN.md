@@ -1353,7 +1353,12 @@ and message norms. Everything else LightGlue needs is already in `Ops`.
   | LighterGlue (XFeat) | 167 ms | 19 ms | 10 ms | 149 ms | 145 ms |
   | LightGlue (ALIKED) | 546 ms | 37 ms | 16 ms | 51 ms | 36 ms |
 
-  WebGPU's `k_attn_any` is not tuned: one query per thread. Not checked: without Metal 4 (`JMT_METAL_MPP=0`)
+  WebGPU's `k_attn_any` is not tuned: one query per thread.
+- **Buffer pools** (found by like-recon's M12 on a 222-frame capture): the GPU pools reused a buffer only for
+  a request of exactly its size, and LightGlue's tensors change size with every pair, so 5,421 LighterGlue
+  pairs on Metal reached 64 GB of memory footprint and 8,421 were killed. Metal and WebGPU now round sizes up
+  to eight steps per octave (at most 12.5 % more, `core/pool.h`) and keep at most 1 GB idle: 2.0 GB peak for
+  the 5,421 pairs, and 25 % faster. The CUDA pool is still exact-size (it affects LightGlue-ALIKED there too). Not checked: without Metal 4 (`JMT_METAL_MPP=0`)
   LighterGlue misses one matchability bound (5.4e-4 against 5.2e-4 on the LaMAR pair), and `ops_metal` fails
   in the linear product ("input channels must be a multiple of 4"), code M10 does not touch.
 
