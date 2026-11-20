@@ -6,5 +6,7 @@ __pycache__/
 venv/
 .DS_Store
 /weights/*.jmtw
+# LighterGlue (XFeat) is small and Apache-2.0: committed, so a build can embed it without PyTorch.
+!/weights/lightglue-xfeat.jmtw
 /docs/_build/
 /docs/.venv/
