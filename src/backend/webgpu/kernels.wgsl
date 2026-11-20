@@ -955,6 +955,220 @@ fn group(g: u32, li: u32) {
   }
 }
 
+//@kernel k_attnd96
+// k_attnd for 96 channels per head (LighterGlue's one head): the same tiles and online softmax, 24 loads
+// per token for the logits, and each thread's outputs are 6 channels (6 tx .. + 5) of its 4 rows, so the
+// 16 threads of a row cover the 96. Scalars: P, S, heads. Groups: heads * ceil(P / 64).
+//@group 256
+@group(0) @binding(1) var<storage, read> q: array<vec4<real>>;
+@group(0) @binding(2) var<storage, read> k: array<vec4<real>>;
+@group(0) @binding(3) var<storage, read> vt: array<vec4<real>>;
+@group(0) @binding(4) var<storage, read_write> out: array<real>;
+var<workgroup> sw: array<vec4<f32>, 1024>;  // [64 queries][16 token quads]: the weights of a tile
+
+fn group(g: u32, li: u32) {
+  let Pq = pu(0u);
+  let S = pu(1u);
+  let heads = pu(2u);
+  let C4 = heads * 24u;  // loads per token
+  let S4 = (S + 3u) / 4u;
+  let pblocks = (Pq + 63u) / 64u;
+  if (g >= heads * pblocks) { return; }
+  let hd = g / pblocks;
+  let p0 = (g % pblocks) * 64u;
+  let tx = li % 16u;
+  let ty = li / 16u;
+  var qb: array<u32, 4>;
+  for (var r = 0u; r < 4u; r++) { qb[r] = min(p0 + ty + 16u * r, Pq - 1u) * C4 + hd * 24u; }
+  let vbase = (hd * 96u + 6u * tx) * S4;
+  var o: array<vec4<f32>, 4>;   // channels 6 tx .. + 3
+  var o2: array<vec2<f32>, 4>;  // channels 6 tx + 4, + 5
+  var top = vec4<f32>(kLowest);
+  var part = vec4<f32>(0.0);
+  for (var r = 0u; r < 4u; r++) { o[r] = vec4<f32>(0.0); o2[r] = vec2<f32>(0.0); }
+  for (var s0 = 0u; s0 < S; s0 += 64u) {
+    var kb: array<u32, 4>;
+    for (var c = 0u; c < 4u; c++) { kb[c] = min(s0 + 4u * tx + c, S - 1u) * C4 + hd * 24u; }
+    var l: array<vec4<f32>, 4>;  // l[r][c]: query ty + 16 r, token s0 + 4 tx + c
+    for (var r = 0u; r < 4u; r++) { l[r] = vec4<f32>(0.0); }
+    for (var j = 0u; j < 24u; j++) {
+      let b0 = vec4<f32>(k[kb[0] + j]);
+      let b1 = vec4<f32>(k[kb[1] + j]);
+      let b2 = vec4<f32>(k[kb[2] + j]);
+      let b3 = vec4<f32>(k[kb[3] + j]);
+      for (var r = 0u; r < 4u; r++) {
+        let a = vec4<f32>(q[qb[r] + j]);
+        l[r] += vec4<f32>(dot(a, b0), dot(a, b1), dot(a, b2), dot(a, b3));
+      }
+    }
+    let valid = vec4<u32>(s0 + tx * 4u) + vec4<u32>(0u, 1u, 2u, 3u) < vec4<u32>(S);
+    for (var r = 0u; r < 4u; r++) { l[r] = select(vec4<f32>(kLowest), l[r] * 0.10206207261596575, valid); }  // 1 / sqrt(96)
+    sw[li] = vec4<f32>(max(max(l[0].x, l[0].y), max(l[0].z, l[0].w)), max(max(l[1].x, l[1].y), max(l[1].z, l[1].w)),
+                        max(max(l[2].x, l[2].y), max(l[2].z, l[2].w)), max(max(l[3].x, l[3].y), max(l[3].z, l[3].w)));
+    workgroupBarrier();
+    var grown = top;
+    for (var t = 0u; t < 16u; t++) { grown = max(grown, sw[ty * 16u + t]); }
+    workgroupBarrier();
+    let shrink = exp(top - grown);  // 0 on the first tile, 1 for rows whose maximum did not grow
+    top = grown;
+    part *= shrink;
+    for (var r = 0u; r < 4u; r++) {
+      o[r] *= shrink[r];
+      o2[r] *= shrink[r];
+      l[r] = select(vec4<f32>(0.0), exp(l[r] - vec4<f32>(top[r])), valid);  // the weights
+      part[r] += (l[r].x + l[r].y) + (l[r].z + l[r].w);
+      sw[(ty + 16u * r) * 16u + tx] = l[r];
+    }
+    workgroupBarrier();
+    for (var t = 0u; t < 16u; t++) {
+      let at = s0 / 4u + t;
+      if (at >= S4) { break; }
+      let v0 = vec4<f32>(vt[vbase + at]);
+      let v1 = vec4<f32>(vt[vbase + S4 + at]);
+      let v2 = vec4<f32>(vt[vbase + 2u * S4 + at]);
+      let v3 = vec4<f32>(vt[vbase + 3u * S4 + at]);
+      let v4 = vec4<f32>(vt[vbase + 4u * S4 + at]);
+      let v5 = vec4<f32>(vt[vbase + 5u * S4 + at]);
+      for (var r = 0u; r < 4u; r++) {
+        let w = sw[(ty + 16u * r) * 16u + t];
+        o[r] += vec4<f32>(dot(w, v0), dot(w, v1), dot(w, v2), dot(w, v3));
+        o2[r] += vec2<f32>(dot(w, v4), dot(w, v5));
+      }
+    }
+    workgroupBarrier();
+  }
+  sw[li] = part;
+  workgroupBarrier();
+  var sum = vec4<f32>(0.0);
+  for (var t = 0u; t < 16u; t++) { sum += sw[ty * 16u + t]; }
+  for (var r = 0u; r < 4u; r++) {
+    let p = p0 + ty + 16u * r;
+    if (p < Pq) {
+      let b = p * heads * 96u + hd * 96u + 6u * tx;
+      let a = o[r] / sum[r];
+      let c = o2[r] / sum[r];
+      out[b] = real(a.x);
+      out[b + 1u] = real(a.y);
+      out[b + 2u] = real(a.z);
+      out[b + 3u] = real(a.w);
+      out[b + 4u] = real(c.x);
+      out[b + 5u] = real(c.y);
+    }
+  }
+}
+
+//@kernel k_attnh96
+// k_attnh for 96 channels per head (LighterGlue's one head, FP16 mode): 12 loads of 8 channels per token
+// for the logits; each thread's outputs are 6 channels (6 tx .. + 5) of its 4 rows, from the values
+// transposed and packed by k_tokens_t. The logits are f32 products of the f16 inputs: LighterGlue's one
+// head of 96 has logits large enough that f16 sums of 8 products moved its matches (k_attnh's are f16).
+// Scalars: P, S, heads. Groups: heads * ceil(P / 64).
+//@group 256
+@group(0) @binding(1) var<storage, read> q: array<vec4<u32>>;
+@group(0) @binding(2) var<storage, read> k: array<vec4<u32>>;
+@group(0) @binding(3) var<storage, read> vt: array<vec4<u32>>;
+@group(0) @binding(4) var<storage, read_write> out: array<f16>;
+var<workgroup> sw: array<vec4<f16>, 1024>;  // [64 queries][16 token quads]: the weights of a tile
+var<workgroup> red: array<vec4<f32>, 256>;  // [thread]: the maxima, then the sums, of its part of its 4 rows
+
+fn h0(v: vec4<u32>) -> vec4<f16> { return bitcast<vec4<f16>>(v.xy); }
+fn h1(v: vec4<u32>) -> vec4<f16> { return bitcast<vec4<f16>>(v.zw); }
+fn dot8f(a: vec4<u32>, b: vec4<u32>) -> f32 {
+  return dot(vec4<f32>(h0(a)), vec4<f32>(h0(b))) + dot(vec4<f32>(h1(a)), vec4<f32>(h1(b)));
+}
+fn wdot(wa: vec4<f16>, wb: vec4<f16>, v: vec4<u32>) -> f16 { return dot(wa, h0(v)) + dot(wb, h1(v)); }
+
+fn group(g: u32, li: u32) {
+  let Pq = pu(0u);
+  let S = pu(1u);
+  let heads = pu(2u);
+  let C8 = heads * 12u;  // loads per token
+  let S8 = (S + 7u) / 8u;
+  let pblocks = (Pq + 63u) / 64u;
+  if (g >= heads * pblocks) { return; }
+  let hd = g / pblocks;
+  let p0 = (g % pblocks) * 64u;
+  let tx = li % 16u;
+  let ty = li / 16u;
+  var qb: array<u32, 4>;
+  for (var r = 0u; r < 4u; r++) { qb[r] = min(p0 + ty + 16u * r, Pq - 1u) * C8 + hd * 12u; }
+  let vbase = (hd * 96u + 6u * tx) * S8;
+  var o: array<vec4<f32>, 4>;   // channels 6 tx .. + 3
+  var o2: array<vec2<f32>, 4>;  // channels 6 tx + 4, + 5
+  var top = vec4<f32>(kLowest);
+  var part = vec4<f32>(0.0);
+  for (var r = 0u; r < 4u; r++) { o[r] = vec4<f32>(0.0); o2[r] = vec2<f32>(0.0); }
+  for (var s0 = 0u; s0 < S; s0 += 64u) {
+    var kb: array<u32, 4>;
+    for (var c = 0u; c < 4u; c++) { kb[c] = min(s0 + 4u * tx + c, S - 1u) * C8 + hd * 12u; }
+    var l: array<vec4<f32>, 4>;
+    for (var r = 0u; r < 4u; r++) { l[r] = vec4<f32>(0.0); }
+    for (var j = 0u; j < 12u; j++) {
+      let b0 = k[kb[0] + j];
+      let b1 = k[kb[1] + j];
+      let b2 = k[kb[2] + j];
+      let b3 = k[kb[3] + j];
+      for (var r = 0u; r < 4u; r++) {
+        let a = q[qb[r] + j];
+        l[r] += vec4<f32>(dot8f(a, b0), dot8f(a, b1), dot8f(a, b2), dot8f(a, b3));
+      }
+    }
+    let valid = vec4<u32>(s0 + tx * 4u) + vec4<u32>(0u, 1u, 2u, 3u) < vec4<u32>(S);
+    for (var r = 0u; r < 4u; r++) { l[r] = select(vec4<f32>(kLowest), l[r] * 0.10206207261596575, valid); }  // 1 / sqrt(96)
+    red[li] = vec4<f32>(max(max(l[0].x, l[0].y), max(l[0].z, l[0].w)), max(max(l[1].x, l[1].y), max(l[1].z, l[1].w)),
+                        max(max(l[2].x, l[2].y), max(l[2].z, l[2].w)), max(max(l[3].x, l[3].y), max(l[3].z, l[3].w)));
+    workgroupBarrier();
+    var grown = top;
+    for (var t = 0u; t < 16u; t++) { grown = max(grown, red[ty * 16u + t]); }
+    let shrink = exp(top - grown);
+    top = grown;
+    part *= shrink;
+    for (var r = 0u; r < 4u; r++) {
+      o[r] *= shrink[r];
+      o2[r] *= shrink[r];
+      l[r] = select(vec4<f32>(0.0), exp(l[r] - vec4<f32>(top[r])), valid);
+      part[r] += (l[r].x + l[r].y) + (l[r].z + l[r].w);
+      sw[(ty + 16u * r) * 16u + tx] = vec4<f16>(l[r]);
+    }
+    workgroupBarrier();
+    for (var t = 0u; t < 8u; t++) {
+      let at = s0 / 8u + t;
+      if (at >= S8) { break; }
+      let v0 = vt[vbase + at];
+      let v1 = vt[vbase + S8 + at];
+      let v2 = vt[vbase + 2u * S8 + at];
+      let v3 = vt[vbase + 3u * S8 + at];
+      let v4 = vt[vbase + 4u * S8 + at];
+      let v5 = vt[vbase + 5u * S8 + at];
+      for (var r = 0u; r < 4u; r++) {
+        let wa = sw[(ty + 16u * r) * 16u + 2u * t];
+        let wb = sw[(ty + 16u * r) * 16u + 2u * t + 1u];
+        o[r] += vec4<f32>(vec4<f16>(wdot(wa, wb, v0), wdot(wa, wb, v1), wdot(wa, wb, v2), wdot(wa, wb, v3)));
+        o2[r] += vec2<f32>(vec2<f16>(wdot(wa, wb, v4), wdot(wa, wb, v5)));
+      }
+    }
+    workgroupBarrier();
+  }
+  red[li] = part;
+  workgroupBarrier();
+  var sum = vec4<f32>(0.0);
+  for (var t = 0u; t < 16u; t++) { sum += red[ty * 16u + t]; }
+  for (var r = 0u; r < 4u; r++) {
+    let p = p0 + ty + 16u * r;
+    if (p < Pq) {
+      let b = p * heads * 96u + hd * 96u + 6u * tx;
+      let a = o[r] / sum[r];
+      let c = o2[r] / sum[r];
+      out[b] = f16(a.x);
+      out[b + 1u] = f16(a.y);
+      out[b + 2u] = f16(a.z);
+      out[b + 3u] = f16(a.w);
+      out[b + 4u] = f16(c.x);
+      out[b + 5u] = f16(c.y);
+    }
+  }
+}
+
 //@kernel k_readout
 // Match read-out of one query from its float logits over the h x w cells (see Ops::readout and
 // core/readout.h, which this follows; the same method as the Metal kernel). One workgroup of 128 threads
@@ -1164,7 +1378,8 @@ fn run(gid: u32) {
 
 //@kernel k_attn_any
 // Attention for any number of channels per head D (a multiple of 4, at most 128): out = softmax(q k^T /
-// sqrt(D)) v per head. Used for LighterGlue (one head of 96); k_attnd and k_attnh are the tuned kernels for 64.
+// sqrt(D)) v per head. The fallback for head sizes without a tuned kernel (k_attnd and k_attnh for 64,
+// k_attnd96 and k_attnh96 for LighterGlue's 96).
 // One workgroup: 64 queries of one head, one thread per query; the source tokens are walked 16 at a time,
 // their keys and values staged in workgroup memory by the whole group (16 KB for D = 128). Per tile, each
 // thread computes its 16 logits; when its largest logit grows, its outputs and sum so far are scaled to the

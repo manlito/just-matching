@@ -1344,8 +1344,10 @@ and message norms. Everything else LightGlue needs is already in `Ops`.
   (FP16: 0.25; matches 99 % the same).
 - **GPU attention** had 64 channels per head built in. Metal's kernels are templates on the head size now
   (`k_attn`, the Metal 4 kernel, and the portable `k_attn_keys` / `k_attn_weights` / `k_attn_apply`,
-  instantiated for 64 and 96); WebGPU has `k_attn_any` (one thread per query, 16-token tiles of keys and values
-  in workgroup memory, any multiple of 4 up to 128) beside its tuned 64-channel kernels. CUDA's `k_flash` is a
+  instantiated for 64 and 96); WebGPU has `k_attnd96` / `k_attnh96` (its tuned 64-channel kernels with 24 loads
+  per token and 6 output channels a thread; the FP16 one takes its logits as f32 products, since f16 sums of
+  8 moved a match on one pair) and `k_attn_any` (one thread per query, any multiple of 4 up to 128) for other
+  sizes; `JMT_WEBGPU_ATTN_ANY=1` forces the latter. CUDA's `k_flash` is a
   template on the head size too (64, 96): with 96 a step covers half as many tokens (both copies of keys and
   values, rows of 104, stay within 48 KB of static shared memory) and a block is 8 warps (16 spilled: 128
   registers a thread). The path through the logits buffer (`JMT_CUDA_FLASH=0`) still needs token counts that
@@ -1354,10 +1356,11 @@ and message norms. Everything else LightGlue needs is already in `Ops`.
 
   | | CPU | Metal FP32 | Metal FP16 | WebGPU FP32 | WebGPU FP16 |
   |---|---|---|---|---|---|
-  | LighterGlue (XFeat) | 167 ms | 19 ms | 10 ms | 149 ms | 145 ms |
+  | LighterGlue (XFeat) | 167 ms | 19 ms | 10 ms | 20 ms | 16 ms |
   | LightGlue (ALIKED) | 546 ms | 37 ms | 16 ms | 51 ms | 36 ms |
 
-  WebGPU's `k_attn_any` is not tuned: one query per thread. On the RTX 2070 Max-Q (CUDA 13.4, same pair):
+  WebGPU was 149 and 145 ms with `k_attn_any`. In Chrome (the demo, 12 samples, 66 pairs) a pair went from
+  157 to 23 ms (FP32) and 19 ms (FP16), the same matches. On the RTX 2070 Max-Q (CUDA 13.4, same pair):
 
   | | CPU | CUDA FP32 | CUDA FP16 |
   |---|---|---|---|

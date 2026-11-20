@@ -872,23 +872,30 @@ class WebGpuOps : public Ops {
     auto out = std::make_shared<GpuTensor>(ctx_, q.h, q.w, q.c);
     const int P = q.n(), S = k.n();
     const long long groups = static_cast<long long>(heads) * ((P + 63) / 64);
-    if (D != 64) {  // LighterGlue's one head of 96
+    // Tuned kernels for 64 channels per head (LightGlue, FlexGlue) and 96 (LighterGlue); any other size takes the
+    // generic one. JMT_WEBGPU_ATTN_ANY=1 forces the generic one (for comparisons).
+    static const bool any_only = [] {
+      const char* e = std::getenv("JMT_WEBGPU_ATTN_ANY");
+      return e && *e == '1';
+    }();
+    if ((D != 64 && D != 96) || any_only) {
       ctx_->run_groups("k_attn_any", groups, q.d(), k.d(), v.d(), out->d(), P, S, heads, D,
                        1.0f / std::sqrt(static_cast<float>(D)));
       return out;
     }
+    const bool d96 = D == 96;
     if (ctx_->fp16()) {
       // The values transposed and packed: 8 tokens of one channel per 16-byte load.
       const int S8 = (S + 7) / 8;
       Buffer vt(ctx_, static_cast<size_t>(q.c) * S8 * 16);
       ctx_->run("k_tokens_t", static_cast<long long>(q.c) * S8, v.d(), vt.view(), S, q.c, S8);
-      ctx_->run_groups("k_attnh", groups, q.d(), k.d(), vt.view(), out->d(), P, S, heads);
+      ctx_->run_groups(d96 ? "k_attnh96" : "k_attnh", groups, q.d(), k.d(), vt.view(), out->d(), P, S, heads);
     } else {
       // The values transposed: 4 tokens of one channel per load.
       const int S4 = (S + 3) / 4;
       Buffer vt(ctx_, static_cast<size_t>(q.c) * S4 * 4 * sizeof(float));
       ctx_->run("k_tokens_t4", static_cast<long long>(q.c) * S4, v.d(), vt.view(), S, q.c, S4);
-      ctx_->run_groups("k_attnd", groups, q.d(), k.d(), vt.view(), out->d(), P, S, heads);
+      ctx_->run_groups(d96 ? "k_attnd96" : "k_attnd", groups, q.d(), k.d(), vt.view(), out->d(), P, S, heads);
     }
     return out;
   }
