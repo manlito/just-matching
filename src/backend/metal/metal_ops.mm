@@ -698,12 +698,16 @@ class MetalOps : public Ops {
 
   TensorPtr attention(const TensorPtr& qp, const TensorPtr& kp, const TensorPtr& vp, int heads) override {
     const MetalTensor &q = dev(qp), &k = dev(kp), &v = dev(vp);
-    if (q.c != heads * 64 || k.c != q.c || v.c != q.c || k.n() != v.n()) fail("attention: needs 64 channels per head");
+    // 64 channels per head (LightGlue, FlexGlue) or one head of 96 (LighterGlue).
+    const int D = heads > 0 ? q.c / heads : 0;
+    if ((D != 64 && D != 96) || q.c != heads * D || k.c != q.c || v.c != q.c || k.n() != v.n())
+      fail("attention: needs 64 or 96 channels per head");
+    const std::string d = D == 64 ? "" : "_d96";
     auto out = std::make_shared<MetalTensor>(ctx_, q.h, q.w, q.c);
     const int P = q.n(), S = k.n(), spad = (S + 7) / 8 * 8;
     if (ctx_->mpp()) {
       ctx_->tag(format("attention P %d S %d", P, S));
-      ctx_->run_groups("k_attn", static_cast<long long>(heads) * ((P + 31) / 32), 32, q.d(), k.d(), v.d(), P, S, heads, out->d());
+      ctx_->run_groups(("k_attn" + d).c_str(), static_cast<long long>(heads) * ((P + 31) / 32), 32, q.d(), k.d(), v.d(), P, S, heads, out->d());
       return out;
     }
     if (spad / 8 > 1024) fail("attention: more than 8192 tokens per image (input size above 720 px)");
@@ -713,15 +717,15 @@ class MetalOps : public Ops {
     chunk = std::min(P, (chunk + 3) / 4 * 4);
     Buffer weights(ctx_, static_cast<size_t>(heads) * chunk * S * ctx_->elem());
     Buffer inv(ctx_, static_cast<size_t>(heads) * chunk * sizeof(float));
-    Buffer keys(ctx_, static_cast<size_t>(heads) * 64 * spad * ctx_->elem());
+    Buffer keys(ctx_, static_cast<size_t>(heads) * D * spad * ctx_->elem());
     ctx_->tag(format("attention P %d S %d", P, S));
-    ctx_->run("k_attn_keys", static_cast<long long>(heads) * 64 * spad, k.d(), S, heads, spad, keys.view());
+    ctx_->run(("k_attn_keys" + d).c_str(), static_cast<long long>(heads) * D * spad, k.d(), S, heads, spad, keys.view());
     for (int p0 = 0; p0 < P; p0 += chunk) {
       const int pc = std::min(chunk, P - p0);
-      ctx_->run_groups("k_attn_weights", static_cast<long long>(heads) * ((pc + 3) / 4), spad / 8, q.d(), keys.view(), pc, S,
+      ctx_->run_groups(("k_attn_weights" + d).c_str(), static_cast<long long>(heads) * ((pc + 3) / 4), spad / 8, q.d(), keys.view(), pc, S,
                        heads, spad, weights.view(), inv.view(), p0);
-      ctx_->run(format("k_attn_apply_r%d_t%d", apply_rows_, apply_tile_),
-                static_cast<long long>(heads) * ((pc + apply_rows_ - 1) / apply_rows_) * (64 / apply_tile_), weights.view(),
+      ctx_->run(format("k_attn_apply_r%d_t%d%s", apply_rows_, apply_tile_, d.c_str()),
+                static_cast<long long>(heads) * ((pc + apply_rows_ - 1) / apply_rows_) * (D / apply_tile_), weights.view(),
                 v.d(), pc, S, heads, inv.view(), out->d(), p0);
     }
     return out;

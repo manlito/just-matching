@@ -212,14 +212,16 @@ std::vector<Matches> match_pairs(Matcher& m, const std::vector<std::tuple<Featur
 
 const char* kOptionsDoc = R"(
 Options, each left at the library's default when not given:
-  n_layers          transformer layers to run (FlexGlue 0..9, LightGlue 1..9; default 9)
+  n_layers          transformer layers to run (FlexGlue 0..9, LightGlue 1..9, lightglue-xfeat 1..6; default 9)
   filter_threshold  minimum match score (default 0.1)
   max_distance_px   FlexGlue: largest distance between a keypoint and the point predicted for its partner,
                     in pixels of the network input (default 3; <= 0 off)
   min_covisibility  FlexGlue: pairs below it get no matches (default 0, off)
   early_stop_decay  FlexGlue: stop a pair early when its covisibility falls behind (default -1, off)
-  depth_confidence  LightGlue: stop when this share of keypoints is confident (default 0.95; <= 0 off)
-  width_confidence  LightGlue: drop confident unmatchable keypoints (default 0.99; <= 0 off))";
+  depth_confidence  LightGlue: stop when this share of keypoints is confident (default: the model's own, 0.95,
+                    lightglue-xfeat off; <= 0 off)
+  width_confidence  LightGlue: drop confident unmatchable keypoints (default: the model's own, 0.99,
+                    lightglue-xfeat 0.95; <= 0 off))";
 
 }  // namespace
 

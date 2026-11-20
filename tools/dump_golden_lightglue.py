@@ -2,11 +2,13 @@
 """Golden test vectors from the original LightGlue (third_party/LightGlue, tools/fetch_lightglue.sh), for the
 C++ backends.
 
-    python tools/dump_golden_lightglue.py A B [--model aliked|raco-aliked] [--keypoints 2048]
+    python tools/dump_golden_lightglue.py A B [--model aliked|raco-aliked|xfeat] [--keypoints 2048]
         -> build/golden/lightglue-<model>/<A>-<B>.jmtt
 
 Keypoints and 128-dim descriptors come from the just-keypoints CLI: aliked-n16 alone, or RaCo keypoints
-described by aliked-n16. Coordinates are just-keypoints' (0,0) = centre of the top-left pixel, which is also
+described by aliked-n16. --model xfeat: LighterGlue (verlab/accelerated_features, XFeat's 6-layer LightGlue of
+width 96 and one head) on xfeat keypoints and 64-dim descriptors, run by the same upstream LightGlue code with
+LighterGlue's configuration; its adaptive run uses LighterGlue's defaults (no early stop, width 0.95). Coordinates are just-keypoints' (0,0) = centre of the top-left pixel, which is also
 upstream ALIKED's. LightGlue runs on the CPU in FP32.
 
 One file per pair, in the weights container format (jmtfile.py). Two runs:
@@ -31,6 +33,10 @@ import jmtfile
 LG_DIR = os.path.join(common.ROOT, "third_party", "LightGlue")
 WEIGHTS = {m: os.path.join(common.ROOT, "third_party", "lightglue-weights", f"{m.replace('-', '_')}_lightglue.pth")
            for m in ("aliked", "raco-aliked")}
+WEIGHTS["xfeat"] = os.path.join(common.ROOT, "third_party", "lightglue-weights", "xfeat-lighterglue.pt")
+# LighterGlue's configuration (modules/lighterglue.py of verlab/accelerated_features at e92685f).
+LIGHTERGLUE = {"input_dim": 64, "descriptor_dim": 96, "n_layers": 6, "num_heads": 1, "depth_confidence": -1,
+               "width_confidence": 0.95}
 
 
 def load_lightglue_module():
@@ -43,8 +49,11 @@ def load_lightglue_module():
 
 def load_model(model, **conf):
     lg = load_lightglue_module()
-    net = lg.LightGlue(features=None, input_dim=128, flash=False, **conf).eval()
+    base = dict(LIGHTERGLUE) if model == "xfeat" else {"input_dim": 128}
+    net = lg.LightGlue(features=None, flash=False, **{**base, **conf}).eval()
     sd = torch.load(WEIGHTS[model], map_location="cpu", weights_only=True)
+    if model == "xfeat":  # the matcher; the file's extractor.* copy is not part of it (strict=False upstream)
+        sd = {k[len("matcher."):]: v for k, v in sd.items() if k.startswith("matcher.")}
     missing, unexpected = net.load_state_dict(sd, strict=False)
     missing = [k for k in missing if k != "confidence_thresholds"]  # a buffer, recomputed in __init__
     if missing or unexpected:
@@ -53,14 +62,14 @@ def load_model(model, **conf):
 
 
 def features(path, model, n):
-    """(xy (N,2), desc (N,128), (width, height)) from the just-keypoints CLI, cached in build/keypoints."""
+    """(xy (N,2), desc (N,dim), (width, height)) from the just-keypoints CLI, cached in build/keypoints."""
     cache = os.path.join(common.ROOT, "build", "keypoints")
     os.makedirs(cache, exist_ok=True)
     out = os.path.join(cache, f"{os.path.basename(path)}.{model}.{n}.jkpt")
     if not os.path.exists(out):
         cmd = [common.JKP, "extract", path, "--out", out, "--top-k", str(n)]
         cmd += ["--model", "raco", "--descriptor", "aliked-n16", "--no-covariance", "--no-ranker"] \
-            if model == "raco-aliked" else ["--model", "aliked-n16"]
+            if model == "raco-aliked" else ["--model", "xfeat"] if model == "xfeat" else ["--model", "aliked-n16"]
         subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL)
     meta, t = jmtfile.read(out)
     return t["keypoints"].copy(), t["descriptors"].copy(), (int(meta["width"]), int(meta["height"]))
@@ -155,7 +164,8 @@ def main():
     os.makedirs(os.path.dirname(path), exist_ok=True)
     meta = {"kind": "golden", "model": f"lightglue-{args.model}", "layers": fixed.conf.n_layers,
             "filter_threshold": fixed.conf.filter_threshold, "keypoints": args.keypoints,
-            "source_commit": "eb42fee2d71449efb0aa5c10549752b5d75384d8"}
+            "source_commit": "eb42fee2d71449efb0aa5c10549752b5d75384d8",
+            **({"weights_commit": "e92685f57f8318b18725c5c8c0bd28c7fe188d9a"} if args.model == "xfeat" else {})}
     jmtfile.write(path, meta, tensors)
     n_fixed, n_adapt = int((out["matches0"] > -1).sum()), int((out_a["matches0"] > -1).sum())
     kept = [int((out_a[f"prune{i}"][0] == int(out_a["stop"])).sum()) for i in range(2)]

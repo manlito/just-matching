@@ -62,7 +62,7 @@ This gives the static library `libjmt.a`, the single public header `jmt/jmt.h` a
 | `JMT_BUILD_CLI` | `ON` | build the `jmt` tool |
 | `JMT_BUILD_TESTS` | `ON` | build the tests |
 | `JMT_EMBED_WEIGHTS` | `OFF` | build LightGlue's weights into the library (`#embed`: Clang 19 or GCC 15); 47.6 MB per model |
-| `JMT_EMBED_MODELS` | both | which: `lightglue-aliked`, `lightglue-raco-aliked`, read from `weights/<model>.jmtw` |
+| `JMT_EMBED_MODELS` | all three | which: `lightglue-aliked`, `lightglue-raco-aliked`, `lightglue-xfeat`, read from `weights/<model>.jmtw` |
 
 ## Weights
 

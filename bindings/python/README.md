@@ -22,12 +22,14 @@ No weights are in the packages. Download them from their authors and give the fi
 the library reads the checkpoints as released, without PyTorch.
 
 **LightGlue** for ALIKED descriptors, under the Apache License 2.0 (Computer Vision and Geometry Lab), from
-[LightGlue's v0.1_arxiv release](https://github.com/cvg/LightGlue/releases/tag/v0.1_arxiv):
+[LightGlue's v0.1_arxiv release](https://github.com/cvg/LightGlue/releases/tag/v0.1_arxiv), and LighterGlue for
+XFeat descriptors, Apache-2.0, from [verlab/accelerated_features](https://github.com/verlab/accelerated_features):
 
 | File | Model | SHA-256 |
 |---|---|---|
 | `aliked_lightglue.pth` | `lightglue-aliked`: ALIKED keypoints and descriptors | `d975e965b105311a6143194852297dff4f02aea5cc2e10cecfed966ca0e22503` |
 | `raco_aliked_lightglue.pth` | `lightglue-raco-aliked`: RaCo keypoints described by ALIKED | `a804c3fe2851cc3c765cda6a9f412845893c8d8e2a3048f848d7f6ba172e6312` |
+| `xfeat-lighterglue.pt` | `lightglue-xfeat`: LighterGlue on XFeat keypoints (verlab/accelerated_features) | `766102df37f11189efe5b0811d1f47c72b22629b79bfabfcfff9d2a2f84654b8` |
 
 **FlexGlue**: `flexglue.pth` (567 MB) from
 [FlexGlue's v0.1 release](https://github.com/cvg/FlexGlue/releases/tag/v0.1), SHA-256

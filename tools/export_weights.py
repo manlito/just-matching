@@ -18,6 +18,9 @@ The files are not committed: the backbone tensors are under the DINOv3 License a
 
 LightGlue (Apache-2.0, checkpoints from tools/fetch_lightglue.sh) gets only the Wqkv reordering, with 4 heads.
 Its `confidence_thresholds` buffer, stored in one of the two files, is left out: the graph computes it.
+LighterGlue (--model lightglue-xfeat, XFeat's 6-layer LightGlue of width 96 and one head): the `matcher.*`
+tensors, renamed without the prefix; its file also holds an `extractor.*` copy of XFeat, which the original
+loads with strict=False and never uses, left out.
 """
 import argparse
 import os
@@ -35,7 +38,11 @@ LIGHTGLUE_HEADS = 4
 LIGHTGLUE = {
     "lightglue-aliked": "aliked_lightglue.pth",
     "lightglue-raco-aliked": "raco_aliked_lightglue.pth",
+    "lightglue-xfeat": "xfeat-lighterglue.pt",
 }
+# LighterGlue's configuration in the original (modules/lighterglue.py at XFEAT_COMMIT).
+XFEAT_COMMIT = "e92685f57f8318b18725c5c8c0bd28c7fe188d9a"
+LIGHTERGLUE = {"n_layers": 6, "dim": 96, "heads": 1, "input_dim": 64, "depth_confidence": -1, "width_confidence": 0.95}
 
 
 def reorder_wqkv(v, heads):
@@ -45,14 +52,16 @@ def reorder_wqkv(v, heads):
     return v[perm]
 
 
-def convert_lightglue(sd):
+def convert_lightglue(sd, heads=LIGHTGLUE_HEADS):
+    if any(k.startswith("matcher.") for k in sd):  # LighterGlue: the matcher, without XFeat's copy
+        sd = {k[len("matcher."):]: v for k, v in sd.items() if k.startswith("matcher.")}
     out = {}
     for k, v in sd.items():
         if k == "confidence_thresholds":
             continue
         v = v.float()
         if k.endswith("self_attn.Wqkv.weight") or k.endswith("self_attn.Wqkv.bias"):
-            v = reorder_wqkv(v, LIGHTGLUE_HEADS)
+            v = reorder_wqkv(v, heads)
         out[k] = v.numpy()
     return out
 
@@ -98,10 +107,17 @@ def main():
     args = ap.parse_args()
     if args.model in LIGHTGLUE:
         ckpt = args.checkpoint or os.path.join(ROOT, "third_party", "lightglue-weights", LIGHTGLUE[args.model])
-        tensors = convert_lightglue(torch.load(ckpt, map_location="cpu", weights_only=True))
-        meta = {**lightglue_meta(), "variant": args.model,
-                "source": f"https://github.com/cvg/LightGlue/releases/download/v0.1_arxiv/{LIGHTGLUE[args.model]}",
-                "source_commit": LIGHTGLUE_COMMIT}
+        xfeat = args.model == "lightglue-xfeat"
+        tensors = convert_lightglue(torch.load(ckpt, map_location="cpu", weights_only=True),
+                                    LIGHTERGLUE["heads"] if xfeat else LIGHTGLUE_HEADS)
+        if xfeat:
+            meta = {**lightglue_meta(), **LIGHTERGLUE, "variant": args.model,
+                    "source": f"https://github.com/verlab/accelerated_features/raw/{XFEAT_COMMIT}/weights/xfeat-lighterglue.pt",
+                    "source_commit": XFEAT_COMMIT}
+        else:
+            meta = {**lightglue_meta(), "variant": args.model,
+                    "source": f"https://github.com/cvg/LightGlue/releases/download/v0.1_arxiv/{LIGHTGLUE[args.model]}",
+                    "source_commit": LIGHTGLUE_COMMIT}
         out = args.out or os.path.join(ROOT, "weights", args.model + ("-fp16" if args.fp16 else "") + ".jmtw")
         write(out, meta, tensors, args.fp16)
         return

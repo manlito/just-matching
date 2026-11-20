@@ -40,8 +40,8 @@ typedef struct {
   int device;
   /* Default JMT_PRECISION_FP32. jmt_create fails when the backend does not support the precision. */
   jmt_precision precision;
-  /* "flexglue", "lightglue-aliked" (ALIKED keypoints and descriptors) or "lightglue-raco-aliked" (RaCo
-     keypoints described by ALIKED). NULL (default): the model of the weights given. A LightGlue model with no
+  /* "flexglue", "lightglue-aliked" (ALIKED keypoints and descriptors), "lightglue-raco-aliked" (RaCo
+     keypoints described by ALIKED) or "lightglue-xfeat" (LighterGlue, XFeat's keypoints and descriptors). NULL (default): the model of the weights given. A LightGlue model with no
      weights given uses the built-in ones. input_size applies to FlexGlue only. */
   const char* model;
 } jmt_config;
@@ -55,7 +55,8 @@ typedef struct {
 } jmt_image;
 
 typedef struct {
-  int n_layers;           /* transformer layers to run, 0..9. Default 9; fewer is faster and less accurate */
+  int n_layers;           /* transformer layers to run, 0..9. Default 9; fewer is faster and less accurate.
+                             lightglue-xfeat has 6: more than that runs all 6 */
   float filter_threshold; /* minimum match score. Default 0.1 */
   float max_distance_px;  /* maximum distance between a keypoint and the point predicted for its partner,
                              mean of both directions, in pixels of the network input. Default 3; <= 0: off */
@@ -68,9 +69,11 @@ typedef struct {
                              full depth (PLAN.md, Notes from C3). Needs min_covisibility > 0. Default -1 (off) */
   /* LightGlue only, as upstream: */
   float depth_confidence; /* after each layer but the last, stop when more than this share of the keypoints
-                             are confident. Default 0.95; <= 0: run every layer */
+                             are confident; <= 0: run every layer. Default NaN: the model's own, 0.95 for
+                             lightglue-aliked and lightglue-raco-aliked, off for lightglue-xfeat */
   float width_confidence; /* drop confident keypoints whose matchability is at most 1 - this before the next
-                             layer (they stay unmatched). Default 0.99; <= 0: keep every keypoint */
+                             layer (they stay unmatched); <= 0: keep every keypoint. Default NaN: the model's
+                             own, 0.99 for the ALIKED models, 0.95 for lightglue-xfeat */
 } jmt_match_options;
 
 /* LightGlue uses n_layers (1..9), filter_threshold, depth_confidence and width_confidence; FlexGlue uses the
@@ -108,7 +111,8 @@ jmt_ctx* jmt_create(const jmt_config* config);
 jmt_features* jmt_describe(jmt_ctx* ctx, const jmt_image* image);
 
 /* LightGlue: n keypoints xy [n][2] of an image of width x height pixels, and their descriptors desc [n][dim]
-   (dim 128: just-keypoints' aliked-n16, alone or describing RaCo's keypoints). The arrays are copied.
+   (dim 128: just-keypoints' aliked-n16, alone or describing RaCo's keypoints; dim 64: just-keypoints' xfeat
+   for lightglue-xfeat). The arrays are copied.
    jmt_match then takes the same keypoints, in the same order. Returns NULL on failure, as jmt_describe. */
 jmt_features* jmt_describe_keypoints(jmt_ctx* ctx, int width, int height, const float* xy, const float* desc, int n,
                                      int dim);

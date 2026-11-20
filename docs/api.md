@@ -35,7 +35,7 @@ thread, or per GPU.
 | `backend` | `JMT_BACKEND_CPU`, `JMT_BACKEND_CUDA`, `JMT_BACKEND_METAL` or `JMT_BACKEND_WEBGPU` |
 | `weights_data`, `weights_size` | a weights file in memory (copied by `jmt_create`): a checkpoint as released (`flexglue.pth`, `aliked_lightglue.pth`, `raco_aliked_lightglue.pth`) or a `.jmtw` file |
 | `weights_path` | the same, on disk; used when no memory blob is given |
-| `model` | `"flexglue"`, `"lightglue-aliked"` or `"lightglue-raco-aliked"`; `NULL` (default): the model of the weights given. A LightGlue model with no weights given uses the weights built into the library ([Build](install.md)) |
+| `model` | `"flexglue"`, `"lightglue-aliked"`, `"lightglue-raco-aliked"` or `"lightglue-xfeat"` (LighterGlue, on just-keypoints' `xfeat`); `NULL` (default): the model of the weights given. A LightGlue model with no weights given uses the weights built into the library ([Build](install.md)) |
 | `input_size` | FlexGlue: side of the square network input, a multiple of 32; default 512. Images are resized to it |
 | `num_threads` | CPU backend worker threads; 0 = all hardware threads |
 | `device` | GPU backends: device index, 0 = the first |
@@ -54,13 +54,13 @@ thread, or per GPU.
 
 | Field | Default | Meaning |
 |---|---|---|
-| `n_layers` | 9 | transformer layers to run, 0 to 9 (LightGlue: 1 to 9) |
+| `n_layers` | 9 | transformer layers to run, 0 to 9 (LightGlue: 1 to 9; `lightglue-xfeat` has 6, and more runs all 6) |
 | `filter_threshold` | 0.1 | minimum match score |
 | `max_distance_px` | 3 | maximum distance between a keypoint and the point predicted for its partner, mean of both directions, in pixels of the network input; 0 or less: off |
 | `min_covisibility` | 0 (off) | pairs scoring below it get no matches; 0.8 is the original's suggestion |
 | `early_stop_decay` | -1 (off) | in [0, 1): after layer k, from 2 to `n_layers` - 1, stop when the score is below `min_covisibility` (1 - decay)^(9 - k). Needs `min_covisibility` > 0 |
-| `depth_confidence` | 0.95 | LightGlue: after each layer but the last, stop when more than this share of the keypoints are confident, as the original does; 0 or less: every layer |
-| `width_confidence` | 0.99 | LightGlue: drop confident keypoints whose matchability is at most 1 - this before the next layer (they stay unmatched); 0 or less: every keypoint |
+| `depth_confidence` | NaN: the model's own (0.95; `lightglue-xfeat`: off) | LightGlue: after each layer but the last, stop when more than this share of the keypoints are confident, as the original does; 0 or less: every layer |
+| `width_confidence` | NaN: the model's own (0.99; `lightglue-xfeat`: 0.95) | LightGlue: drop confident keypoints whose matchability is at most 1 - this before the next layer (they stay unmatched); 0 or less: every keypoint |
 
 `max_distance_px`, `min_covisibility` and `early_stop_decay` are FlexGlue's; LightGlue ignores them, and FlexGlue
 ignores `depth_confidence` and `width_confidence`.

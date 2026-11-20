@@ -248,8 +248,8 @@ class Matcher {
   }
 
   // options: layers (9), filterThreshold (0.1); FlexGlue: maxDistancePx (3), minCovisibility (0),
-  // earlyStopDecay (-1); LightGlue: depthConfidence (0.95; 0 runs every layer), widthConfidence (0.99; 0 keeps
-  // every keypoint).
+  // earlyStopDecay (-1); LightGlue: depthConfidence (the model's own: 0.95, LighterGlue off; 0 runs every
+  // layer), widthConfidence (the model's own: 0.99, LighterGlue 0.95; 0 keeps every keypoint).
   async match(a, xyA, b, xyB, options = {}) {
     const M = this.M;
     if (!this.handle) throw new Error('matcher destroyed');
@@ -260,7 +260,7 @@ class Matcher {
     const n = await M._jmtw_match(this.handle, a.ptr, pa, nA, b.ptr, pb, nB, options.layers ?? 9,
                                   options.filterThreshold ?? 0.1, options.maxDistancePx ?? 3,
                                   options.minCovisibility ?? 0, options.earlyStopDecay ?? -1,
-                                  options.depthConfidence ?? 0.95, options.widthConfidence ?? 0.99);
+                                  options.depthConfidence ?? NaN, options.widthConfidence ?? NaN);
     if (n < 0) throw new Error(M.UTF8ToString(M._jmtw_error()));
     const h = this.handle;
     const f32 = (ptr, count) => new Float32Array(M.HEAPF32.buffer, ptr, count).slice();

@@ -62,7 +62,7 @@ void need_flexglue(jmt_ctx* ctx, const char* what) {
   if (!ctx->model) throw std::runtime_error(std::string(what) + " needs FlexGlue; this context runs LightGlue");
 }
 
-const char* const kLightGlueModels[] = {"lightglue-aliked", "lightglue-raco-aliked"};
+const char* const kLightGlueModels[] = {"lightglue-aliked", "lightglue-raco-aliked", "lightglue-xfeat"};
 
 bool is_lightglue_model(const std::string& m) {
   return std::find(std::begin(kLightGlueModels), std::end(kLightGlueModels), m) != std::end(kLightGlueModels);
@@ -172,7 +172,7 @@ jmt_ctx* jmt_create(const jmt_config* config) {
     auto ctx = std::make_unique<jmt_ctx>();
     const std::string model = config->model ? config->model : "";
     if (!model.empty() && model != "flexglue" && !is_lightglue_model(model))
-      throw std::runtime_error("unknown model '" + model + "' (flexglue, lightglue-aliked, lightglue-raco-aliked)");
+      throw std::runtime_error("unknown model '" + model + "' (flexglue, lightglue-aliked, lightglue-raco-aliked, lightglue-xfeat)");
     const void* blob = nullptr;
     size_t blob_size = 0;
     if (config->weights_data && config->weights_size) {

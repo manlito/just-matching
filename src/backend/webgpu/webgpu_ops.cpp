@@ -21,6 +21,7 @@
 #include <webgpu/webgpu.h>
 
 #include <algorithm>
+#include <cmath>
 #include <chrono>
 #include <climits>
 #include <cstdio>
@@ -846,10 +847,17 @@ class WebGpuOps : public Ops {
 
   TensorPtr attention(const TensorPtr& qp, const TensorPtr& kp, const TensorPtr& vp, int heads) override {
     const GpuTensor &q = dev(qp), &k = dev(kp), &v = dev(vp);
-    if (q.c != heads * 64 || k.c != q.c || v.c != q.c || k.n() != v.n()) fail("attention: needs 64 channels per head");
+    const int D = heads > 0 ? q.c / heads : 0;
+    if (D < 4 || D > 128 || D % 4 || q.c != heads * D || k.c != q.c || v.c != q.c || k.n() != v.n())
+      fail("attention: needs a multiple of 4 channels per head, at most 128");
     auto out = std::make_shared<GpuTensor>(ctx_, q.h, q.w, q.c);
     const int P = q.n(), S = k.n();
     const long long groups = static_cast<long long>(heads) * ((P + 63) / 64);
+    if (D != 64) {  // LighterGlue's one head of 96
+      ctx_->run_groups("k_attn_any", groups, q.d(), k.d(), v.d(), out->d(), P, S, heads, D,
+                       1.0f / std::sqrt(static_cast<float>(D)));
+      return out;
+    }
     if (ctx_->fp16()) {
       // The values transposed and packed: 8 tokens of one channel per 16-byte load.
       const int S8 = (S + 7) / 8;

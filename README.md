@@ -1,6 +1,6 @@
 # just-matching
 
-Image matching (FlexGlue, and LightGlue on ALIKED descriptors) and covisibility with minimal dependencies, the
+Image matching (FlexGlue, LightGlue on ALIKED descriptors, LighterGlue on XFeat's) and covisibility with minimal dependencies, the
 companion of [just-keypoints](../just-keypoints). No PyTorch, no ONNX Runtime at run time. Plan and status:
 [PLAN.md](PLAN.md).
 
@@ -8,6 +8,11 @@ LightGlue (M9): `jmt match --model lightglue-aliked --kpts-a A.jkpt --kpts-b B.j
 original's matches and its adaptive depth and width; 16 ms per pair on the M5 Pro (Metal FP16), 18 ms on the
 RTX 2070 (CUDA FP16), 2048 keypoints per image. Its weights are Apache-2.0: `tools/fetch_lightglue.sh`, then
 `jmt convert` (or `tools/export_weights.py --model lightglue-aliked`) and `-DJMT_EMBED_WEIGHTS=ON` to build them in.
+
+LighterGlue (M10), XFeat's smaller LightGlue (6 layers, width 96, one head; verlab/accelerated_features,
+Apache-2.0): `jmt match --model lightglue-xfeat` on just-keypoints' `xfeat` keypoints and 64-dim descriptors, on the
+CPU, Metal and WebGPU backends, with the original's matches; 19 ms per pair on the M5 Pro (Metal FP32, 10 ms FP16),
+2048 keypoints per image. Its 4.5 MB weights come from the same fetch script (`xfeat-lighterglue.pt`).
 
 > [!IMPORTANT]
 > **Use [FlexGlue](https://github.com/cvg/FlexGlue) and [LightGlue](https://github.com/cvg/LightGlue).** This

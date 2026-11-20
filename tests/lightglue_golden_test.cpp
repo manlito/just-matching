@@ -114,6 +114,10 @@ int main(int argc, char** argv) {
   try {
     jmt::Weights weights = jmt::Weights::from_file(argv[1]);
     jmt::Weights golden = jmt::Weights::from_file(argv[2]);
+    // Match scores against the original's float32 ones. LighterGlue's logits are larger (one head of 96):
+    // the original's own float32 scores drift up to 2.6e-4 from float64 there, 4.8e-5 for LightGlue.
+    const bool lighter = golden.meta("model") == "lightglue-xfeat";
+    const double score_tol = fp16 ? (lighter ? 0.25 : 0.15) : (lighter ? 6e-4 : 2e-4);
     jmt::LightGlue model(weights);
     std::unique_ptr<jmt::Ops> ops;
     if (backend == "cpu") ops = jmt::make_cpu_ops(0);
@@ -174,9 +178,9 @@ int main(int argc, char** argv) {
     check_exact("pair.matchability1", out.matchability1, values(golden.get("pair.matchability1")),
                 values(golden.get("pair.fp64.matchability1")), loose);
     check_matches("out.matches0", out.matches0, out.scores0, golden.get("out.matches0"),
-                  golden.get("out.matching_scores0"), fp16 ? 0.15 : 2e-4);
+                  golden.get("out.matching_scores0"), score_tol);
     check_matches("out.matches1", out.matches1, out.scores1, golden.get("out.matches1"),
-                  golden.get("out.matching_scores1"), fp16 ? 0.15 : 2e-4);
+                  golden.get("out.matching_scores1"), score_tol);
 
     // Adaptive depth and width with upstream's defaults: the same stop layer, the same points dropped after
     // the same layers (but for a few whose confidence or matchability sits at a threshold), the same matches.
@@ -202,7 +206,7 @@ int main(int argc, char** argv) {
       g_failed += !ok;
     }
     check_matches("adaptive.matches0", ad.matches0, ad.scores0, golden.get("adaptive.matches0"),
-                  golden.get("adaptive.matching_scores0"), fp16 ? 0.15 : 2e-4);
+                  golden.get("adaptive.matching_scores0"), score_tol);
   } catch (const std::exception& e) {
     std::fprintf(stderr, "error: %s\n", e.what());
     return 1;

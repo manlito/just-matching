@@ -30,6 +30,8 @@ LightGlue::LightGlue(const Weights& weights) : w_(weights) {
   heads_ = w_.meta_int("heads");
   dim_ = w_.meta_int("dim");
   input_dim_ = w_.meta_int("input_dim");
+  if (w_.metadata().count("depth_confidence")) depth_confidence_ = std::stof(w_.meta("depth_confidence"));
+  if (w_.metadata().count("width_confidence")) width_confidence_ = std::stof(w_.meta("width_confidence"));
   for (int i = 0; i < n_layers_; ++i) {
     const double t = 0.8 + 0.1 * std::exp(-4.0 * i / n_layers_);
     thresholds_.push_back(static_cast<float>(std::min(std::max(t, 0.0), 1.0)));
@@ -90,9 +92,13 @@ LightGlue::Image LightGlue::prepare(Ops& ops, const float* xy, const float* desc
   return im;
 }
 
-void LightGlue::match(Ops& ops, const Image& im0, const Image& im1, const Options& o, Result* out,
+void LightGlue::match(Ops& ops, const Image& im0, const Image& im1, const Options& options, Result* out,
                       const Trace& trace) const {
-  if (o.n_layers < 1 || o.n_layers > n_layers_) throw std::runtime_error("n_layers out of range");
+  Options o = options;
+  if (std::isnan(o.depth_confidence)) o.depth_confidence = depth_confidence_;
+  if (std::isnan(o.width_confidence)) o.width_confidence = width_confidence_;
+  if (o.n_layers < 1) throw std::runtime_error("n_layers out of range");
+  o.n_layers = std::min(o.n_layers, n_layers_);  // more than the model has: all of them (LighterGlue has 6)
   const int m = im0.n, n = im1.n, last = o.n_layers - 1;
   out->matches0.assign(m, -1), out->matches1.assign(n, -1);
   out->scores0.assign(m, 0.0f), out->scores1.assign(n, 0.0f);

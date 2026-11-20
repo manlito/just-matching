@@ -1161,3 +1161,68 @@ fn run(gid: u32) {
     out[gid * 3u + c] = real(div_rn((top * (1.0 - ty) + bottom * ty) - pf(4u + c), pf(7u + c)));
   }
 }
+
+//@kernel k_attn_any
+// Attention for any number of channels per head D (a multiple of 4, at most 128): out = softmax(q k^T /
+// sqrt(D)) v per head. Used for LighterGlue (one head of 96); k_attnd and k_attnh are the tuned kernels for 64.
+// One workgroup: 64 queries of one head, one thread per query; the source tokens are walked 16 at a time,
+// their keys and values staged in workgroup memory by the whole group (16 KB for D = 128). Per tile, each
+// thread computes its 16 logits; when its largest logit grows, its outputs and sum so far are scaled to the
+// new reference, so the result is the same as with the true maximum known in advance.
+// Scalars: P, S, heads, D, scale. Groups: heads * ceil(P / 64).
+//@group 64
+@group(0) @binding(1) var<storage, read> q: array<vec4<real>>;
+@group(0) @binding(2) var<storage, read> k: array<vec4<real>>;
+@group(0) @binding(3) var<storage, read> v: array<vec4<real>>;
+@group(0) @binding(4) var<storage, read_write> out: array<vec4<real>>;
+var<workgroup> kt: array<vec4<f32>, 512>;  // [16 tokens][D / 4]
+var<workgroup> vt: array<vec4<f32>, 512>;
+
+fn group(g: u32, li: u32) {
+  let Pq = pu(0u);
+  let S = pu(1u);
+  let heads = pu(2u);
+  let D4 = pu(3u) / 4u;
+  let scale = pf(4u);
+  let C4 = heads * D4;  // loads per token
+  let pblocks = (Pq + 63u) / 64u;
+  if (g >= heads * pblocks) { return; }
+  let hd = g / pblocks;
+  let p = (g % pblocks) * 64u + li;
+  let qb = min(p, Pq - 1u) * C4 + hd * D4;
+  var o: array<vec4<f32>, 32>;
+  for (var c = 0u; c < D4; c++) { o[c] = vec4<f32>(0.0); }
+  var top = kLowest;
+  var sum = 0.0;
+  for (var s0 = 0u; s0 < S; s0 += 16u) {
+    // Stage the tile: 16 tokens x D4 loads each, for keys and values.
+    for (var e = li; e < 16u * D4; e += 64u) {
+      let t = min(s0 + e / D4, S - 1u);
+      kt[e] = vec4<f32>(k[t * C4 + hd * D4 + e % D4]);
+      vt[e] = vec4<f32>(v[t * C4 + hd * D4 + e % D4]);
+    }
+    workgroupBarrier();
+    let n = min(16u, S - s0);
+    var l: array<f32, 16>;
+    var grown = top;
+    for (var t = 0u; t < n; t++) {
+      var acc = 0.0;
+      for (var c = 0u; c < D4; c++) { acc += dot(vec4<f32>(q[qb + c]), kt[t * D4 + c]); }
+      l[t] = acc * scale;
+      grown = max(grown, l[t]);
+    }
+    let shrink = exp(top - grown);  // 0 on the first tile
+    top = grown;
+    sum *= shrink;
+    for (var c = 0u; c < D4; c++) { o[c] *= shrink; }
+    for (var t = 0u; t < n; t++) {
+      let w = exp(l[t] - top);
+      sum += w;
+      for (var c = 0u; c < D4; c++) { o[c] += w * vt[t * D4 + c]; }
+    }
+    workgroupBarrier();
+  }
+  if (p < Pq) {
+    for (var c = 0u; c < D4; c++) { out[p * C4 + hd * D4 + c] = vec4<real>(o[c] / sum); }
+  }
+}
