@@ -36,6 +36,7 @@
 
 #include "core/half.h"
 #include "core/ops.h"
+#include "core/pool.h"
 #include "core/preprocess.h"
 #include "core/readout.h"
 
@@ -197,8 +198,10 @@ class Context {
       key_.clear();
     }
     if (epoch == epoch_ - 1 && !command_) {  // nothing is running: every released buffer is idle
+      for (const auto& kv : pending_) idle_bytes_ += kv.first;
       free_.insert(pending_.begin(), pending_.end());
       pending_.clear();
+      trim();
       submitted_.clear();
       base_ = checked_ = epoch_;
     }
@@ -215,7 +218,7 @@ class Context {
   // before the GPU uses it, so it must not be in use by the open command buffer. Otherwise a buffer that
   // was released during the open command buffer can be reused at once: dispatches run in order.
   id<MTLBuffer> alloc(size_t bytes, bool host) {
-    bytes = std::max<size_t>(bytes, 16);
+    bytes = pool_size(bytes);
     if (!host) {
       auto it = pending_.find(bytes);
       if (it != pending_.end()) {
@@ -228,6 +231,7 @@ class Context {
     if (it != free_.end()) {
       id<MTLBuffer> b = it->second;
       free_.erase(it);
+      idle_bytes_ -= bytes;
       return b;
     }
     if (bytes > device_.maxBufferLength) fail("buffer of " + std::to_string(bytes) + " bytes exceeds the device limit");
@@ -235,13 +239,34 @@ class Context {
     id<MTLBuffer> b = [device_ newBufferWithLength:bytes options:MTLResourceStorageModeShared];
     if (!b) {
       free_.clear();
+      idle_bytes_ = 0;
       b = [device_ newBufferWithLength:bytes options:MTLResourceStorageModeShared];
       if (!b) fail("out of memory allocating " + std::to_string(bytes) + " bytes");
     }
     return b;
   }
   void release(id<MTLBuffer> b, size_t bytes) {
-    (command_ || !submitted_.empty() ? pending_ : free_).emplace(std::max<size_t>(bytes, 16), b);
+    bytes = pool_size(bytes);
+    if (command_ || !submitted_.empty()) {
+      pending_.emplace(bytes, b);
+    } else {
+      free_.emplace(bytes, b);
+      idle_bytes_ += bytes;
+      trim();
+    }
+  }
+  // The pool's size for a request (see core/pool.h); a buffer may be a little larger than asked.
+  size_t pool_size(size_t bytes) const {
+    const size_t b = pool_bucket(std::max<size_t>(bytes, 16));
+    return b <= device_.maxBufferLength ? b : std::max<size_t>(bytes, 16);
+  }
+  // Lets the largest idle buffers go while more than kPoolIdleBytes are idle.
+  void trim() {
+    while (idle_bytes_ > kPoolIdleBytes && !free_.empty()) {
+      auto last = std::prev(free_.end());
+      idle_bytes_ -= last->first;
+      free_.erase(last);
+    }
   }
 
   bool fp16() const { return fp16_; }
@@ -390,6 +415,7 @@ class Context {
   std::vector<id<MTLCommandBuffer>> submitted_;  // committed, numbers base_ .. epoch_ - 1
   long epoch_ = 0, base_ = 0, checked_ = 0;
   std::multimap<size_t, id<MTLBuffer>> free_, pending_;
+  size_t idle_bytes_ = 0;  // sum of the sizes in free_
   bool profile_ = false;
   std::string tag_, key_;
   std::map<std::string, Stat> stats_;
