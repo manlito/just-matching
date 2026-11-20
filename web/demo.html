@@ -121,8 +121,8 @@
 <!-- site:header -->
 <main id="content">
   <h1>just-matching demo</h1>
-  <p class="lede">Matches your images with LightGlue, or finds which ones show the same place and matches them
-  with FlexGlue, on your GPU. Nothing is uploaded.</p>
+  <p class="lede">Matches your images with LightGlue or LighterGlue, or finds which ones show the same place and
+  matches them with FlexGlue, on your GPU. Nothing is uploaded.</p>
 
   <div class="banner" id="banner" hidden></div>
 
@@ -166,6 +166,7 @@
           <span class="label">Matcher</span>
           <div class="seg" role="radiogroup" aria-label="Matcher">
             <label title="ALIKED keypoints and descriptors; every pair is matched. Its weights (Apache-2.0) come with the page."><input type="radio" name="model" value="lightglue" checked>LightGlue</label>
+            <label title="XFeat keypoints and descriptors, matched by LighterGlue (XFeat's light LightGlue); every pair is matched. Its weights (Apache-2.0) come with the page."><input type="radio" name="model" value="lighterglue">LighterGlue</label>
             <label title="RaCo keypoints; tells pairs of the same place from look-alikes. Needs its weights from you."><input type="radio" name="model" value="flexglue">FlexGlue</label>
           </div>
         </div>
@@ -184,7 +185,7 @@
             <select id="layers" aria-label="Layers"><option value="9" selected>9 layers</option><option value="5">5 layers</option></select>
           </div>
         </div>
-        <div class="field" data-model="lightglue">
+        <div class="field" data-model="lightglue lighterglue">
           <label class="label" for="adaptive" title="After each layer LightGlue checks how sure it is: it stops once nearly every keypoint is settled, and drops keypoints that cannot match.">Adaptive depth and width</label>
           <select id="adaptive">
             <option value="on" selected>On</option>
@@ -223,7 +224,7 @@
           <div>
             <svg id="matrix" role="img" aria-label="Similarity of every pair of images; pairs picked to match marked with a dot"></svg>
             <div class="legend" id="legend" hidden>
-              <span id="legend-label" title="FlexGlue: level 1, how alike two images look overall (their mean feature vectors); it picks the pairs to match. LightGlue: the number of matches.">similarity</span>
+              <span id="legend-label" title="FlexGlue: level 1, how alike two images look overall (their mean feature vectors); it picks the pairs to match. LightGlue and LighterGlue: the number of matches.">similarity</span>
               <span id="lmin"></span><span class="ramp" id="ramp"></span><span id="lmax"></span>
               <span id="legend-picked"><span class="dot"></span> picked to match</span>
             </div>
@@ -261,7 +262,7 @@
   from the ALIKED repository's samples, and eight of <a href="https://www.cvlibs.net/datasets/kitti/">KITTI</a>
   (Geiger et al., CVPR 2012 and IJRR 2013; <a href="https://creativecommons.org/licenses/by-nc-sa/3.0/">CC BY-NC-SA
   3.0</a>, non-commercial): four consecutive frames, one street corner passed twice, and two different streets that
-  look alike. All re-encoded as JPEG. LightGlue: weights Apache-2.0; ALIKED: BSD-3-Clause. FlexGlue: matcher
+  look alike. All re-encoded as JPEG. LightGlue: weights Apache-2.0; ALIKED: BSD-3-Clause. XFeat and LighterGlue: Apache-2.0. FlexGlue: matcher
   weights MIT; DINOv3 backbone under the <!-- site:licence -->DINOv3 License<!-- /site:licence -->.</footer>
 </main>
 <div class="tip" id="tip" hidden></div>

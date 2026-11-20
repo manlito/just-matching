@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Fetch just-keypoints' browser module (the demo's keypoints: RaCo for FlexGlue, ALIKED with its descriptors for
-# LightGlue) from just-keypoints' documentation site into
+# LightGlue, XFeat with its descriptors for LighterGlue) from just-keypoints' documentation site into
 # third_party/jkp-web (not committed), checked against pinned hashes:
 #
 #   tools/fetch_jkp_web.sh
@@ -15,9 +15,10 @@ BASE="https://just-keypoints.pages.dev/lib"
 FILES=(
   "jkp.js d459bd7cbb03187b0662a289e8235ce4b70d83969b93b3a750f71e89972d0262"
   "jkp_wasm.js 54d4ddebaa5187427297c2c1ef401ca8ba4016367ad763f96a4bc58b7e36ae9a"
-  "jkp_wasm.wasm 3fc11898ad410815e8a399c7e110bc9cb218362088c91bba6f84ec8a12711d20"
+  "jkp_wasm.wasm 6f11dd0839b57488d3f63e48e07e8b1fa3cdeaca7381e9302800ee67389d5919"
   "raco.jkpw a206d87e639b697d478d7bc7ec86d1e7f5a00f51d972721e69dbc784efa82abc"
   "aliked-n16.jkpw 8002a58d4f374335b58941dd3eac210daa2d19270105932c60fbf6ae2d33f3a8"
+  "xfeat.jkpw c67999d3f9cc647d9ad03258b5df758cb4269ece10270f14168249d06ced3434"
 )
 
 sha256() { if command -v sha256sum >/dev/null; then sha256sum "$1"; else shasum -a 256 "$1"; fi | cut -d' ' -f1; }
