@@ -385,19 +385,26 @@ typedef half wreal;
 typedef float wreal;
 #endif
 
-// kt[(head * 64 + c) * spad + s] = k[s][head * 64 + c]; zeros for s >= S. Grid: heads * 64 * spad.
+// kt[(head * D + c) * spad + s] = k[s][head * D + c]; zeros for s >= S. Grid: heads * D * spad. D, the
+// channels per head, is 64 for LightGlue and FlexGlue, 96 for LighterGlue (one head).
+template <int D>
 kernel void k_attn_keys(device const real* k [[buffer(0)]], constant int& S [[buffer(1)]], constant int& heads [[buffer(2)]],
                         constant int& spad [[buffer(3)]], device real* kt [[buffer(4)]],
                         uint gid [[thread_position_in_grid]]) {
-  if (gid >= uint(heads) * 64u * uint(spad)) return;
+  if (gid >= uint(heads) * uint(D) * uint(spad)) return;
   const int s = int(gid % uint(spad)), ch = int(gid / uint(spad));
-  kt[gid] = s < S ? k[size_t(s) * size_t(heads) * 64 + size_t(ch)] : real(0);
+  kt[gid] = s < S ? k[size_t(s) * size_t(heads) * D + size_t(ch)] : real(0);
 }
+template [[host_name("k_attn_keys")]] kernel void k_attn_keys<64>(device const real*, constant int&, constant int&,
+                                                                   constant int&, device real*, uint);
+template [[host_name("k_attn_keys_d96")]] kernel void k_attn_keys<96>(device const real*, constant int&, constant int&,
+                                                                       constant int&, device real*, uint);
 
 constant int kReduce = 32;  // threads that fold the per-thread values of a group
 
 // One threadgroup: 4 queries of one head; one thread: 8 source tokens. Threadgroups: heads * ceil(P / 4),
-// threads per group: spad / 8 (at most 1024).
+// threads per group: spad / 8 (at most 1024). D channels per head; the logits are scaled by 1 / sqrt(D).
+template <int D>
 kernel void k_attn_weights(device const real* q [[buffer(0)]], device const real4* kt [[buffer(1)]],
                            constant int& P [[buffer(2)]], constant int& S [[buffer(3)]], constant int& heads [[buffer(4)]],
                            constant int& spad [[buffer(5)]], device wreal* weights [[buffer(6)]],
@@ -411,13 +418,13 @@ kernel void k_attn_weights(device const real* q [[buffer(0)]], device const real
   uint qrow[4];  // in units of 4 values
   float4 acc[4][2];
   for (int r = 0; r < 4; ++r) {
-    qrow[r] = (uint(p0 + min(pb * 4 + r, P - 1)) * uint(heads) + uint(hd)) * 16u;
+    qrow[r] = (uint(p0 + min(pb * 4 + r, P - 1)) * uint(heads) + uint(hd)) * uint(D / 4);
     acc[r][0] = float4(0.0f), acc[r][1] = float4(0.0f);
   }
   device const real4* q4 = (device const real4*)q;
-  device const real4* wp = kt + (size_t(hd) * 64 * size_t(spad)) / 4 + size_t(sb) * 2;
+  device const real4* wp = kt + (size_t(hd) * D * size_t(spad)) / 4 + size_t(sb) * 2;
   const uint wstep = uint(spad) / 4u;
-  for (uint c = 0, wi = 0; c < 16u; ++c) {
+  for (uint c = 0, wi = 0; c < uint(D / 4); ++c) {
     float4 qv[4];
     for (int r = 0; r < 4; ++r) qv[r] = float4(q4[qrow[r] + c]);
     for (int j = 0; j < 4; ++j, wi += wstep) {
@@ -433,9 +440,10 @@ kernel void k_attn_weights(device const real* q [[buffer(0)]], device const real
   const int4 s0 = int4(sb * 8) + int4(0, 1, 2, 3);
   const bool4 in0 = s0 < int4(S), in1 = (s0 + 4) < int4(S);
   float4 mine = float4(-INFINITY);
+  const float scale = D == 64 ? 0.125f : 1.0f / precise::sqrt(float(D));  // as the CPU backend
   for (int r = 0; r < 4; ++r) {
-    acc[r][0] = select(float4(-INFINITY), acc[r][0] * 0.125f, in0);  // 1 / sqrt(64)
-    acc[r][1] = select(float4(-INFINITY), acc[r][1] * 0.125f, in1);
+    acc[r][0] = select(float4(-INFINITY), acc[r][0] * scale, in0);
+    acc[r][1] = select(float4(-INFINITY), acc[r][1] * scale, in1);
     const float4 m = max(acc[r][0], acc[r][1]);
     mine[r] = max(max(m.x, m.y), max(m.z, m.w));
   }
@@ -479,14 +487,20 @@ kernel void k_attn_weights(device const real* q [[buffer(0)]], device const real
   }
 }
 
-// out (P, heads * 64) = weights (heads, P, S) * v (S, heads * 64) * inv, per head. One thread: R queries x T
-// channels. Grid: heads * ceil(P / R) * (64 / T), channel block fastest.
-template <int R, int T>
+#define JMT_ATTN_WEIGHTS(NAME, D)                                                                           \
+  template [[host_name(NAME)]] kernel void k_attn_weights<D>(device const real*, device const real4*, constant int&,  \
+      constant int&, constant int&, constant int&, device wreal*, device float*, constant int&, uint, uint);
+JMT_ATTN_WEIGHTS("k_attn_weights", 64)
+JMT_ATTN_WEIGHTS("k_attn_weights_d96", 96)
+
+// out (P, heads * D) = weights (heads, P, S) * v (S, heads * D) * inv, per head. One thread: R queries x T
+// channels. Grid: heads * ceil(P / R) * (D / T), channel block fastest.
+template <int R, int T, int D>
 kernel void k_attn_apply(device const wreal* weights [[buffer(0)]], device const real4* v [[buffer(1)]],
                          constant int& P [[buffer(2)]], constant int& S [[buffer(3)]], constant int& heads [[buffer(4)]],
                          device const float* inv [[buffer(5)]], device real4* out [[buffer(6)]],
                          constant int& p0 [[buffer(7)]], uint gid [[thread_position_in_grid]]) {
-  const int pblocks = (P + R - 1) / R, oblocks = 64 / T;
+  const int pblocks = (P + R - 1) / R, oblocks = D / T;
   if (gid >= uint(heads) * uint(pblocks) * uint(oblocks)) return;
   const int ob = int(gid % uint(oblocks)), pb = int((gid / uint(oblocks)) % uint(pblocks));
   const int hd = int(gid / uint(oblocks) / uint(pblocks));
@@ -499,8 +513,8 @@ kernel void k_attn_apply(device const wreal* weights [[buffer(0)]], device const
     row[r] = uint(min(pb * R + r, P - 1)) * uint(S);
     for (int j = 0; j < T / 4; ++j) acc[r][j] = float4(0.0f);
   }
-  device const real4* vp = v + size_t(hd) * 16 + size_t(ob) * (T / 4);
-  const uint vstep = uint(heads) * 16u;
+  device const real4* vp = v + size_t(hd) * (D / 4) + size_t(ob) * (T / 4);
+  const uint vstep = uint(heads) * uint(D / 4);
   for (uint s = 0, vi = 0; s < uint(S); ++s, vi += vstep) {
     float4 vv[T / 4];
     for (int j = 0; j < T / 4; ++j) vv[j] = float4(vp[vi + uint(j)]);
@@ -513,16 +527,18 @@ kernel void k_attn_apply(device const wreal* weights [[buffer(0)]], device const
     const int p = pb * R + r;
     if (p >= P) break;
     const float scale = inv[hd * P + p];
-    const size_t base = (size_t(p0 + p) * size_t(heads) + size_t(hd)) * 16 + size_t(ob) * (T / 4);
+    const size_t base = (size_t(p0 + p) * size_t(heads) + size_t(hd)) * (D / 4) + size_t(ob) * (T / 4);
     for (int j = 0; j < T / 4; ++j) out[base + j] = real4(acc[r][j] * scale);
   }
 }
-#define JMT_APPLY(NAME, R, T)                                                                              \
-  template [[host_name(NAME)]] kernel void k_attn_apply<R, T>(                                              \
+#define JMT_APPLY(NAME, R, T, D)                                                                           \
+  template [[host_name(NAME)]] kernel void k_attn_apply<R, T, D>(                                           \
       device const wreal*, device const real4*, constant int&, constant int&, constant int&, device const float*, \
       device real4*, constant int&, uint);
-JMT_APPLY("k_attn_apply_r4_t8", 4, 8)
-JMT_APPLY("k_attn_apply_r2_t16", 2, 16)
+JMT_APPLY("k_attn_apply_r4_t8", 4, 8, 64)
+JMT_APPLY("k_attn_apply_r2_t16", 2, 16, 64)
+JMT_APPLY("k_attn_apply_r4_t8_d96", 4, 8, 96)
+JMT_APPLY("k_attn_apply_r2_t16_d96", 2, 16, 96)
 
 #ifdef JMT_MPP
 // ---------------------------------------------------------------------------------------------
@@ -592,7 +608,8 @@ kernel void k_mm(device real* x [[buffer(0)]], device real* w [[buffer(1)]], dev
   }
 }
 
-// Attention with 64 channels per head, without the weights buffer: out = softmax(q k^T / 8) v per head.
+// Attention with D channels per head (64; LighterGlue: 96), without the weights buffer: out = softmax(q k^T /
+// sqrt(D)) v per head.
 // One SIMD group takes 32 queries of one head and walks the source tokens 32 at a time, once. Per tile:
 // the logits (a 32 x 32 x 64 product), the largest of each row so far, the weights exp(logit - largest)
 // in registers, their row sums, and the product of the tile with the values, accumulated into 32 x 64
@@ -603,20 +620,21 @@ kernel void k_mm(device real* x [[buffer(0)]], device real* w [[buffer(1)]], dev
 constant int kAtRows = 32;
 constant int kAtCols = 32;
 
+template <int D>
 kernel void k_attn(device real* q [[buffer(0)]], device real* k [[buffer(1)]], device real* v [[buffer(2)]],
                    constant int& P [[buffer(3)]], constant int& S [[buffer(4)]], constant int& heads [[buffer(5)]],
                    device real* out [[buffer(6)]], uint tg [[threadgroup_position_in_grid]]) {
-  const int C = heads * 64, pblocks = (P + kAtRows - 1) / kAtRows;
+  const int C = heads * D, pblocks = (P + kAtRows - 1) / kAtRows;
   const int pb = int(tg) % pblocks, hd = int(tg) / pblocks;
-  constexpr auto logits_desc = matmul2d_descriptor(kAtRows, kAtCols, 64, false, true);
+  constexpr auto logits_desc = matmul2d_descriptor(kAtRows, kAtCols, D, false, true);
   constexpr auto apply_desc =
-      matmul2d_descriptor(kAtRows, 64, kAtCols, false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
+      matmul2d_descriptor(kAtRows, D, kAtCols, false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
   matmul2d<logits_desc, execution_simdgroup> logits_op;
   matmul2d<apply_desc, execution_simdgroup> apply_op;
   auto Q = tensor<device real, ext2, tensor_inline>(q, ext2(C, P));
   auto K = tensor<device real, ext2, tensor_inline>(k, ext2(C, S));
   auto V = tensor<device real, ext2, tensor_inline>(v, ext2(C, S));
-  auto tQ = Q.slice(hd * 64, pb * kAtRows);
+  auto tQ = Q.slice(hd * D, pb * kAtRows);
   typedef decltype(tQ) slice_t;
 
   // Logits and weights are tiles of `real`. Row sums and outputs are float in both modes: before the
@@ -629,6 +647,7 @@ kernel void k_attn(device real* q [[buffer(0)]], device real* k [[buffer(1)]], d
   auto shrink = logits_op.template get_row_reduction_destination_cooperative_tensor<slice_t, slice_t, float>();
   auto acc = apply_op.template get_destination_cooperative_tensor<decltype(tile), slice_t, float>();
   const real lowest = real(-1e30f);  // -inf in half
+  const float scale = D == 64 ? 0.125f : 1.0f / precise::sqrt(float(D));  // as the CPU backend
   #pragma unroll
   for (ushort i = 0; i < top.get_capacity(); ++i)
     if (top.is_valid_element(i)) top[i] = lowest, sum[i] = 0.0f;
@@ -637,8 +656,8 @@ kernel void k_attn(device real* q [[buffer(0)]], device real* k [[buffer(1)]], d
     if (acc.is_valid_element(i)) acc[i] = 0.0f;
 
   for (int s = 0; s < S; s += kAtCols) {
-    auto tK = K.slice(hd * 64, s);
-    auto tV = V.slice(hd * 64, s);
+    auto tK = K.slice(hd * D, s);
+    auto tV = V.slice(hd * D, s);
     logits_op.run(tQ, tK, tile);
     const bool last = s + kAtCols > S;
     if (last)
@@ -651,14 +670,14 @@ kernel void k_attn(device real* q [[buffer(0)]], device real* k [[buffer(1)]], d
     for (ushort i = 0; i < top.get_capacity(); ++i)
       if (top.is_valid_element(i)) {
         const real t = max(top[i], part[i]);
-        shrink[i] = t > top[i] ? exp((float(top[i]) - float(t)) * 0.125f) : 1.0f;
+        shrink[i] = t > top[i] ? exp((float(top[i]) - float(t)) * scale) : 1.0f;
         grew = grew || t > top[i];
         sum[i] *= shrink[i];
         top[i] = t;
       }
     if (simd_any(grew))
       for (auto it = acc.begin(); it != acc.end(); it++) *it *= *shrink.map_iterator(it);
-    for (auto it = tile.begin(); it != tile.end(); it++) *it = exp((*it - *top.map_iterator(it)) * real(0.125f));  // 1 / sqrt(64)
+    for (auto it = tile.begin(); it != tile.end(); it++) *it = exp((*it - *top.map_iterator(it)) * real(scale));
     if (last)
       for (auto it = tile.begin(); it != tile.end(); it++)
         if (tile.is_valid_element(it) && s + tile.get_multidimensional_index(it)[0] >= S) *it = real(0);
@@ -673,9 +692,13 @@ kernel void k_attn(device real* q [[buffer(0)]], device real* k [[buffer(1)]], d
     if (!acc.is_valid_element(it)) continue;
     const auto at = acc.get_multidimensional_index(it);
     const int row = pb * kAtRows + at[1];
-    if (row < P) out[size_t(row) * size_t(C) + size_t(hd * 64 + at[0])] = real(*it / *sum.map_iterator(it));
+    if (row < P) out[size_t(row) * size_t(C) + size_t(hd * D + at[0])] = real(*it / *sum.map_iterator(it));
   }
 }
+template [[host_name("k_attn")]] kernel void k_attn<64>(device real*, device real*, device real*, constant int&,
+                                                      constant int&, constant int&, device real*, uint);
+template [[host_name("k_attn_d96")]] kernel void k_attn<96>(device real*, device real*, device real*, constant int&,
+                                                          constant int&, constant int&, device real*, uint);
 
 // LayerNorm over groups of g channels (g a multiple of 32, at most 1024), then an activation. One SIMD
 // group (32 threads) per token and group: each thread holds g / 32 values in registers, and the mean and

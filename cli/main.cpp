@@ -39,7 +39,7 @@ void usage() {
   std::fprintf(stderr,
                "usage: jmt match A B --kpts-a A.jkpt --kpts-b B.jkpt [--out OUT.jmtt] [options]\n"
                "       jmt match --model lightglue-aliked --kpts-a A.jkpt --kpts-b B.jkpt [--out OUT.jmtt] [options]\n"
-               "  --model M              flexglue (default), lightglue-aliked or lightglue-raco-aliked\n"
+               "  --model M              flexglue (default), lightglue-aliked, lightglue-raco-aliked or lightglue-xfeat\n"
                "  --backend B            cpu (default), metal, metal:fp16, cuda, cuda:fp16,\n"
                "                         webgpu, webgpu:fp16\n"
                "  --weights FILE         a checkpoint as released (.pth) or a .jmtw file (default weights/flexglue.jmtw;\n"

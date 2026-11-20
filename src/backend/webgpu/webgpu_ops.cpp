@@ -21,6 +21,7 @@
 #include <webgpu/webgpu.h>
 
 #include <algorithm>
+#include <cmath>
 #include <chrono>
 #include <climits>
 #include <cstdio>
@@ -38,6 +39,7 @@
 
 #include "core/half.h"
 #include "core/ops.h"
+#include "core/pool.h"
 #include "core/preprocess.h"
 #include "core/readout.h"
 
@@ -250,11 +252,12 @@ class Context {
   // Pool of storage buffers, reused by size. GPU work runs in submission order and host writes flush
   // first, so a released buffer can be handed out again at once.
   WGPUBuffer alloc(uint64_t bytes) {
-    bytes = round16(bytes);
+    bytes = pool_size(bytes);
     auto it = free_.find(bytes);
     if (it != free_.end()) {
       WGPUBuffer b = it->second;
       free_.erase(it);
+      idle_bytes_ -= bytes;
       return b;
     }
     if (bytes > max_binding())
@@ -267,7 +270,23 @@ class Context {
     if (!b) fail("out of memory allocating " + std::to_string(bytes) + " bytes");
     return b;
   }
-  void release(WGPUBuffer b, uint64_t bytes) { free_.emplace(round16(bytes), b); }
+  void release(WGPUBuffer b, uint64_t bytes) {
+    bytes = pool_size(bytes);
+    free_.emplace(bytes, b);
+    idle_bytes_ += bytes;
+    // Let the largest idle buffers go while more than kPoolIdleBytes are idle (see core/pool.h).
+    while (idle_bytes_ > kPoolIdleBytes && !free_.empty()) {
+      auto last = std::prev(free_.end());
+      idle_bytes_ -= last->first;
+      wgpuBufferRelease(last->second);
+      free_.erase(last);
+    }
+  }
+  // The pool's size for a request (see core/pool.h); a buffer may be a little larger than asked.
+  uint64_t pool_size(uint64_t bytes) const {
+    const uint64_t b = round16(pool_bucket(static_cast<size_t>(bytes)));
+    return b <= max_binding() ? b : round16(bytes);
+  }
 
   // Device copy of a weight tensor rearranged by `fill(dst)` into n values, in the storage type (or float
   // with f32), made on first use and kept. Weights outlive the backend (see jmt_ctx). `kind` separates
@@ -621,6 +640,7 @@ class Context {
   std::map<std::string, Kernel> kernels_;
   std::map<std::tuple<const void*, int, bool>, View> params_;
   std::multimap<uint64_t, WGPUBuffer> free_;
+  uint64_t idle_bytes_ = 0;  // sum of the sizes in free_
   long buffers_created_ = 0;
   WGPUCommandEncoder encoder_ = nullptr;
   WGPUComputePassEncoder pass_ = nullptr;
@@ -846,10 +866,17 @@ class WebGpuOps : public Ops {
 
   TensorPtr attention(const TensorPtr& qp, const TensorPtr& kp, const TensorPtr& vp, int heads) override {
     const GpuTensor &q = dev(qp), &k = dev(kp), &v = dev(vp);
-    if (q.c != heads * 64 || k.c != q.c || v.c != q.c || k.n() != v.n()) fail("attention: needs 64 channels per head");
+    const int D = heads > 0 ? q.c / heads : 0;
+    if (D < 4 || D > 128 || D % 4 || q.c != heads * D || k.c != q.c || v.c != q.c || k.n() != v.n())
+      fail("attention: needs a multiple of 4 channels per head, at most 128");
     auto out = std::make_shared<GpuTensor>(ctx_, q.h, q.w, q.c);
     const int P = q.n(), S = k.n();
     const long long groups = static_cast<long long>(heads) * ((P + 63) / 64);
+    if (D != 64) {  // LighterGlue's one head of 96
+      ctx_->run_groups("k_attn_any", groups, q.d(), k.d(), v.d(), out->d(), P, S, heads, D,
+                       1.0f / std::sqrt(static_cast<float>(D)));
+      return out;
+    }
     if (ctx_->fp16()) {
       // The values transposed and packed: 8 tokens of one channel per 16-byte load.
       const int S8 = (S + 7) / 8;

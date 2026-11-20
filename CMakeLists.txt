@@ -8,7 +8,7 @@ option(JMT_BUILD_PYTHON "Build the Python bindings (bindings/python; needs nanob
 # LightGlue's weights (Apache-2.0) can be built into the library: weights/<model>.jmtw, made by
 # tools/export_weights.py --model <model> (47.6 MB each). FlexGlue's never are (DINOv3 License).
 option(JMT_EMBED_WEIGHTS "Build the LightGlue weights of JMT_EMBED_MODELS into the library" OFF)
-set(JMT_EMBED_MODELS "lightglue-aliked;lightglue-raco-aliked" CACHE STRING "Models to embed when JMT_EMBED_WEIGHTS is ON")
+set(JMT_EMBED_MODELS "lightglue-aliked;lightglue-raco-aliked;lightglue-xfeat" CACHE STRING "Models to embed when JMT_EMBED_WEIGHTS is ON")
 set(JMT_CUDA "AUTO" CACHE STRING "CUDA backend: AUTO (build it when a CUDA compiler is found), ON or OFF")
 set_property(CACHE JMT_CUDA PROPERTY STRINGS AUTO ON OFF)
 set(JMT_METAL "AUTO" CACHE STRING "Metal backend (Apple platforms): AUTO (build it when Metal.framework is found), ON or OFF")
@@ -276,10 +276,13 @@ if(JMT_BUILD_TESTS)
                                                      "${CMAKE_CURRENT_SOURCE_DIR}/weights/flexglue.jmtw")
   endif()
   # LightGlue's checkpoints (tools/fetch_lightglue.sh) and, when built in, the embedded copies.
-  foreach(model lightglue-aliked lightglue-raco-aliked)
+  foreach(model lightglue-aliked lightglue-raco-aliked lightglue-xfeat)
     string(REPLACE "lightglue-" "" pth "${model}")
     string(REPLACE "-" "_" pth "${pth}")
     set(pth "${CMAKE_CURRENT_SOURCE_DIR}/third_party/lightglue-weights/${pth}_lightglue.pth")
+    if(model STREQUAL "lightglue-xfeat")
+      set(pth "${CMAKE_CURRENT_SOURCE_DIR}/third_party/lightglue-weights/xfeat-lighterglue.pt")
+    endif()
     set(jmtw "${CMAKE_CURRENT_SOURCE_DIR}/weights/${model}.jmtw")
     if(EXISTS "${pth}" AND EXISTS "${jmtw}")
       add_test(NAME checkpoint_${model} COMMAND checkpoint_test "${pth}" "${jmtw}")
@@ -306,7 +309,7 @@ if(JMT_BUILD_TESTS)
   endforeach()
   # LightGlue: tools/fetch_lightglue.sh, python tools/export_weights.py --model <model>, then
   # tools/dump_golden_lightglue.sh. Every backend of the build, each GPU one in FP32 and FP16.
-  foreach(model lightglue-aliked lightglue-raco-aliked)
+  foreach(model lightglue-aliked lightglue-raco-aliked lightglue-xfeat)
     set(jmtw "${CMAKE_CURRENT_SOURCE_DIR}/weights/${model}.jmtw")
     file(GLOB lg_golden "${CMAKE_CURRENT_SOURCE_DIR}/build/golden/${model}/*.jmtt")
     if(EXISTS "${jmtw}")

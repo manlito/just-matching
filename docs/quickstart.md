@@ -124,7 +124,7 @@ jmt shortlist images/*.jpg --weights flexglue.pth --k 10 --neighbours 2 --rerank
 
 | Option of `match` | Meaning |
 |---|---|
-| `--model M` | `flexglue` (default), `lightglue-aliked` or `lightglue-raco-aliked` |
+| `--model M` | `flexglue` (default), `lightglue-aliked`, `lightglue-raco-aliked` or `lightglue-xfeat` |
 | `--backend B` | `cpu` (default), `metal`, `metal:fp16`, `cuda`, `cuda:fp16`, `webgpu`, `webgpu:fp16` |
 | `--weights FILE` | a checkpoint as released or a `.jmtw` file (FlexGlue's default: `weights/flexglue.jmtw`) |
 | `--size N` | network input side, a multiple of 32 (default 512) |

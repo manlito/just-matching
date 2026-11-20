@@ -62,6 +62,7 @@
 #include <vector>
 
 #include "core/half.h"
+#include "core/pool.h"
 #include "core/ops.h"
 #include "core/preprocess.h"
 #include "core/readout.h"
@@ -590,10 +591,10 @@ __global__ void k_gemm_tc(const X* x, const __half* w, const float* bias, int* t
 }
 
 // ---------------------------------------------------------------------------------------------
-// Attention without the logits buffer (FP16 mode, 64 channels per head): out = softmax(q k^T / 8) v.
+// Attention without the logits buffer (64 or 96 channels per head, D): out = softmax(q k^T / sqrt(D)) v.
 // A warp takes 16 queries of one head and walks the source tokens 64 at a time. Per step: the logits
-// (16 x 64, k = 64), the largest logit of each row so far, the weights exp(logit - largest) and the
-// product of the weights with the values (16 x 64, k = 64) all stay in registers; when a row's largest
+// (16 x 64, k = D), the largest logit of each row so far, the weights exp(logit - largest) and the
+// product of the weights with the values (16 x D, k = 64) all stay in registers; when a row's largest
 // logit grows, what the row has accumulated is scaled down to the new reference first, so the result is
 // that of the softmax with the row maximum known in advance. Outputs are divided by the row sums at the
 // end. Logits, row sums and outputs are float; the weights go to the second product as half.
@@ -604,6 +605,8 @@ __global__ void k_gemm_tc(const X* x, const __half* w, const float* bias, int* t
 // Keys and values go through shared memory (rows padded to 72 values, so that the 8 rows an ldmatrix
 // reads fall on distinct banks), two copies used by alternate steps; the next step's tiles are read into
 // registers while the current one is computed. Source tokens past S are zero and masked.
+// With 96 channels (LighterGlue) a step covers half as many tokens, so that both copies of the keys and
+// values (rows of 104) stay within the 48 KB of static shared memory.
 // Block: W warps (16 W queries of one head). Grid: ceil(P / (16 W)) x heads.
 // ---------------------------------------------------------------------------------------------
 __device__ __forceinline__ void mma16816(float* c, unsigned a0, unsigned a1, unsigned b) {
@@ -640,28 +643,31 @@ __device__ __forceinline__ void split_half2(float a, float b, unsigned* hi, unsi
   const __half2 l = __floats2half2_rn(a - f.x, b - f.y);
   *hi = *reinterpret_cast<const unsigned*>(&h), *lo = *reinterpret_cast<const unsigned*>(&l);
 }
-template <typename T, int W, int MINB>
+template <typename T, int W, int MINB, int D>
 __global__ void __launch_bounds__(W * 32, MINB) k_flash(const T* q, const T* k, const T* v, int P, int S, int q_row,
                                                         int k_row, int v_row, int o_row, T* out) {
   constexpr bool kSplit = std::is_same<T, float>::value;
   constexpr int TERMS = kSplit ? 2 : 1;  // half tiles per operand: hi (and lo)
-  constexpr int NT = kSplit ? 4 : 8;     // token tiles of 8 per step
-  constexpr int KT = NT * 8, LD = 72, THREADS = W * 32, VL = 16 / sizeof(T);  // VL: values per 16-byte load
-  constexpr int LOADS = KT * (64 / VL) / THREADS;                             // 16-byte loads per tile and thread
-  static_assert(LOADS * THREADS == KT * (64 / VL), "a tile divides among the threads");
+  static_assert(D == 64 || D == 96, "64 or 96 channels per head");
+  // Token tiles of 8 per step: half as many with 96 channels, which keeps shared memory under 48 KB.
+  constexpr int NT = (kSplit ? 4 : 8) / (D == 64 ? 1 : 2);
+  constexpr int DK = D / 8, DQ = D / 32;  // k-slices (and output tiles) of 8 dims; ldmatrix x4 loads per row
+  constexpr int KT = NT * 8, LD = D + 8, THREADS = W * 32, VL = 16 / sizeof(T);  // VL: values per 16-byte load
+  constexpr int ROW = D / VL, TOTAL = KT * ROW;           // 16-byte loads per token and per tile
+  constexpr int LOADS = (TOTAL + THREADS - 1) / THREADS;  // per thread (the last one may be partial)
   __shared__ __align__(16) __half ks[2][TERMS][KT * LD];
   __shared__ __align__(16) __half vs[2][TERMS][KT * LD];
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, tig = lane & 3;
   const int hd = blockIdx.y, row0 = blockIdx.x * (16 * W) + warp * 16;
-  q += hd * 64, k += hd * 64, v += hd * 64, out += hd * 64;
+  q += hd * D, k += hd * D, v += hd * D, out += hd * D;
 
   // The warp's queries as left operands: qa[t][kk] holds dims kk * 8 + 2 tig (+1) of rows g and g + 8.
-  unsigned qa[TERMS][8][2];
+  unsigned qa[TERMS][DK][2];
   #pragma unroll
   for (int r = 0; r < 2; ++r) {
     const T* src = q + static_cast<long long>(min(row0 + g + 8 * r, P - 1)) * q_row + 2 * tig;
     #pragma unroll
-    for (int kk = 0; kk < 8; ++kk) {
+    for (int kk = 0; kk < DK; ++kk) {
       if constexpr (kSplit) {
         const float2 f = *reinterpret_cast<const float2*>(src + kk * 8);
         split_half2(f.x, f.y, &qa[0][kk][r], &qa[TERMS - 1][kk][r]);
@@ -670,13 +676,13 @@ __global__ void __launch_bounds__(W * 32, MINB) k_flash(const T* q, const T* k, 
       }
     }
   }
-  // Tile loads: element e = tid + j * THREADS is token e / (64 / VL), dims VL (e % (64 / VL)) ... + VL - 1.
+  // Tile loads: element e = tid + j * THREADS is token e / ROW, dims VL (e % ROW) ... + VL - 1.
   uint4 kr[LOADS], vr[LOADS];
   auto fetch = [&](int s0) {
     #pragma unroll
     for (int j = 0; j < LOADS; ++j) {
-      const int e = tid + j * THREADS, t = s0 + e / (64 / VL), c = (e % (64 / VL)) * VL;
-      const bool ok = t < S;
+      const int e = tid + j * THREADS, t = s0 + e / ROW, c = (e % ROW) * VL;
+      const bool ok = (TOTAL % THREADS == 0 || e < TOTAL) && t < S;
       kr[j] = ok ? *reinterpret_cast<const uint4*>(k + static_cast<long long>(t) * k_row + c) : make_uint4(0, 0, 0, 0);
       vr[j] = ok ? *reinterpret_cast<const uint4*>(v + static_cast<long long>(t) * v_row + c) : make_uint4(0, 0, 0, 0);
     }
@@ -684,7 +690,8 @@ __global__ void __launch_bounds__(W * 32, MINB) k_flash(const T* q, const T* k, 
   auto stash = [&](int buf) {
     #pragma unroll
     for (int j = 0; j < LOADS; ++j) {
-      const int e = tid + j * THREADS, at = (e / (64 / VL)) * LD + (e % (64 / VL)) * VL;
+      const int e = tid + j * THREADS, at = (e / ROW) * LD + (e % ROW) * VL;
+      if (TOTAL % THREADS != 0 && e >= TOTAL) continue;
       if constexpr (kSplit) {
         const float* kf = reinterpret_cast<const float*>(&kr[j]);
         const float* vf = reinterpret_cast<const float*>(&vr[j]);
@@ -700,11 +707,11 @@ __global__ void __launch_bounds__(W * 32, MINB) k_flash(const T* q, const T* k, 
     }
   };
 
-  float o[8][4];
+  float o[DK][4];
   #pragma unroll
-  for (int dt = 0; dt < 8; ++dt) o[dt][0] = o[dt][1] = o[dt][2] = o[dt][3] = 0.0f;
+  for (int dt = 0; dt < DK; ++dt) o[dt][0] = o[dt][1] = o[dt][2] = o[dt][3] = 0.0f;
   float top[2] = {-INFINITY, -INFINITY}, sum[2] = {0.0f, 0.0f};  // rows g and g + 8; sum: this thread's columns
-  constexpr float kScale = 0.125f * 1.4426950408889634f;              // 1 / sqrt(64), and exp via exp2
+  constexpr float kScale = (D == 64 ? 0.125f : 0.10206207261596575f) * 1.4426950408889634f;  // 1 / sqrt(D), exp via exp2
   // ldmatrix: lane l gives the address of row l % 8 of matrix l / 8.
   const int lrow = lane & 7, lmat = lane >> 3;
 
@@ -720,14 +727,13 @@ __global__ void __launch_bounds__(W * 32, MINB) k_flash(const T* q, const T* k, 
     #pragma unroll
     for (int nt = 0; nt < NT; ++nt) {
       c[nt][0] = c[nt][1] = c[nt][2] = c[nt][3] = 0.0f;
-      unsigned kb[TERMS][8];
+      unsigned kb[TERMS][DK];
       #pragma unroll
-      for (int t = 0; t < TERMS; ++t) {
-        ldsm_x4(kb[t], ks[buf][t] + (nt * 8 + lrow) * LD + lmat * 8);
-        ldsm_x4(kb[t] + 4, ks[buf][t] + (nt * 8 + lrow) * LD + 32 + lmat * 8);
-      }
+      for (int t = 0; t < TERMS; ++t)
+        #pragma unroll
+        for (int d4 = 0; d4 < DQ; ++d4) ldsm_x4(kb[t] + 4 * d4, ks[buf][t] + (nt * 8 + lrow) * LD + 32 * d4 + lmat * 8);
       #pragma unroll
-      for (int kk = 0; kk < 8; ++kk) {
+      for (int kk = 0; kk < DK; ++kk) {
         if constexpr (kSplit) {  // the small terms first
           mma16816(c[nt], qa[1][kk][0], qa[1][kk][1], kb[0][kk]);
           mma16816(c[nt], qa[0][kk][0], qa[0][kk][1], kb[1][kk]);
@@ -755,17 +761,17 @@ __global__ void __launch_bounds__(W * 32, MINB) k_flash(const T* q, const T* k, 
         const float shrink = exp2f((top[r] - t) * kScale);  // 0 on the first step
         sum[r] *= shrink;
         #pragma unroll
-        for (int dt = 0; dt < 8; ++dt) o[dt][2 * r] *= shrink, o[dt][2 * r + 1] *= shrink;
+        for (int dt = 0; dt < DK; ++dt) o[dt][2 * r] *= shrink, o[dt][2 * r + 1] *= shrink;
         top[r] = t;
       }
     }
     // Weights, their sums, and the product with the values: the weights of tokens nt * 8 ... + 7 are the
     // left operand of k-slice nt. Split mode (float) adds the step's products in a fresh accumulator and
     // that to the outputs with float additions (see the comment above the kernel).
-    float ps[kSplit ? 8 : 1][4];
+    float ps[kSplit ? DK : 1][4];
     if constexpr (kSplit) {
       #pragma unroll
-      for (int dt = 0; dt < 8; ++dt) ps[dt][0] = ps[dt][1] = ps[dt][2] = ps[dt][3] = 0.0f;
+      for (int dt = 0; dt < DK; ++dt) ps[dt][0] = ps[dt][1] = ps[dt][2] = ps[dt][3] = 0.0f;
     }
     #pragma unroll
     for (int nt = 0; nt < NT; ++nt) {
@@ -778,14 +784,13 @@ __global__ void __launch_bounds__(W * 32, MINB) k_flash(const T* q, const T* k, 
       } else {
         a[0][0] = pack_half2(p0, p1), a[0][1] = pack_half2(p2, p3);
       }
-      unsigned vb[TERMS][8];
+      unsigned vb[TERMS][DK];
       #pragma unroll
-      for (int t = 0; t < TERMS; ++t) {
-        ldsm_x4_t(vb[t], vs[buf][t] + (nt * 8 + lrow) * LD + lmat * 8);
-        ldsm_x4_t(vb[t] + 4, vs[buf][t] + (nt * 8 + lrow) * LD + 32 + lmat * 8);
-      }
+      for (int t = 0; t < TERMS; ++t)
+        #pragma unroll
+        for (int d4 = 0; d4 < DQ; ++d4) ldsm_x4_t(vb[t] + 4 * d4, vs[buf][t] + (nt * 8 + lrow) * LD + 32 * d4 + lmat * 8);
       #pragma unroll
-      for (int dt = 0; dt < 8; ++dt) {
+      for (int dt = 0; dt < DK; ++dt) {
         if constexpr (kSplit) {
           mma16816(ps[dt], a[1][0], a[1][1], vb[0][dt]);
           mma16816(ps[dt], a[0][0], a[0][1], vb[1][dt]);
@@ -797,7 +802,7 @@ __global__ void __launch_bounds__(W * 32, MINB) k_flash(const T* q, const T* k, 
     }
     if constexpr (kSplit) {
       #pragma unroll
-      for (int dt = 0; dt < 8; ++dt)
+      for (int dt = 0; dt < DK; ++dt)
         #pragma unroll
         for (int i = 0; i < 4; ++i) o[dt][i] += ps[dt][i];
     }
@@ -813,7 +818,7 @@ __global__ void __launch_bounds__(W * 32, MINB) k_flash(const T* q, const T* k, 
     const float inv = 1.0f / sum[r];
     T* dst = out + static_cast<long long>(row) * o_row + 2 * tig;
     #pragma unroll
-    for (int dt = 0; dt < 8; ++dt) {
+    for (int dt = 0; dt < DK; ++dt) {
       if constexpr (kSplit) *reinterpret_cast<float2*>(dst + dt * 8) = make_float2(o[dt][2 * r] * inv, o[dt][2 * r + 1] * inv);
       else *reinterpret_cast<unsigned*>(dst + dt * 8) = pack_half2(o[dt][2 * r] * inv, o[dt][2 * r + 1] * inv);
     }
@@ -1488,24 +1493,26 @@ void launch(void (*kernel)(Args...), long long n, typename Identity<Args>::type.
   launch_grid(kernel, dim3(static_cast<unsigned>(blocks)), dim3(kBlock), args...);
 }
 
-// Device memory with reuse: released blocks are kept and handed out again for the same size.
+// Device memory with reuse: released blocks are kept and handed out again for the same size, rounded up
+// to one of a few sizes per power of two (core/pool.h); at most kPoolIdleBytes are kept idle.
 class Pool {
  public:
   explicit Pool(int device) : device_(device) {}
   ~Pool() {
     if (cudaSetDevice(device_) == cudaSuccess) {
       cudaDeviceSynchronize();
-      trim();
+      trim(0);
     }
   }
   int device() const { return device_; }
 
   void* alloc(size_t bytes) {
-    bytes = std::max<size_t>(bytes, 16);
+    bytes = bucket(bytes);
     auto it = free_.find(bytes);
     if (it != free_.end()) {
       void* p = it->second;
       free_.erase(it);
+      idle_bytes_ -= bytes;
       return p;
     }
     void* p = nullptr;
@@ -1514,23 +1521,36 @@ class Pool {
     if (status == cudaErrorMemoryAllocation) {  // give back what is cached and try once more
       cudaGetLastError();
       cudaDeviceSynchronize();
-      trim();
+      trim(0);
       status = cudaMalloc(&p, bytes);
     }
     check(status, "cudaMalloc");
     return p;
   }
-  void release(void* p, size_t bytes) { free_.emplace(std::max<size_t>(bytes, 16), p); }
+  // cudaFree waits for the kernels in flight, so a buffer let go by trim is no longer read.
+  void release(void* p, size_t bytes) {
+    bytes = bucket(bytes);
+    free_.emplace(bytes, p);
+    idle_bytes_ += bytes;
+    trim(kPoolIdleBytes);
+  }
   long created() const { return created_; }
-  void trim() {
-    for (auto& kv : free_) cudaFree(kv.second);
-    free_.clear();
+  // Lets the largest idle blocks go while more than `limit` bytes are idle.
+  void trim(size_t limit) {
+    while (idle_bytes_ > limit && !free_.empty()) {
+      auto last = std::prev(free_.end());
+      idle_bytes_ -= last->first;
+      cudaFree(last->second);
+      free_.erase(last);
+    }
   }
 
  private:
+  static size_t bucket(size_t bytes) { return pool_bucket(std::max<size_t>(bytes, 16)); }
   int device_;
   std::multimap<size_t, void*> free_;
-  long created_ = 0;  // cudaMalloc calls
+  size_t idle_bytes_ = 0;  // sum of the sizes in free_
+  long created_ = 0;       // cudaMalloc calls
 };
 using PoolPtr = std::shared_ptr<Pool>;
 
@@ -1815,10 +1835,13 @@ class CudaOps : public Ops {
     const int P = q.n(), S = k.n(), d = q.c / heads;
     Ptr out = make(q.h, q.w, q.c);
     // Without the logits buffer, on the tensor cores (see k_flash).
-    if (flash_ && d == 64 && (kHalf ? tensor_ != 0 : split_) && q.c % 8 == 0 && k.c % 8 == 0 && v.c % 8 == 0) {
+    if (flash_ && (d == 64 || d == 96) && (kHalf ? tensor_ != 0 : split_) && q.c % 8 == 0 && k.c % 8 == 0 && v.c % 8 == 0) {
       g_profile.tag("attention P %d S %d", P, S);
-      const int wq = flash_ == 4 || flash_ == 8 ? flash_ : 16;  // 16 measured fastest (8: 3 % slower, 4: 15 %)
-      auto kern = wq == 4 ? k_flash<R, 4, 1> : wq == 8 ? k_flash<R, 8, 1> : k_flash<R, 16, 1>;
+      // 64 channels: 16 warps measured fastest (8: 3 % slower, 4: 15 %). 96 (LighterGlue): 8, whose 255
+      // registers a thread hold its larger tiles.
+      const int wq = flash_ == 4 || flash_ == 8 || flash_ == 16 ? flash_ : d == 64 ? 16 : 8;
+      auto kern = d == 64 ? (wq == 4 ? k_flash<R, 4, 1, 64> : wq == 8 ? k_flash<R, 8, 1, 64> : k_flash<R, 16, 1, 64>)
+                          : (wq == 4 ? k_flash<R, 4, 1, 96> : wq == 8 ? k_flash<R, 8, 1, 96> : k_flash<R, 16, 1, 96>);
       launch_grid(kern, dim3((P + 16 * wq - 1) / (16 * wq), heads), dim3(32 * wq), q.buf.template as<R>(), k.buf.template as<R>(),
                   v.buf.template as<R>(), P, S, q.c, k.c, v.c, q.c, out->buf.template as<R>());
       return out;

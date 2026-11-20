@@ -36,6 +36,7 @@
 
 #include "core/half.h"
 #include "core/ops.h"
+#include "core/pool.h"
 #include "core/preprocess.h"
 #include "core/readout.h"
 
@@ -197,8 +198,10 @@ class Context {
       key_.clear();
     }
     if (epoch == epoch_ - 1 && !command_) {  // nothing is running: every released buffer is idle
+      for (const auto& kv : pending_) idle_bytes_ += kv.first;
       free_.insert(pending_.begin(), pending_.end());
       pending_.clear();
+      trim();
       submitted_.clear();
       base_ = checked_ = epoch_;
     }
@@ -215,7 +218,7 @@ class Context {
   // before the GPU uses it, so it must not be in use by the open command buffer. Otherwise a buffer that
   // was released during the open command buffer can be reused at once: dispatches run in order.
   id<MTLBuffer> alloc(size_t bytes, bool host) {
-    bytes = std::max<size_t>(bytes, 16);
+    bytes = pool_size(bytes);
     if (!host) {
       auto it = pending_.find(bytes);
       if (it != pending_.end()) {
@@ -228,6 +231,7 @@ class Context {
     if (it != free_.end()) {
       id<MTLBuffer> b = it->second;
       free_.erase(it);
+      idle_bytes_ -= bytes;
       return b;
     }
     if (bytes > device_.maxBufferLength) fail("buffer of " + std::to_string(bytes) + " bytes exceeds the device limit");
@@ -235,13 +239,34 @@ class Context {
     id<MTLBuffer> b = [device_ newBufferWithLength:bytes options:MTLResourceStorageModeShared];
     if (!b) {
       free_.clear();
+      idle_bytes_ = 0;
       b = [device_ newBufferWithLength:bytes options:MTLResourceStorageModeShared];
       if (!b) fail("out of memory allocating " + std::to_string(bytes) + " bytes");
     }
     return b;
   }
   void release(id<MTLBuffer> b, size_t bytes) {
-    (command_ || !submitted_.empty() ? pending_ : free_).emplace(std::max<size_t>(bytes, 16), b);
+    bytes = pool_size(bytes);
+    if (command_ || !submitted_.empty()) {
+      pending_.emplace(bytes, b);
+    } else {
+      free_.emplace(bytes, b);
+      idle_bytes_ += bytes;
+      trim();
+    }
+  }
+  // The pool's size for a request (see core/pool.h); a buffer may be a little larger than asked.
+  size_t pool_size(size_t bytes) const {
+    const size_t b = pool_bucket(std::max<size_t>(bytes, 16));
+    return b <= device_.maxBufferLength ? b : std::max<size_t>(bytes, 16);
+  }
+  // Lets the largest idle buffers go while more than kPoolIdleBytes are idle.
+  void trim() {
+    while (idle_bytes_ > kPoolIdleBytes && !free_.empty()) {
+      auto last = std::prev(free_.end());
+      idle_bytes_ -= last->first;
+      free_.erase(last);
+    }
   }
 
   bool fp16() const { return fp16_; }
@@ -390,6 +415,7 @@ class Context {
   std::vector<id<MTLCommandBuffer>> submitted_;  // committed, numbers base_ .. epoch_ - 1
   long epoch_ = 0, base_ = 0, checked_ = 0;
   std::multimap<size_t, id<MTLBuffer>> free_, pending_;
+  size_t idle_bytes_ = 0;  // sum of the sizes in free_
   bool profile_ = false;
   std::string tag_, key_;
   std::map<std::string, Stat> stats_;
@@ -698,12 +724,16 @@ class MetalOps : public Ops {
 
   TensorPtr attention(const TensorPtr& qp, const TensorPtr& kp, const TensorPtr& vp, int heads) override {
     const MetalTensor &q = dev(qp), &k = dev(kp), &v = dev(vp);
-    if (q.c != heads * 64 || k.c != q.c || v.c != q.c || k.n() != v.n()) fail("attention: needs 64 channels per head");
+    // 64 channels per head (LightGlue, FlexGlue) or one head of 96 (LighterGlue).
+    const int D = heads > 0 ? q.c / heads : 0;
+    if ((D != 64 && D != 96) || q.c != heads * D || k.c != q.c || v.c != q.c || k.n() != v.n())
+      fail("attention: needs 64 or 96 channels per head");
+    const std::string d = D == 64 ? "" : "_d96";
     auto out = std::make_shared<MetalTensor>(ctx_, q.h, q.w, q.c);
     const int P = q.n(), S = k.n(), spad = (S + 7) / 8 * 8;
     if (ctx_->mpp()) {
       ctx_->tag(format("attention P %d S %d", P, S));
-      ctx_->run_groups("k_attn", static_cast<long long>(heads) * ((P + 31) / 32), 32, q.d(), k.d(), v.d(), P, S, heads, out->d());
+      ctx_->run_groups(("k_attn" + d).c_str(), static_cast<long long>(heads) * ((P + 31) / 32), 32, q.d(), k.d(), v.d(), P, S, heads, out->d());
       return out;
     }
     if (spad / 8 > 1024) fail("attention: more than 8192 tokens per image (input size above 720 px)");
@@ -713,15 +743,15 @@ class MetalOps : public Ops {
     chunk = std::min(P, (chunk + 3) / 4 * 4);
     Buffer weights(ctx_, static_cast<size_t>(heads) * chunk * S * ctx_->elem());
     Buffer inv(ctx_, static_cast<size_t>(heads) * chunk * sizeof(float));
-    Buffer keys(ctx_, static_cast<size_t>(heads) * 64 * spad * ctx_->elem());
+    Buffer keys(ctx_, static_cast<size_t>(heads) * D * spad * ctx_->elem());
     ctx_->tag(format("attention P %d S %d", P, S));
-    ctx_->run("k_attn_keys", static_cast<long long>(heads) * 64 * spad, k.d(), S, heads, spad, keys.view());
+    ctx_->run(("k_attn_keys" + d).c_str(), static_cast<long long>(heads) * D * spad, k.d(), S, heads, spad, keys.view());
     for (int p0 = 0; p0 < P; p0 += chunk) {
       const int pc = std::min(chunk, P - p0);
-      ctx_->run_groups("k_attn_weights", static_cast<long long>(heads) * ((pc + 3) / 4), spad / 8, q.d(), keys.view(), pc, S,
+      ctx_->run_groups(("k_attn_weights" + d).c_str(), static_cast<long long>(heads) * ((pc + 3) / 4), spad / 8, q.d(), keys.view(), pc, S,
                        heads, spad, weights.view(), inv.view(), p0);
-      ctx_->run(format("k_attn_apply_r%d_t%d", apply_rows_, apply_tile_),
-                static_cast<long long>(heads) * ((pc + apply_rows_ - 1) / apply_rows_) * (64 / apply_tile_), weights.view(),
+      ctx_->run(format("k_attn_apply_r%d_t%d%s", apply_rows_, apply_tile_, d.c_str()),
+                static_cast<long long>(heads) * ((pc + apply_rows_ - 1) / apply_rows_) * (D / apply_tile_), weights.view(),
                 v.d(), pc, S, heads, inv.view(), out->d(), p0);
     }
     return out;

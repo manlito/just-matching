@@ -294,6 +294,8 @@ Ref unpickle(const uint8_t* p, size_t size) {
 
 // ---- The state dict as float32 tensors.
 
+bool ends_with(const std::string& s, const std::string& end);
+
 std::vector<OwnedTensor> read_state_dict(const uint8_t* p, size_t size) {
   std::map<std::string, Entry> zip = read_zip(p, size);
   std::string prefix;
@@ -318,6 +320,9 @@ std::vector<OwnedTensor> read_state_dict(const uint8_t* p, size_t size) {
     const Value& t = *kv.second;
     const Value& st = *t.storage;
     const int elem = st.s == "FloatStorage" ? 4 : (st.s == "HalfStorage" || st.s == "BFloat16Storage") ? 2 : 0;
+    // BatchNorm's num_batches_tracked counters are integers, and none of the models reads them: LighterGlue's
+    // file carries them in its unused copy of XFeat.
+    if (!elem && st.s == "LongStorage" && ends_with(kv.first->s, ".num_batches_tracked")) continue;
     if (!elem) fail("tensor '" + kv.first->s + "' is a " + st.s);
     auto data = zip.find(prefix + "data/" + st.s2);
     if (data == zip.end() || data->second.size != static_cast<size_t>(st.i) * elem) fail("bad storage " + st.s2);
@@ -434,20 +439,37 @@ Weights flexglue_from_state_dict(std::vector<OwnedTensor> sd) {
 }
 
 Weights lightglue_from_state_dict(std::vector<OwnedTensor> sd) {
-  const size_t kHeads = 4;
+  // LighterGlue (XFeat's) names its tensors matcher.* and carries an extractor.* copy of XFeat that the
+  // original never loads into the matcher: keep the matcher, without the prefix.
+  const bool lighter = std::any_of(sd.begin(), sd.end(), [](const OwnedTensor& t) { return t.name.rfind("matcher.", 0) == 0; });
+  if (lighter) {
+    std::vector<OwnedTensor> kept;
+    for (OwnedTensor& t : sd)
+      if (t.name.rfind("matcher.", 0) == 0) t.name.erase(0, 8), kept.push_back(std::move(t));
+    sd = std::move(kept);
+  }
+  const auto input = std::find_if(sd.begin(), sd.end(), [](const OwnedTensor& t) { return t.name == "input_proj.weight"; });
+  const bool aliked = input != sd.end() && input->shape == std::vector<int>{256, 128};
+  const bool xfeat = input != sd.end() && input->shape == std::vector<int>{96, 64};
+  if (!aliked && !xfeat)
+    fail("not a LightGlue checkpoint for 128-dim ALIKED or 64-dim XFeat descriptors (input_proj.weight)");
+  const size_t heads = aliked ? 4 : 1;
   std::vector<OwnedTensor> out;
   for (OwnedTensor& t : sd) {
     if (t.name == "confidence_thresholds") continue;  // a buffer the graph computes
     if (ends_with(t.name, "self_attn.Wqkv.weight") || ends_with(t.name, "self_attn.Wqkv.bias"))
-      reorder_wqkv(t, kHeads);
+      reorder_wqkv(t, heads);
     out.push_back(std::move(t));
   }
-  const auto input = std::find_if(out.begin(), out.end(), [](const OwnedTensor& t) { return t.name == "input_proj.weight"; });
-  if (input == out.end() || input->shape != std::vector<int>{256, 128})
-    fail("not a LightGlue checkpoint for 128-dim descriptors (input_proj.weight)");
   std::map<std::string, std::string> meta = {{"kind", "weights"},  {"model", "lightglue"}, {"n_layers", "9"},
                                              {"dim", "256"},       {"heads", "4"},         {"input_dim", "128"},
                                              {"license", "Apache-2.0"}, {"source", "LightGlue checkpoint"}};
+  if (xfeat) {
+    // LighterGlue's configuration in the original (modules/lighterglue.py): no early stop, width 0.95.
+    meta["n_layers"] = "6", meta["dim"] = "96", meta["heads"] = "1", meta["input_dim"] = "64";
+    meta["depth_confidence"] = "-1", meta["width_confidence"] = "0.95", meta["variant"] = "lightglue-xfeat";
+    meta["source"] = "LighterGlue checkpoint";
+  }
   return Weights::from_tensors(std::move(meta), std::move(out));
 }
 

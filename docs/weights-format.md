@@ -39,6 +39,7 @@ Metadata keys of the weights files: `kind`, `model` (`flexglue` or `lightglue`),
 | `flexglue-fp16.jmtw` | the same tensors as float16 | 284 MB |
 | `aliked_lightglue.pth`, `raco_aliked_lightglue.pth` | LightGlue's checkpoints for ALIKED descriptors, as released | 47.6 MB each |
 | `lightglue-aliked.jmtw`, `lightglue-raco-aliked.jmtw` | 253 tensors, 11,884,625 values, float32 | 47.6 MB each |
+| `lightglue-xfeat.jmtw` | 169 tensors, 1,125,995 values, float32 | 4.5 MB |
 | `lightglue-aliked-fp16.jmtw` | the same tensors as float16, what the demo loads | 23.8 MB |
 
 `jmt convert IN OUT.jmtw [--fp16]` makes the `.jmtw` files from a checkpoint, and so does the repository's

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Fetch the original LightGlue at its pinned commit into third_party/LightGlue, and its two checkpoints for
 # 128-dim ALIKED descriptors into third_party/lightglue-weights/. Code and weights are Apache-2.0
-# (third_party/LightGlue/LICENSE); nothing in them comes from DINO.
+# (third_party/LightGlue/LICENSE); nothing in them comes from DINO. Also LighterGlue, XFeat's LightGlue
+# (verlab/accelerated_features, Apache-2.0), from that repository at its pinned commit.
 #
 #   tools/fetch_lightglue.sh            # the code and both checkpoints
 #   tools/fetch_lightglue.sh weights    # the checkpoints only (the docs deploy: no clone)
@@ -36,3 +37,11 @@ done <<'EOF'
 aliked_lightglue.pth d975e965b105311a6143194852297dff4f02aea5cc2e10cecfed966ca0e22503
 raco_aliked_lightglue.pth a804c3fe2851cc3c765cda6a9f412845893c8d8e2a3048f848d7f6ba172e6312
 EOF
+
+pth="$ROOT/third_party/lightglue-weights/xfeat-lighterglue.pt"
+if [ ! -f "$pth" ]; then
+  curl -fsSL -o "$pth.part" \
+    https://github.com/verlab/accelerated_features/raw/e92685f57f8318b18725c5c8c0bd28c7fe188d9a/weights/xfeat-lighterglue.pt
+  mv "$pth.part" "$pth"
+fi
+echo "766102df37f11189efe5b0811d1f47c72b22629b79bfabfcfff9d2a2f84654b8  $pth" | shasum -a 256 -c -

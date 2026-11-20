@@ -281,6 +281,10 @@ reference for recall, before any C++ is written for them.
   `jmt match --model`; adaptive depth and width, which stop and drop exactly where the original does; the
   GPU backends on the device (Metal, CUDA, WebGPU, FP32 and FP16); the demo (LightGlue by default, weights
   served) and the docs. See "M9 plan" and "Notes from M9".
+- [x] **M10 — LighterGlue for XFeat**: just-keypoints' `xfeat` (its XFeat track) matched by LighterGlue, XFeat's
+  6-layer LightGlue of width 96 with one head (verlab/accelerated_features at `e92685f`, Apache-2.0, 4.5 MB),
+  for like-recon's mobile demo: small, built-in weights and no FlexGlue download. Done on the CPU, Metal,
+  WebGPU and CUDA, FP32 and FP16. See "Notes from M10".
 
 ### Covisibility track (parallel, like the RaCo track in just-keypoints)
 
@@ -1314,6 +1318,65 @@ and message norms. Everything else LightGlue needs is already in `Ops`.
   repository.
 - **Not checked:** the deploy itself runs on the next push to main; its new step was run here by hand
   (fetch, CPU-only CLI, convert).
+
+## Notes from M10 (LighterGlue)
+
+- **Reference.** The original runs LighterGlue through kornia's LightGlue with its own configuration
+  (`modules/lighterglue.py`: input 64, width 96, 6 layers, 1 head, `depth_confidence` -1, `width_confidence`
+  0.95, `filter_threshold` 0.1). The golden files use cvg/LightGlue's code at `eb42fee` with that
+  configuration (`tools/dump_golden_lightglue.py --model xfeat`, keypoints from `jkp extract --model xfeat`);
+  kornia's LighterGlue on the same inputs gives identical matches on all 6 pairs (scores within 1.8e-4).
+  End to end, the original XFeat + LighterGlue gives 6 / 288 / 827 matches on Berlin, LaMAR and the Berlin
+  homography pair, the golden files 5 / 281 / 827: the Berlin pair is hard for XFeat, not a setup error.
+- **Weights.** `xfeat-lighterglue.pt` holds `matcher.*` and an `extractor.*` copy of XFeat that differs from
+  `xfeat.pt`; the original loads the file into LightGlue with `strict=False`, so the copy is never used.
+  `tools/export_weights.py --model lightglue-xfeat` and the library's checkpoint reader keep the matcher
+  without the prefix (Wqkv reordered for one head) and skip the integer `num_batches_tracked` counters. The
+  reader tells the two families apart by `input_proj.weight` (256 x 128 or 96 x 64).
+- **Defaults.** `jmt_match_options.depth_confidence` and `width_confidence` now default to NaN, "the model's
+  own", stored in the weights metadata for LighterGlue (off and 0.95) and 0.95 / 0.99 otherwise, so
+  `jmt match --model lightglue-xfeat` reproduces the original without options. `n_layers` above the model's
+  depth (9 by default, LighterGlue has 6) runs every layer.
+- **Agreement**, 6 pairs, 2048 keypoints: fixed depth and adaptive runs give the original's matches on the CPU,
+  Metal and WebGPU in FP32 (identical sets), every token within the bounds of M9 measured from float64.
+  Scores: within 3.4e-4 of the original's float32 scores, whose own drift from float64 reaches 2.6e-4 here
+  (LightGlue-ALIKED: 4.8e-5): LighterGlue's logits are larger (one head of 96). The bound is 6e-4 for this model
+  (FP16: 0.25; matches 99 % the same).
+- **GPU attention** had 64 channels per head built in. Metal's kernels are templates on the head size now
+  (`k_attn`, the Metal 4 kernel, and the portable `k_attn_keys` / `k_attn_weights` / `k_attn_apply`,
+  instantiated for 64 and 96); WebGPU has `k_attn_any` (one thread per query, 16-token tiles of keys and values
+  in workgroup memory, any multiple of 4 up to 128) beside its tuned 64-channel kernels. CUDA's `k_flash` is a
+  template on the head size too (64, 96): with 96 a step covers half as many tokens (both copies of keys and
+  values, rows of 104, stay within 48 KB of static shared memory) and a block is 8 warps (16 spilled: 128
+  registers a thread). The path through the logits buffer (`JMT_CUDA_FLASH=0`) still needs token counts that
+  are multiples of 16, which adaptive width breaks, as it does for LightGlue-ALIKED.
+- **Speed**, LaMAR pair, 2048 + 2048 keypoints, adaptive, M5 Pro (`jmt match --runs 10`):
+
+  | | CPU | Metal FP32 | Metal FP16 | WebGPU FP32 | WebGPU FP16 |
+  |---|---|---|---|---|---|
+  | LighterGlue (XFeat) | 167 ms | 19 ms | 10 ms | 149 ms | 145 ms |
+  | LightGlue (ALIKED) | 546 ms | 37 ms | 16 ms | 51 ms | 36 ms |
+
+  WebGPU's `k_attn_any` is not tuned: one query per thread. On the RTX 2070 Max-Q (CUDA 13.4, same pair):
+
+  | | CPU | CUDA FP32 | CUDA FP16 |
+  |---|---|---|---|
+  | LighterGlue (XFeat) | 842 ms | 28 ms | 14 ms |
+  | LightGlue (ALIKED) | | 40 ms | 15 ms |
+
+  Attention is 59 % of LighterGlue's time in FP32 (split halves, three products each) and 38 % in FP16;
+  layer norm 13 % and 28 %. CUDA agrees as Metal does: the original's matches on all 6 pairs in FP32, every
+  layer within the bounds.
+- **Buffer pools** (found by like-recon's M12 on a 222-frame capture): the GPU pools reused a buffer only for
+  a request of exactly its size, and LightGlue's tensors change size with every pair, so 5,421 LighterGlue
+  pairs on Metal reached 64 GB of memory footprint and 8,421 were killed. Metal and WebGPU now round sizes up
+  to eight steps per octave (at most 12.5 % more, `core/pool.h`) and keep at most 1 GB idle: 2.0 GB peak for
+  the 5,421 pairs, and 25 % faster. CUDA's pool does the same (an idle block let go is freed with cudaFree,
+  which waits for the kernels in flight): 3,000 LighterGlue pairs of 500 to 4,096 keypoints stay at 340 MB of
+  device memory (FP16: 234 MB); 2,000 LightGlue-ALIKED pairs peak at 1.15 GB, where they reached the 8 GB
+  card's limit before (7.7 GB peak, held only by the pool's trim when cudaMalloc failed). Not checked: without Metal 4 (`JMT_METAL_MPP=0`)
+  LighterGlue misses one matchability bound (5.4e-4 against 5.2e-4 on the LaMAR pair), and `ops_metal` fails
+  in the linear product ("input channels must be a multiple of 4"), code M10 does not touch.
 
 ## Python package
 
