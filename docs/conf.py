@@ -3,8 +3,10 @@
 # Next to the pages, after the build, this file puts the live demo and what it loads:
 #   lib/       jmt.js and its WebAssembly module, from a browser build (JMT_WASM_DIR, default build/wasm/web),
 #              with LightGlue's weights in float16 (lightglue-aliked-fp16.jmtw, Apache-2.0, 24 MB), which that
-#              build copies in when weights/lightglue-aliked-fp16.jmtw exists (jmt convert ... --fp16);
-#              lib/jkp/ just-keypoints' module and its RaCo and ALIKED weights, which that build copies in (web/jkp)
+#              build copies in when weights/lightglue-aliked-fp16.jmtw exists (jmt convert ... --fp16), and
+#              LighterGlue's (lightglue-xfeat.jmtw, Apache-2.0, 4.5 MB, committed);
+#              lib/jkp/ just-keypoints' module and its RaCo, ALIKED and XFeat weights, which that build copies in
+#              (web/jkp)
 #   demo/      web/demo.html with the site's top bar, and web/demo.js
 #   samples/   the demo's sample images (web/samples)
 # Anything missing is a warning, so `sphinx-build -W` fails. FlexGlue's weights are not on the site: their
@@ -37,8 +39,8 @@ html_extra_path = ["_extra"]
 html_copy_source = False
 html_show_sourcelink = False
 
-MODULE_FILES = ["jmt.js", "jmt_wasm.js", "jmt_wasm.wasm", "lightglue-aliked-fp16.jmtw"]
-JKP_FILES = ["jkp.js", "jkp_wasm.js", "jkp_wasm.wasm", "raco.jkpw", "aliked-n16.jkpw"]
+MODULE_FILES = ["jmt.js", "jmt_wasm.js", "jmt_wasm.wasm", "lightglue-aliked-fp16.jmtw", "lightglue-xfeat.jmtw"]
+JKP_FILES = ["jkp.js", "jkp_wasm.js", "jkp_wasm.wasm", "raco.jkpw", "aliked-n16.jkpw", "xfeat.jkpw"]
 
 SITE_HEADER = """<a class="jk-skip" href="#content">Skip to content</a>
 <header class="jk-top">
@@ -55,7 +57,8 @@ SITE_HEADER = """<a class="jk-skip" href="#content">Skip to content</a>
 
 SITE_HEAD = """<link rel="stylesheet" href="site-bar.css">
 <script type="application/json" id="demo-config">
-{"lib": "../lib/", "jkp": "../lib/jkp/", "samples": "../samples/", "lightglue": "../lib/lightglue-aliked-fp16.jmtw"}
+{"lib": "../lib/", "jkp": "../lib/jkp/", "samples": "../samples/", "lightglue": "../lib/lightglue-aliked-fp16.jmtw",
+ "lighterglue": "../lib/lightglue-xfeat.jmtw"}
 </script>"""
 
 

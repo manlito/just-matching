@@ -9,6 +9,13 @@ Geometry Lab. The library can build its two checkpoints for ALIKED descriptors i
 Nothing in them comes from DINOv3. The keypoints and descriptors come from just-keypoints: ALIKED is under the
 [BSD 3-Clause licence](https://github.com/Shiaoming/ALIKED/blob/main/LICENSE).
 
+## LighterGlue and XFeat
+
+XFeat (verlab/accelerated_features) and its LighterGlue matcher are under the
+[Apache License 2.0](https://github.com/verlab/accelerated_features/blob/main/LICENSE). The library ships
+LighterGlue's weights (`lightglue-xfeat.jmtw`), and the demo serves them; XFeat's keypoints and descriptors come
+from just-keypoints.
+
 ## FlexGlue
 
 just-matching does not distribute FlexGlue's weights, and this site does not serve them. You download them from

@@ -1,6 +1,8 @@
 // just-matching demo: pick images and see their matches, with either matcher.
 // - LightGlue (default): ALIKED keypoints and descriptors from just-keypoints, every pair matched with adaptive
 //   depth and width. Its weights (Apache-2.0) are served next to the page as lightglue-aliked-fp16.jmtw.
+// - LighterGlue: XFeat keypoints and descriptors, every pair matched; XFeat's light LightGlue (Apache-2.0), served
+//   next to the page as lightglue-xfeat.jmtw.
 // - FlexGlue: RaCo keypoints, the shortlist (covisibility levels 1 and 2), and matches with early stop (level 3)
 //   on the pairs it keeps.
 // Keypoints come from just-keypoints' module (jkp/), the matcher from jmt.js. Both run on WebGPU in this page.
@@ -12,7 +14,8 @@
 // next visit only when the visitor ticks "Keep in this browser". URL parameters:
 // run=1 runs once the sample set is loaded (and weights are at hand); weights=URL fetches the weights instead
 // (a .pth or .jmtw file, or a parts manifest), for local testing; jkp=DIR for just-keypoints' module and its
-// raco.jkpw and aliked-n16.jkpw; lightglue=URL for LightGlue's weights; model=flexglue starts with FlexGlue.
+// raco.jkpw, aliked-n16.jkpw and xfeat.jkpw; lightglue=URL and lighterglue=URL for LightGlue's and
+// LighterGlue's weights; model=flexglue or model=lighterglue starts with that matcher.
 const params = new URLSearchParams(location.search);
 const CONFIG = JSON.parse(document.getElementById('demo-config')?.textContent || '{}');
 const dir = d => d.replace(/\/?$/, '/');
@@ -21,6 +24,13 @@ const JKP_DIR = dir(params.get('jkp') ?? CONFIG.jkp ?? 'jkp/');
 const SAMPLES_DIR = dir(CONFIG.samples ?? 'samples/');
 const WEIGHTS_URL = params.get('weights');
 const LIGHTGLUE_URL = params.get('lightglue') ?? CONFIG.lightglue ?? 'lightglue-aliked-fp16.jmtw';
+const LIGHTERGLUE_URL = params.get('lighterglue') ?? CONFIG.lighterglue ?? 'lightglue-xfeat.jmtw';
+// The matchers of keypoints and their descriptors (no shortlist: every pair is matched), by model.
+const SPARSE = {
+  lightglue: { name: 'LightGlue', keypoints: 'ALIKED', jkpw: 'aliked-n16.jkpw', weightsUrl: LIGHTGLUE_URL, depth: 9 },
+  lighterglue: { name: 'LighterGlue', keypoints: 'XFeat', jkpw: 'xfeat.jkpw', weightsUrl: LIGHTERGLUE_URL, depth: 6 },
+};
+const sparse = model => Object.hasOwn(SPARSE, model);
 const STORED = 'flexglue-weights';   // the visitor's weights file, in the origin private file system
 const jmt = await import(new URL(`${LIB}jmt.js`, location.href).href);
 const SAMPLES = ['tum-1', 'tum-2', 'tum-3', 'tum-4', 'kitti-1', 'kitti-2', 'kitti-3', 'kitti-4',
@@ -37,9 +47,9 @@ const $ = id => document.getElementById(id);
 const status = $('status'), progress = $('progress');
 
 const state = {
-  images: [],          // { name, bitmap, data, kp (RaCo xy), tKp, lg ({ xy, desc } from ALIKED), tLg, feat, tDescribe }
-  extractors: {},      // by model: RaCo for FlexGlue, ALIKED for LightGlue
-  lightglueWeights: null,
+  images: [],          // { name, bitmap, data, kp (RaCo xy), tKp, sp (by model: { xy, desc } from ALIKED or XFeat), tSp, feat, tDescribe }
+  extractors: {},      // by model: RaCo for FlexGlue, ALIKED for LightGlue, XFeat for LighterGlue
+  sparseWeights: {},   // by model: LightGlue's and LighterGlue's weights, once fetched
   matcher: null, matcherKey: '',
   weights: null,       // { name, size, blob or url, stored }: the visitor's FlexGlue weights
   timings: null,
@@ -128,7 +138,7 @@ async function addImages(entries) {  // [{ name, blob }]
     }
     try {
       const bitmap = await bitmapOf(blob);
-      state.images.push({ name, bitmap, data: jmt.rgba(bitmap), kp: null, tKp: 0, lg: null, tLg: 0, feat: null, tDescribe: 0 });
+      state.images.push({ name, bitmap, data: jmt.rgba(bitmap), kp: null, tKp: 0, sp: {}, tSp: {}, feat: null, tDescribe: 0 });
     } catch (e) {
       setStatus(`Cannot read ${name}: ${e.message}`, true);
     }
@@ -190,19 +200,20 @@ async function fetchWithProgress(url, label) {
   });
 }
 
-// The keypoints each matcher takes: RaCo's for FlexGlue, ALIKED's with their descriptors for LightGlue.
+// The keypoints each matcher takes: RaCo's for FlexGlue, ALIKED's with their descriptors for LightGlue, XFeat's
+// for LighterGlue.
 async function ensureExtractor(model, t) {
   if (state.extractors[model]) return;
-  setStatus(`Loading just-keypoints (${model === 'lightglue' ? 'ALIKED' : 'RaCo'})…`);
+  setStatus(`Loading just-keypoints (${sparse(model) ? SPARSE[model].keypoints : 'RaCo'})…`);
   const t0 = performance.now();
   const jkp = await import(new URL(`${JKP_DIR}jkp.js`, location.href).href);
-  state.extractors[model] = model === 'lightglue'
-    ? await jkp.create({ weightsUrl: `${JKP_DIR}aliked-n16.jkpw`, topK: KEYPOINTS })
+  state.extractors[model] = sparse(model)
+    ? await jkp.create({ weightsUrl: `${JKP_DIR}${SPARSE[model].jkpw}`, topK: KEYPOINTS })
     : await jkp.create({ weightsUrl: `${JKP_DIR}raco.jkpw`, topK: KEYPOINTS, skipRanker: true, skipCovariance: true });
   t.loadKeypoints = performance.now() - t0;
 }
 
-const xyOf = (im, model) => (model === 'lightglue' ? im.lg.xy : im.kp);
+const xyOf = (im, model) => (sparse(model) ? im.sp[model].xy : im.kp);
 
 // ---- FlexGlue's weights, from the visitor
 
@@ -324,14 +335,14 @@ function dropMatcher() {
 
 async function ensureMatcher(s, t) {
   const { model, precision, size } = s;
-  const key = `${model}/${precision}/${model === 'lightglue' ? '' : size}`;
+  const key = `${model}/${precision}/${sparse(model) ? '' : size}`;
   if (state.matcher && state.matcherKey === key) return;
   dropMatcher();
   let t0 = performance.now(), weights, name;
-  if (model === 'lightglue') {
-    name = 'LightGlue weights';
-    if (!state.lightglueWeights) state.lightglueWeights = await fetchWithProgress(LIGHTGLUE_URL, name);
-    weights = state.lightglueWeights;
+  if (sparse(model)) {
+    name = `${SPARSE[model].name} weights`;
+    if (!state.sparseWeights[model]) state.sparseWeights[model] = await fetchWithProgress(SPARSE[model].weightsUrl, name);
+    weights = state.sparseWeights[model];
   } else {
     const w = state.weights;
     name = w.name;
@@ -370,7 +381,8 @@ function settings() {
 }
 
 function matchOptions(s) {
-  if (s.model === 'lightglue') return { layers: s.layers, depthConfidence: s.adaptive ? 0.95 : 0, widthConfidence: s.adaptive ? 0.99 : 0 };
+  // Adaptive: the model's own depth and width confidences (LightGlue 0.95 and 0.99, LighterGlue none and 0.95).
+  if (sparse(s.model)) return s.adaptive ? { layers: s.layers } : { layers: s.layers, depthConfidence: 0, widthConfidence: 0 };
   return s.early == null ? { layers: s.layers } : { layers: s.layers, minCovisibility: MIN_COVISIBILITY, earlyStopDecay: s.early };
 }
 
@@ -380,9 +392,9 @@ async function matchPair(i, j, s) {
   const r = await state.matcher.match(a.feat, xyOf(a, s.model), b.feat, xyOf(b, s.model), matchOptions(s));
   r.ms = performance.now() - t0;
   r.model = s.model;
-  r.layers = s.layers;
+  r.layers = sparse(s.model) ? Math.min(s.layers, SPARSE[s.model].depth) : s.layers;
   r.checked = s.model === 'flexglue' && s.early != null;
-  if (s.model === 'lightglue' && state.level1) {
+  if (sparse(s.model) && state.level1) {
     const n = state.images.length;
     state.level1[i * n + j] = state.level1[j * n + i] = r.n;  // the matrix shows match counts
   }
@@ -412,16 +424,16 @@ async function run() {
     t.persist = { loadKeypoints: t.loadKeypoints, loadWeights: t.loadWeights, weightsMB: t.weightsMB, create: t.create };
     t.model = s.model;
     invalidate();
-    const lg = s.model === 'lightglue';
+    const lg = sparse(s.model);
     for (const [i, im] of state.images.entries()) {
-      if ((lg ? im.lg : im.kp) && im.feat) continue;
+      if ((lg ? im.sp[s.model] : im.kp) && im.feat) continue;
       setStatus(`Image ${i + 1} of ${n}: keypoints and features…`);
       setProgress(i, n);
-      if (lg && !im.lg) {
+      if (lg && !im.sp[s.model]) {
         const t0 = performance.now();
-        const k = await state.extractors.lightglue.extract(im.data);
-        im.lg = { xy: k.xy, desc: k.desc };
-        im.tLg = performance.now() - t0;
+        const k = await state.extractors[s.model].extract(im.data);
+        im.sp[s.model] = { xy: k.xy, desc: k.desc };
+        im.tSp[s.model] = performance.now() - t0;
       } else if (!lg && !im.kp) {
         const t0 = performance.now();
         im.kp = (await state.extractors.flexglue.extract(im.data)).xy;
@@ -429,12 +441,12 @@ async function run() {
       }
       if (!im.feat) {
         const t0 = performance.now();
-        im.feat = lg ? await state.matcher.describeKeypoints(im.data, im.lg.xy, im.lg.desc) : await state.matcher.describe(im.data);
+        im.feat = lg ? await state.matcher.describeKeypoints(im.data, im.sp[s.model].xy, im.sp[s.model].desc) : await state.matcher.describe(im.data);
         await state.matcher.finish();
         im.tDescribe = performance.now() - t0;
       }
     }
-    t.keypoints = median(state.images.map(im => (lg ? im.tLg : im.tKp)));
+    t.keypoints = median(state.images.map(im => (lg ? im.tSp[s.model] : im.tKp)));
     t.describe = median(state.images.map(im => im.tDescribe));
     if (lg) return await runLightGlue(s, t, tRun);
     const feats = state.images.map(im => im.feat);
@@ -495,12 +507,12 @@ async function run() {
   }
 }
 
-// LightGlue has no shortlist: every pair is matched, and the matrix shows how many matches each pair got.
+// LightGlue and LighterGlue have no shortlist: every pair is matched, and the matrix shows how many matches each pair got.
 async function runLightGlue(s, t, tRun) {
   const n = state.images.length, m = n * (n - 1) / 2;
   const pairs = new Int32Array(2 * m);
   for (let i = 0, p = 0; i < n; i++) for (let j = i + 1; j < n; j++, p++) pairs[2 * p] = i, pairs[2 * p + 1] = j;
-  state.shortlist = { n: m, pairs, scores: new Float32Array(m).fill(NaN), rerank: false, model: 'lightglue' };
+  state.shortlist = { n: m, pairs, scores: new Float32Array(m).fill(NaN), rerank: false, model: s.model };
   state.level1 = new Float32Array(n * n).fill(0);
   state.resultKey = JSON.stringify(s);
   renderMatrix();
@@ -577,7 +589,7 @@ async function select(i, j) {
 // FlexGlue's verdict on a pair: same place (matched), or different places (no matches; most stop early, which
 // only saves time).
 function verdict(r) {
-  if (!r || r.model === 'lightglue') return '';
+  if (!r || sparse(r.model)) return '';
   if (!r.checked) return '<span class="tag" title="Early stop is off: FlexGlue keeps the matches of every pair">not checked</span>';
   if (r.covisibility >= MIN_COVISIBILITY) return '<span class="tag pass" title="FlexGlue judges that the images show the same place">same place</span>';
   const how = r.stopLayer < r.layers ? `stopped after ${r.stopLayer} of ${r.layers} layers, which saves time` : `after all ${r.layers} layers`;
@@ -607,8 +619,8 @@ function renderPairs() {
     const sel = state.selected && state.selected[0] === i && state.selected[1] === j;
     rows.push(`<tr data-i="${i}" data-j="${j}"${sel ? ' class="sel"' : ''}><td>${p + 1}</td>` +
       `<td class="l">${i + 1} ${state.images[i].name} – ${j + 1} ${state.images[j].name}</td>` +
-      `<td>${sl.model === 'lightglue' ? '–' : fmt3(state.level1[i * n + j])}</td>${sl.rerank ? `<td>${fmt3(sl.scores[p])}</td>` : ''}` +
-      `<td>${r ? (r.model === 'lightglue' ? '–' : fmt3(r.covisibility)) : '…'}</td><td>${r ? `${r.stopLayer} / ${r.layers}` : ''}</td>` +
+      `<td>${sparse(sl.model) ? '–' : fmt3(state.level1[i * n + j])}</td>${sl.rerank ? `<td>${fmt3(sl.scores[p])}</td>` : ''}` +
+      `<td>${r ? (sparse(r.model) ? '–' : fmt3(r.covisibility)) : '…'}</td><td>${r ? `${r.stopLayer} / ${r.layers}` : ''}</td>` +
       `<td>${r ? r.n : ''}</td><td>${r ? fmtMs(r.ms) : ''}</td><td class="l">${verdict(r)}</td></tr>`);
   }
   body.innerHTML = rows.join('') || '<tr><td colspan="9" class="l">No pairs kept.</td></tr>';
@@ -617,10 +629,10 @@ function renderPairs() {
 function renderTimings() {
   const t = state.timings;
   if (!t) return;
-  const lg = t.model === 'lightglue';
+  const lg = sparse(t.model);
   const rows = lg ? [
-    ['just-keypoints module and ALIKED weights', t.loadKeypoints],
-    [`LightGlue weights read (${fmtMs(t.weightsMB)} MB)`, t.loadWeights],
+    [`just-keypoints module and ${SPARSE[t.model].keypoints} weights`, t.loadKeypoints],
+    [`${SPARSE[t.model].name} weights read (${fmtMs(t.weightsMB)} MB)`, t.loadWeights],
     ['Matcher created (weights converted and uploaded to the GPU)', t.create],
     ['Keypoints and descriptors, per image', t.keypoints],
     ['Keypoints to the GPU, per image', t.describe],
@@ -658,7 +670,7 @@ function renderMatrix() {
   for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) if (i !== j) lo = Math.min(lo, L[i * n + j]), hi = Math.max(hi, L[i * n + j]);
   const span = hi - lo || 1;
   const kept = new Set();
-  const sl = state.shortlist, lg = sl?.model === 'lightglue';
+  const sl = state.shortlist, lg = sparse(sl?.model);
   if (sl && !lg) for (let p = 0; p < sl.n; p++) kept.add(pairKey(sl.pairs[2 * p], sl.pairs[2 * p + 1]));
   const out = [];
   const every = cell >= 16 ? 1 : Math.ceil(16 / cell);
@@ -702,7 +714,7 @@ function tipHtml(i, j) {
   let rank = -1;
   if (sl) for (let p = 0; p < sl.n; p++) if (sl.pairs[2 * p] === a && sl.pairs[2 * p + 1] === b) rank = p;
   const r = state.results.get(pairKey(a, b));
-  if (sl?.model === 'lightglue') {
+  if (sparse(sl?.model)) {
     const head = `<b>${a + 1} ${state.images[a].name} – ${b + 1} ${state.images[b].name}</b>`;
     return r ? `${head}<br><b>${r.n}</b> matches after ${r.stopLayer} of ${r.layers} layers` : `${head}<br><span class="m">not matched yet</span>`;
   }
@@ -761,7 +773,7 @@ function renderPair() {
   const n = state.images.length;
   const l2 = level2Of(i, j);
   const stat = (k, v) => `<div class="stat"><div class="v">${v}</div><div class="k">${k}</div></div>`;
-  if (r.model === 'lightglue') stats.innerHTML = stat(`${A.name} – ${B.name}`, `${i + 1} – ${j + 1}`) + stat('matches', r.n) +
+  if (sparse(r.model)) stats.innerHTML = stat(`${A.name} – ${B.name}`, `${i + 1} – ${j + 1}`) + stat('matches', r.n) +
     stat('layers run', `${r.stopLayer} / ${r.layers}`) + stat('match time', `${fmtMs(r.ms)} ms`);
   else stats.innerHTML = `<div class="stat"><div class="v" style="font-size:14px;padding-top:4px">${verdict(r) || '–'}</div><div class="k">verdict</div></div>` +
     stat(`${A.name} – ${B.name}`, `${i + 1} – ${j + 1}`) + stat('matches', r.n) +
@@ -839,12 +851,14 @@ function renderPair() {
 // anew with the other one.
 function applyModel() {
   const model = settings().model;
-  for (const el of document.querySelectorAll('[data-model]')) el.hidden = el.dataset.model !== model;
+  for (const el of document.querySelectorAll('[data-model]')) el.hidden = !el.dataset.model.split(' ').includes(model);
+  // LighterGlue has 6 layers: "9" runs them all.
+  $('layers').options[0].textContent = model === 'lighterglue' ? '6 layers (all)' : '9 layers';
   if (state.busy) return;
   dropMatcher();
   invalidate();
   showWeights();
-  setStatus(model === 'lightglue' ? 'LightGlue: its weights come with the page. Press Run.'
+  setStatus(sparse(model) ? `${SPARSE[model].name}: its weights come with the page. Press Run.`
                                    : state.weights ? 'FlexGlue. Press Run.' : "FlexGlue's weights are needed to run: download them, then load them.");
 }
 
@@ -913,7 +927,8 @@ async function init() {
       setStatus(`${state.images.length} images. Press Run.`);
     });
   }
-  if (params.get('model') === 'flexglue') document.querySelector('input[name=model][value=flexglue]').checked = true;
+  const start = params.get('model');
+  if (start === 'flexglue' || start === 'lighterglue') document.querySelector(`input[name=model][value=${start}]`).checked = true;
   for (const r of document.querySelectorAll('input[name=model]')) r.addEventListener('change', applyModel);
   applyModel();
   $('run').addEventListener('click', run);
