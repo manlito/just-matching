@@ -25,7 +25,8 @@ typedef enum { JMT_PRECISION_FP32 = 0, JMT_PRECISION_FP16 = 1 } jmt_precision;
 typedef struct {
   jmt_backend backend;
   /* Weights source, first that is set wins: memory blob, file path. A checkpoint as released (flexglue.pth,
-     aliked_lightglue.pth, raco_aliked_lightglue.pth, read without PyTorch) or a .jmtw file. FlexGlue's weights
+     aliked_lightglue.pth, raco_aliked_lightglue.pth, xfeat-lighterglue.pt, read without PyTorch) or a .jmtw
+     file. FlexGlue's weights
      are never built in or distributed: the backbone is under Meta's DINOv3 License. LightGlue's (Apache-2.0)
      are built in when the library is compiled with JMT_EMBED_WEIGHTS; then no source needs to be set. */
   const void* weights_data;
@@ -41,8 +42,9 @@ typedef struct {
   /* Default JMT_PRECISION_FP32. jmt_create fails when the backend does not support the precision. */
   jmt_precision precision;
   /* "flexglue", "lightglue-aliked" (ALIKED keypoints and descriptors), "lightglue-raco-aliked" (RaCo
-     keypoints described by ALIKED) or "lightglue-xfeat" (LighterGlue, XFeat's keypoints and descriptors). NULL (default): the model of the weights given. A LightGlue model with no
-     weights given uses the built-in ones. input_size applies to FlexGlue only. */
+     keypoints described by ALIKED) or "lightglue-xfeat" (LighterGlue, XFeat's keypoints and descriptors).
+     NULL (default): the model of the weights given. A LightGlue model with no weights given uses the built-in
+     ones. input_size applies to FlexGlue only. */
   const char* model;
 } jmt_config;
 
