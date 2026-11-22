@@ -7,6 +7,7 @@
 # The version is chosen here (packaging/version.py): the latest release, tag or PyPI, with its patch bumped, or
 # project(VERSION) in CMakeLists.txt when that is higher (a minor or major release is an edit there). It is
 # written into the checkout before each build, and the tag vX.Y.Z is pushed once every package is up.
+# Pushes that change only the notes, the docs site and its workflow, tools/ or web/ release nothing.
 #
 # Free hosted runners only. Three packages: just-matching (CPU, and Metal on macOS) for Linux x86_64, macOS
 # arm64 and Windows x86_64, with the sdist; just-matching-cu12 and just-matching-cu13 for Linux x86_64 and
@@ -19,6 +20,12 @@ name: release
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "tools/**"
+      - "web/**"
+      - ".github/workflows/docs.yml"
   workflow_dispatch:
     inputs:
       publish:
